@@ -28,8 +28,9 @@ mock.
 ## Build
 
 ```sh
-# 1. Build the plugin library (from this worktree root).
-env CGO_ENABLED=1 make build VERSION=0.1.0-review
+# 1. Build the plugin library (from this worktree root). VERSION is the release
+#    version the harness asserts, so keep it in sync with --expected-version.
+env CGO_ENABLED=1 make build VERSION=0.1.0
 # -> dist/linux/amd64/cliproxyapi-credit-manager.so
 
 # 2. Build the CPA host into a scratch dir (no CPA repo files are created).
@@ -46,19 +47,37 @@ cd tests/integration
 PYTHONDONTWRITEBYTECODE=1 python3 run_acceptance.py \
     --cpa "$SCRATCH/cpa" \
     --plugin "$PWD/../../dist/linux/amd64/cliproxyapi-credit-manager.so" \
-    --artifacts "$SCRATCH/run"
+    --artifacts "$SCRATCH/run" \
+    --plugin-id cliproxyapi-credit-manager \
+    --expected-version 0.1.0 \
+    --expected-commit "$(git rev-parse HEAD)"
 ```
+
+`git rev-parse HEAD` still resolves correctly from inside `tests/integration`:
+git walks up to the repository root, so the command needs no extra `cd`. Pass
+the **plugin source** commit, which is the commit the library was built from --
+if the harness itself changes afterwards, `HEAD` moves but the built library's
+commit does not.
 
 Options:
 
 - `--only <substr>` run only cases whose name contains the substring.
 - `--modules core,retry` restrict to specific case modules (default: all).
 - `--plugin-id credit-manager` override the plugin library/instance id.
+- `--expected-version <v>` the exact plugin base version the build must report
+  (default `0.1.0`); must be non-empty.
+- `--expected-commit <40hex>` an explicit build commit to assert exactly. When
+  given, the plugin version must equal `<version>+<commit>` exactly. When
+  omitted, the version before `+` must equal `--expected-version` and the part
+  after `+` must still be a 40-hex commit (this project always injects the build
+  commit, so a version without one is a misbuild). Must be 40 hex characters.
 
 Exit code: `0` all cases pass, `1` at least one case failed, `2` fail-closed: the
-host failed to boot, a requested module does not exist, or the filter matched no
-case. A zero-case or unresolvable run is never reported as green. Build/run
-status is reported separately from case status.
+host failed to boot, a requested module does not exist, the filter matched no
+case, or `--expected-version`/`--expected-commit` is malformed. A zero-case or
+unresolvable run is never reported as green. Build/run status is reported
+separately from case status, and `build` in `result.json` records the expected
+build identity.
 
 The plugin involves two distinct ids: the plugin's *declared* management route
 prefix (fixed at `/v0/management/plugins/credit-manager`, serving `/api/*`) and
@@ -104,6 +123,10 @@ Each case's host lives at `<artifacts>/host-<n>-<case>/` with `config.yaml`,
   accounting -- it denies every plugin key at all five credential locations, so
   the deployment fails closed rather than silently falling back to the original
   CPA `access.api-keys`. The `auth` module's deployment case asserts this.
+  The precondition is that at least one *undistributed native guard* key remains
+  configured in `access.api-keys` (the native CPA guard is left in place). The
+  denial is not plugin "magic": it is the host's own native authentication
+  rejecting a key the absent plugin no longer injects.
 - Put `GOTMPDIR` on persistent home storage; some hosts run `/tmp` on a
   quota-limited tmpfs and `go build` of the ~90 MB host binary can otherwise fail
   with `disk quota exceeded`.

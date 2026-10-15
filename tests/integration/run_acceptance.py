@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import shutil
 import sys
 import time
@@ -40,7 +41,23 @@ def parse_args(argv):
     parser.add_argument("--plugin-id", default="credit-manager")
     parser.add_argument("--only", default="", help="run only cases whose name contains this substring")
     parser.add_argument("--modules", default="", help="comma separated case module names (default: all present)")
+    parser.add_argument("--expected-version", default="0.1.0",
+                        help="exact plugin base version the build must report (default: 0.1.0)")
+    parser.add_argument("--expected-commit", default="",
+                        help="explicit 40-hex build commit to assert exactly; when omitted the commit part "
+                             "must simply be a 40-hex hash")
     return parser.parse_args(argv)
+
+
+def resolve_expected(args):
+    """Validate the expected build identity, failing closed on misuse."""
+    version = (args.expected_version or "").strip()
+    if not version:
+        return None, None, "--expected-version must not be empty"
+    commit = (args.expected_commit or "").strip().lower()
+    if commit and re.fullmatch(r"[0-9a-f]{40}", commit) is None:
+        return None, None, f"--expected-commit must be a 40-hex commit, got {args.expected_commit!r}"
+    return version, commit, None
 
 
 def reset_artifacts(artifacts: Path) -> None:
@@ -91,13 +108,21 @@ def main(argv=None):
     reset_artifacts(artifacts)
     recorder = Recorder(artifacts)
 
+    expected_version, expected_commit, expected_error = resolve_expected(args)
+    if expected_error:
+        recorder.write(artifacts / "result.json", extra={"build": {"error": expected_error}})
+        print(f"[ERROR] {expected_error}", file=sys.stderr)
+        return 2
+
     specs, modules = resolve_specs(recorder, args, artifacts)
     if specs is None:
         return 2
 
-    ctx = Context(artifacts, Path(args.cpa), Path(args.plugin), plugin_id=args.plugin_id)
+    ctx = Context(artifacts, Path(args.cpa), Path(args.plugin), plugin_id=args.plugin_id,
+                  expected_version=expected_version, expected_commit=expected_commit)
     build = {"cpa": str(Path(args.cpa).resolve()), "plugin": str(Path(args.plugin).resolve()),
              "plugin_id": args.plugin_id, "modules": modules, "cases_planned": len(specs)}
+    build.update(ctx.version_metadata())
 
     started = time.time()
     try:
