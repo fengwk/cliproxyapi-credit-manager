@@ -1,0 +1,199 @@
+name: release
+
+# Publishing is manual only: a human pushes a vX.Y.Z tag or runs this workflow
+# with an explicit existing tag. Nothing here creates tags, pushes commits, runs
+# on a schedule, runs on a branch push, or reacts to CI -- there is no
+# auto-release controller and no "latest" pointer manager.
+#
+# The build matrix produces one archive per native target; the publish job
+# assembles checksums.txt, re-verifies every asset and creates exactly one
+# GitHub Release for the pre-existing tag. The release is created as a draft,
+# all assets are attached, and only then is it published: a failed upload never
+# leaves a half-published release, and an existing release is never overwritten.
+run-name: release ${{ inputs.tag || github.ref_name }}
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release tag to build and publish (e.g. v0.1.0)"
+        required: true
+        type: string
+
+env:
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+
+# A tag push and a workflow_dispatch retry for the same tag must never publish
+# concurrently. cancel-in-progress stays false so an in-flight publish is never
+# aborted halfway.
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Validate release tag
+        env:
+          TAG: ${{ env.RELEASE_TAG }}
+        run: |
+          # A manual dispatch must name an existing vX.Y.Z tag. This never
+          # creates a tag and never claims an unpublished release; a bogus or
+          # missing value fails here before anything is built.
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "release: refusing '$TAG'; push or dispatch an existing vX.Y.Z tag" >&2
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ env.RELEASE_TAG }}
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Verify the tagged source
+        run: |
+          go mod verify
+          make test
+          make race
+          make static
+
+  build:
+    needs: verify
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Native runners only; no cross-compilation toolchain is required.
+          - goos: linux
+            goarch: amd64
+            runner: ubuntu-24.04
+          - goos: linux
+            goarch: arm64
+            runner: ubuntu-24.04-arm
+          - goos: darwin
+            goarch: arm64
+            runner: macos-latest
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ env.RELEASE_TAG }}
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Resolve plugin version
+        id: version
+        env:
+          PLUGIN_VERSION: ${{ env.RELEASE_TAG }}
+        run: |
+          echo "version=$(bash scripts/plugin-version.sh)" >> "$GITHUB_OUTPUT"
+          echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Build native plugin
+        run: >-
+          make build
+          GOOS=${{ matrix.goos }}
+          GOARCH=${{ matrix.goarch }}
+          VERSION=${{ steps.version.outputs.version }}
+          GIT_COMMIT=${{ steps.version.outputs.commit }}
+
+      - name: Package archive
+        env:
+          # GITHUB_* variables are reserved; COMMIT identifies the checked-out tag.
+          COMMIT: ${{ steps.version.outputs.commit }}
+        run: >-
+          bash scripts/package-plugin.sh
+          "${{ steps.version.outputs.version }}"
+          "${{ matrix.goos }}"
+          "${{ matrix.goarch }}"
+          "$RUNNER_TEMP/pkg"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: ${{ runner.temp }}/pkg/
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      # Least privilege: only this job may write repository contents.
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ env.RELEASE_TAG }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: pkg
+          merge-multiple: true
+
+      - name: Assemble checksums.txt
+        run: |
+          cd pkg
+          : > checksums.txt
+          for f in ./*.zip.sha256; do
+            cat "$f" >> checksums.txt
+          done
+          sort -k2 checksums.txt -o checksums.txt
+          rm -f ./*.zip.sha256
+          cat checksums.txt
+
+      - name: Verify release assets
+        env:
+          TAG: ${{ env.RELEASE_TAG }}
+        run: |
+          set -euo pipefail
+          commit="$(git rev-parse HEAD)"
+          sdk="$(bash scripts/plugin-sdk.sh --module)"
+          # The curated notes are part of the release contract: publishing must
+          # never silently fall back to an empty or invented description.
+          test -s "docs/release-notes-${TAG}.md"
+          python3 scripts/verify-release-assets.py pkg \
+            --version "${TAG#v}" --commit "$commit" --sdk "$sdk"
+
+      - name: Publish GitHub Release (create once, never overwrite)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ env.RELEASE_TAG }}
+        run: |
+          set -euo pipefail
+          # One create call for one pre-existing tag: an already published
+          # release is refused instead of being overwritten or duplicated.
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "release: $TAG already exists; refusing to overwrite" >&2
+            exit 1
+          fi
+          # --verify-tag refuses to create the tag; the release always points at
+          # the pre-existing, human-pushed tag.
+          gh release create "$TAG" \
+            --verify-tag \
+            --draft \
+            --title "$TAG" \
+            --notes-file "docs/release-notes-${TAG}.md" \
+            pkg/*.zip pkg/checksums.txt
+          gh release edit "$TAG" --draft=false
