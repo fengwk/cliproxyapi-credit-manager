@@ -188,6 +188,15 @@ func TestOpenCreatesDatabaseAndPepper(t *testing.T) {
 	if autoVacuum == 0 {
 		t.Fatal("auto_vacuum is disabled; retention cleanup could not reclaim space")
 	}
+	// The ledger is the durable record: an acknowledged commit must survive
+	// power loss even though the host event queue is memory only.
+	var sync int
+	if err := h.store.db.QueryRow(`PRAGMA synchronous`).Scan(&sync); err != nil {
+		t.Fatalf("read synchronous: %v", err)
+	}
+	if sync != 2 {
+		t.Fatalf("synchronous = %d, want 2 (FULL)", sync)
+	}
 }
 
 // TestRestartMarksActivePending verifies a restart neither frees holds nor
@@ -482,5 +491,33 @@ func TestTokenValidation(t *testing.T) {
 	}
 	if _, err := normalizeQuality("guess"); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("quality err = %v", err)
+	}
+}
+
+// TestUpdateKeyRejectsMaterial keeps key ownership changes explicit: material
+// only ever changes through RotateKey.
+func TestUpdateKeyRejectsMaterial(t *testing.T) {
+	h := newHarness(t)
+	key, material := h.mustKey(KeySpec{Label: "one", Enabled: true})
+	spec := key.Spec
+	spec.Label = "renamed"
+	spec.Material = "sk-injected-material-0001"
+	if _, err := h.store.UpdateKey(h.ctx(), key.ID, spec); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("material on update err = %v, want ErrInvalid", err)
+	}
+	// The rejected update changed nothing, in particular not the material.
+	spec.Material = ""
+	updated, err := h.store.UpdateKey(h.ctx(), key.ID, spec)
+	if err != nil {
+		t.Fatalf("update without material: %v", err)
+	}
+	if updated.Spec.Label != "renamed" {
+		t.Fatalf("label = %q, want renamed", updated.Spec.Label)
+	}
+	if _, err := h.store.Authenticate(h.ctx(), material); err != nil {
+		t.Fatalf("original material stopped working: %v", err)
+	}
+	if _, err := h.store.Authenticate(h.ctx(), "sk-injected-material-0001"); !errors.Is(err, ErrUnauthorized) {
+		t.Fatalf("injected material err = %v, want ErrUnauthorized", err)
 	}
 }

@@ -23,6 +23,12 @@ const (
 
 	OutcomeSucceeded = "succeeded"
 	OutcomeFailed    = "failed"
+	// OutcomeRejected marks a proven rejection before any execution: it is the
+	// only outcome that may close a request without an execution event.
+	OutcomeRejected = "rejected"
+	// OutcomeCanceled marks an aborted execution; it is treated like a failure
+	// because partial usage may still be missing.
+	OutcomeCanceled = "canceled"
 
 	// QualityComplete marks usage that is trustworthy even when all counters
 	// are zero. Empty quality is trusted only when it carries positive tokens.
@@ -45,10 +51,14 @@ const (
 // It is additive to the shared error set in types.go.
 var ErrPending = errors.New("too many unresolved requests")
 
+// ErrLocked reports that another process already owns the data directory.
+var ErrLocked = errors.New("data directory is locked")
+
 const (
 	driverName             = "sqlite"
 	dbFileName             = "credit.db"
 	pepperFileName         = "pepper"
+	lockFileName           = "lock"
 	defaultRetentionMonths = 3
 	defaultMaxPending      = 16
 	pepperLen              = 32
@@ -170,6 +180,7 @@ CREATE TABLE IF NOT EXISTS key_money_counters (
   micro_usd INTEGER NOT NULL,
   PRIMARY KEY (key_id, win, period)
 );
+CREATE INDEX IF NOT EXISTS key_money_counters_window ON key_money_counters(win, period);
 CREATE TABLE IF NOT EXISTS key_token_counters (
   key_id TEXT NOT NULL,
   model TEXT NOT NULL,
@@ -178,6 +189,7 @@ CREATE TABLE IF NOT EXISTS key_token_counters (
   tokens INTEGER NOT NULL,
   PRIMARY KEY (key_id, model, win, period)
 );
+CREATE INDEX IF NOT EXISTS key_token_counters_window ON key_token_counters(win, period);
 CREATE TABLE IF NOT EXISTS adjustments (
   seq INTEGER PRIMARY KEY AUTOINCREMENT,
   request_id TEXT NOT NULL,
@@ -193,6 +205,7 @@ CREATE INDEX IF NOT EXISTS adjustments_request ON adjustments(request_id);
 // Store is the SQLite-backed implementation of Backend.
 type Store struct {
 	db              *sql.DB
+	dirLock         *dirLock
 	dbPath          string
 	walPath         string
 	pepper          []byte
@@ -205,6 +218,7 @@ var _ Backend = (*Store)(nil)
 
 // Open prepares the accounting database inside Options.DataDir. Reopening an
 // existing directory reuses the pepper and marks crashed executions pending.
+// Only one process may own a directory at a time.
 func Open(opts Options) (*Store, error) {
 	dir := strings.TrimSpace(opts.DataDir)
 	if dir == "" {
@@ -217,10 +231,17 @@ func Open(opts Options) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
+	// The lock is taken before touching the database so a second instance can
+	// never run recovery against another process's live executions.
+	lock, err := acquireDirLock(filepath.Join(dir, lockFileName))
+	if err != nil {
+		return nil, err
+	}
 	dbPath := filepath.Join(dir, dbFileName)
 	dsn := dsnFor(dbPath)
 	db, err := sql.Open(driverName, dsn)
 	if err != nil {
+		_ = lock.release()
 		return nil, fmt.Errorf("open database: %w", err)
 	}
 	// One connection keeps transactions serialized and pragmas deterministic.
@@ -229,6 +250,7 @@ func Open(opts Options) (*Store, error) {
 	db.SetConnMaxLifetime(0)
 	s := &Store{
 		db:              db,
+		dirLock:         lock,
 		dbPath:          dbPath,
 		walPath:         dbPath + "-wal",
 		pepper:          pepper,
@@ -246,17 +268,19 @@ func Open(opts Options) (*Store, error) {
 		s.maxPending = defaultMaxPending
 	}
 	ctx := context.Background()
-	if err := db.PingContext(ctx); err != nil {
+	fail := func(err error) (*Store, error) {
 		_ = db.Close()
-		return nil, fmt.Errorf("connect database: %w", err)
+		_ = lock.release()
+		return nil, err
+	}
+	if err := db.PingContext(ctx); err != nil {
+		return fail(fmt.Errorf("connect database: %w", err))
 	}
 	if err := s.migrate(ctx); err != nil {
-		_ = db.Close()
-		return nil, err
+		return fail(err)
 	}
 	if err := s.recoverExecutions(ctx); err != nil {
-		_ = db.Close()
-		return nil, err
+		return fail(err)
 	}
 	return s, nil
 }
@@ -265,7 +289,9 @@ func dsnFor(path string) string {
 	q := url.Values{}
 	q.Add("_pragma", "busy_timeout(5000)")
 	q.Add("_pragma", "journal_mode(WAL)")
-	q.Add("_pragma", "synchronous(NORMAL)")
+	// FULL keeps an acknowledged commit durable across power loss. The host
+	// event queue is explicitly not durable, so the ledger cannot rely on it.
+	q.Add("_pragma", "synchronous(FULL)")
 	q.Add("_pragma", "foreign_keys(1)")
 	q.Add("_pragma", "auto_vacuum(INCREMENTAL)")
 	q.Add("_txlock", "immediate")
@@ -327,12 +353,55 @@ func (s *Store) recoverExecutions(ctx context.Context) error {
 	})
 }
 
-// Close releases the database handle.
+// Close releases the database handle and the directory lock.
 func (s *Store) Close() error {
-	if s == nil || s.db == nil {
+	if s == nil {
 		return nil
 	}
-	return s.db.Close()
+	var err error
+	if s.db != nil {
+		err = s.db.Close()
+	}
+	if rerr := s.dirLock.release(); err == nil {
+		err = rerr
+	}
+	return err
+}
+
+// HasActive reports whether any execution is still in flight.
+func (s *Store) HasActive(ctx context.Context) (bool, error) {
+	active, err := counterValue(ctx, s.db, `SELECT COUNT(*) FROM requests WHERE state = ?`, stateActive)
+	if err != nil {
+		return false, err
+	}
+	return active > 0, nil
+}
+
+// withSnapshot runs fn inside one deferred read transaction so every number in
+// a report observes the same database state even while writers commit.
+func (s *Store) withSnapshot(ctx context.Context, fn func(querier) error) error {
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("acquire snapshot connection: %w", err)
+	}
+	defer conn.Close()
+	if _, err := conn.ExecContext(ctx, `BEGIN`); err != nil {
+		return fmt.Errorf("begin snapshot: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_, _ = conn.ExecContext(context.WithoutCancel(ctx), `ROLLBACK`)
+		}
+	}()
+	if err := fn(conn); err != nil {
+		return err
+	}
+	if _, err := conn.ExecContext(ctx, `COMMIT`); err != nil {
+		return fmt.Errorf("commit snapshot: %w", err)
+	}
+	committed = true
+	return nil
 }
 
 // querier is satisfied by both *sql.DB and *sql.Tx.

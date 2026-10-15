@@ -193,6 +193,9 @@ type Maintenance struct {
 // Backend is the application-facing contract; Store is its SQLite implementation.
 type Backend interface {
 	Close() error
+	// HasActive reports whether any execution is still in flight. Callers use it
+	// to refuse disruptive reconfiguration while business requests are running.
+	HasActive(context.Context) (bool, error)
 	CreateKey(context.Context, KeySpec) (Key, string, error)
 	UpdateKey(context.Context, string, KeySpec) (Key, error)
 	RotateKey(context.Context, string, string) (Key, string, error)

@@ -283,11 +283,14 @@ func (s *Store) CreateKey(ctx context.Context, spec KeySpec) (Key, string, error
 	return out, material, nil
 }
 
-// UpdateKey replaces the mutable part of a key spec. Material given in the
-// spec rotates the key in place without revealing the values.
+// UpdateKey replaces the mutable part of a key spec. Key material is not part
+// of an update: rotate it through RotateKey so ownership changes stay explicit.
 func (s *Store) UpdateKey(ctx context.Context, id string, spec KeySpec) (Key, error) {
 	if strings.TrimSpace(id) == "" {
 		return Key{}, fmt.Errorf("%w: key id is required", ErrInvalid)
+	}
+	if strings.TrimSpace(spec.Material) != "" {
+		return Key{}, fmt.Errorf("%w: use RotateKey to change key material", ErrInvalid)
 	}
 	norm, err := normalizeSpec(spec)
 	if err != nil {
@@ -297,7 +300,6 @@ func (s *Store) UpdateKey(ctx context.Context, id string, spec KeySpec) (Key, er
 	if err != nil {
 		return Key{}, err
 	}
-	material := strings.TrimSpace(spec.Material)
 	var out Key
 	err = s.inTx(ctx, func(tx *sql.Tx) error {
 		key, err := loadKey(ctx, tx, "id = ?", id)
@@ -307,21 +309,11 @@ func (s *Store) UpdateKey(ctx context.Context, id string, spec KeySpec) (Key, er
 		if err := hydrateLimits(ctx, tx, key); err != nil {
 			return err
 		}
-		hmac := key.hmac
-		fingerprint := key.fingerprint
-		if material != "" {
-			hmac = materialHMAC(s.pepper, material)
-			if err := checkMaterialFree(ctx, tx, hmac, key.id); err != nil {
-				return err
-			}
-			fingerprint = fingerprintOf(hmac)
-		}
 		if _, err := tx.ExecContext(ctx, `UPDATE keys SET label=?, enabled=?, quota_micro_usd=?,
 			daily_micro_usd=?, weekly_micro_usd=?, monthly_micro_usd=?, max_concurrent=?,
-			allowed_models=?, expires_at=?, hmac=?, fingerprint=? WHERE id=?`,
+			allowed_models=?, expires_at=? WHERE id=?`,
 			norm.Label, boolInt(norm.Enabled), norm.QuotaMicroUSD, norm.DailyMicroUSD, norm.WeeklyMicroUSD,
-			norm.MonthlyMicroUSD, norm.MaxConcurrent, allowed, nullableNano(norm.ExpiresAt),
-			hmac, fingerprint, key.id); err != nil {
+			norm.MonthlyMicroUSD, norm.MaxConcurrent, allowed, nullableNano(norm.ExpiresAt), key.id); err != nil {
 			return fmt.Errorf("update key: %w", err)
 		}
 		if _, err := tx.ExecContext(ctx, `DELETE FROM model_token_limits WHERE key_id = ?`, key.id); err != nil {
@@ -330,10 +322,7 @@ func (s *Store) UpdateKey(ctx context.Context, id string, spec KeySpec) (Key, er
 		if err := s.insertLimits(ctx, tx, key.id, norm.ModelTokenLimits); err != nil {
 			return err
 		}
-		key.hmac = hmac
-		key.fingerprint = fingerprint
 		key.spec = norm
-		key.spec.ModelTokenLimits = norm.ModelTokenLimits
 		out = key.toKey()
 		return nil
 	})

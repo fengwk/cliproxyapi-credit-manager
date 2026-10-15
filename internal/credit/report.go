@@ -29,31 +29,41 @@ func (s *Store) Report(ctx context.Context, f Filter) (Report, error) {
 	page, size := normalizePaging(f)
 	bucket := bucketSize(f.Bucket)
 
-	summary, err := s.reportSummary(ctx, where, args, execWhere, execArgs)
+	// All derived numbers come from one read transaction so a concurrent writer
+	// cannot make the page, the total and the trend disagree.
+	var out Report
+	err := s.withSnapshot(ctx, func(q querier) error {
+		summary, err := s.reportSummary(ctx, q, where, args, execWhere, execArgs)
+		if err != nil {
+			return err
+		}
+		total, err := counterValue(ctx, q, `SELECT COUNT(*) FROM requests r WHERE `+where, args...)
+		if err != nil {
+			return err
+		}
+		trend, err := s.reportTrend(ctx, q, where, args, execWhere, execArgs, bucket)
+		if err != nil {
+			return err
+		}
+		items, err := s.reportItems(ctx, q, where, args, execWhere, execArgs, page, size)
+		if err != nil {
+			return err
+		}
+		out = Report{
+			Summary:       summary,
+			Trend:         trend,
+			Items:         items,
+			Total:         total,
+			Page:          page,
+			PageSize:      size,
+			RetentionFrom: s.retentionFrom(now),
+		}
+		return nil
+	})
 	if err != nil {
 		return Report{}, err
 	}
-	total, err := counterValue(ctx, s.db, `SELECT COUNT(*) FROM requests r WHERE `+where, args...)
-	if err != nil {
-		return Report{}, err
-	}
-	trend, err := s.reportTrend(ctx, where, args, execWhere, execArgs, bucket)
-	if err != nil {
-		return Report{}, err
-	}
-	items, err := s.reportItems(ctx, where, args, execWhere, execArgs, page, size)
-	if err != nil {
-		return Report{}, err
-	}
-	return Report{
-		Summary:       summary,
-		Trend:         trend,
-		Items:         items,
-		Total:         total,
-		Page:          page,
-		PageSize:      size,
-		RetentionFrom: s.retentionFrom(now),
-	}, nil
+	return out, nil
 }
 
 func normalizePaging(f Filter) (int, int) {
@@ -79,6 +89,9 @@ func bucketSize(bucket string) int64 {
 	return int64(24 * time.Hour)
 }
 
+// failedOutcomeList is the shared definition of a non-successful outcome.
+const failedOutcomeList = "('" + OutcomeFailed + "','" + OutcomeCanceled + "','" + OutcomeRejected + "')"
+
 func escapeLike(v string) string {
 	r := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
 	return "%" + r.Replace(v) + "%"
@@ -99,11 +112,20 @@ func buildPredicates(f Filter, from, to time.Time) (string, []any, string, []any
 		conds = append(conds, "r.model = ?")
 		args = append(args, f.Model)
 	}
+	// A success only counts once it is settled, so an unresolved "success" is
+	// never mistaken for a trustworthy one. Failures and cancellations are
+	// reported whether or not they could be closed yet.
 	switch f.Result {
 	case OutcomeSucceeded:
 		conds = append(conds, "r.state = '"+stateSettled+"' AND r.outcome = '"+OutcomeSucceeded+"'")
 	case OutcomeFailed:
-		conds = append(conds, "r.state = '"+stateSettled+"' AND r.outcome = '"+OutcomeFailed+"'")
+		conds = append(conds, "r.outcome IN "+failedOutcomeList)
+	case OutcomeRejected:
+		conds = append(conds, "r.outcome = '"+OutcomeRejected+"'")
+	case OutcomeCanceled:
+		conds = append(conds, "r.outcome = '"+OutcomeCanceled+"'")
+	case stateActive:
+		conds = append(conds, "r.state = '"+stateActive+"'")
 	case statePending:
 		conds = append(conds, "r.state IN ('"+stateActive+"','"+statePending+"')")
 	}
@@ -170,16 +192,16 @@ func (t execTotals) apply(sum *Summary) {
 	}
 }
 
-func (s *Store) reportSummary(ctx context.Context, where string, args []any, execWhere string, execArgs []any) (Summary, error) {
+func (s *Store) reportSummary(ctx context.Context, q querier, where string, args []any, execWhere string, execArgs []any) (Summary, error) {
 	var sum Summary
-	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*),
-		COALESCE(SUM(CASE WHEN r.state = '`+stateSettled+`' AND r.outcome = '`+OutcomeFailed+`' THEN 1 ELSE 0 END),0),
+	err := q.QueryRowContext(ctx, `SELECT COUNT(*),
+		COALESCE(SUM(CASE WHEN r.outcome IN `+failedOutcomeList+` THEN 1 ELSE 0 END),0),
 		COALESCE(SUM(CASE WHEN r.state IN ('`+stateActive+`','`+statePending+`') THEN 1 ELSE 0 END),0)
 		FROM requests r WHERE `+where, args...).Scan(&sum.Requests, &sum.Failed, &sum.Pending)
 	if err != nil {
 		return Summary{}, fmt.Errorf("summarize requests: %w", err)
 	}
-	row := s.db.QueryRowContext(ctx, `SELECT `+execAggregate+`
+	row := q.QueryRowContext(ctx, `SELECT `+execAggregate+`
 		FROM usages u JOIN requests r ON r.id = u.request_id
 		WHERE `+where+` AND `+execWhere, append(append([]any{}, args...), execArgs...)...)
 	totals, err := scanExecTotals(row.Scan)
@@ -190,11 +212,11 @@ func (s *Store) reportSummary(ctx context.Context, where string, args []any, exe
 	return sum, nil
 }
 
-func (s *Store) reportTrend(ctx context.Context, where string, args []any, execWhere string, execArgs []any, bucket int64) ([]Point, error) {
+func (s *Store) reportTrend(ctx context.Context, q querier, where string, args []any, execWhere string, execArgs []any, bucket int64) ([]Point, error) {
 	points := map[int64]*Summary{}
 	order := []int64{}
-	requestRows, err := s.db.QueryContext(ctx, `SELECT (r.started_at / ?) * ? AS bucket, COUNT(*),
-		COALESCE(SUM(CASE WHEN r.state = '`+stateSettled+`' AND r.outcome = '`+OutcomeFailed+`' THEN 1 ELSE 0 END),0),
+	requestRows, err := q.QueryContext(ctx, `SELECT (r.started_at / ?) * ? AS bucket, COUNT(*),
+		COALESCE(SUM(CASE WHEN r.outcome IN `+failedOutcomeList+` THEN 1 ELSE 0 END),0),
 		COALESCE(SUM(CASE WHEN r.state IN ('`+stateActive+`','`+statePending+`') THEN 1 ELSE 0 END),0)
 		FROM requests r WHERE `+where+` GROUP BY bucket ORDER BY bucket`,
 		append([]any{bucket, bucket}, args...)...)
@@ -219,7 +241,7 @@ func (s *Store) reportTrend(ctx context.Context, where string, args []any, execW
 	}
 	requestRows.Close()
 
-	execRows, err := s.db.QueryContext(ctx, `SELECT (r.started_at / ?) * ? AS bucket, `+execAggregate+`
+	execRows, err := q.QueryContext(ctx, `SELECT (r.started_at / ?) * ? AS bucket, `+execAggregate+`
 		FROM usages u JOIN requests r ON r.id = u.request_id
 		WHERE `+where+` AND `+execWhere+` GROUP BY bucket ORDER BY bucket`,
 		append([]any{bucket, bucket}, append(append([]any{}, args...), execArgs...)...)...)
@@ -255,8 +277,8 @@ func (s *Store) reportTrend(ctx context.Context, where string, args []any, execW
 	return out, nil
 }
 
-func (s *Store) reportItems(ctx context.Context, where string, args []any, execWhere string, execArgs []any, page, size int) ([]Request, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT `+requestColumns+` FROM requests r WHERE `+where+`
+func (s *Store) reportItems(ctx context.Context, q querier, where string, args []any, execWhere string, execArgs []any, page, size int) ([]Request, error) {
+	rows, err := q.QueryContext(ctx, `SELECT `+requestColumns+` FROM requests r WHERE `+where+`
 		ORDER BY r.started_at DESC, r.id DESC LIMIT ? OFFSET ?`,
 		append(append([]any{}, args...), size, (page-1)*size)...)
 	if err != nil {
@@ -280,10 +302,9 @@ func (s *Store) reportItems(ctx context.Context, where string, args []any, execW
 	// honour the same execution filter as the summary.
 	byRequest := map[string][]Usage{}
 	if len(ids) > 0 {
-		placeholders := strings.TrimSuffix(strings.Repeat("?,", len(ids)), ",")
-		query := `SELECT ` + usageColumns + ` FROM usages u WHERE u.request_id IN (` + placeholders + `) AND ` + execWhere + `
+		query := `SELECT ` + usageColumns + ` FROM usages u WHERE u.request_id IN (` + placeholders(len(ids)) + `) AND ` + execWhere + `
 			ORDER BY u.at, u.id`
-		execRows, err := s.db.QueryContext(ctx, query, append(append([]any{}, ids...), execArgs...)...)
+		execRows, err := q.QueryContext(ctx, query, append(append([]any{}, ids...), execArgs...)...)
 		if err != nil {
 			return nil, fmt.Errorf("list executions: %w", err)
 		}

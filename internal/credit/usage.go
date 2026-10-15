@@ -212,9 +212,15 @@ func accountingReliable(u Usage) bool {
 
 // RecordUsage attaches one execution event to a persisted request. Unknown or
 // zero accounting is retained as unknown and never billed as a fake zero.
+//
+// The cost is always derived by the core from the request price snapshot; a
+// caller supplied cost is rejected so quality and money can never disagree.
 func (s *Store) RecordUsage(ctx context.Context, usage Usage) error {
 	if strings.TrimSpace(usage.ID) == "" || strings.TrimSpace(usage.TraceID) == "" || strings.TrimSpace(usage.KeyID) == "" {
 		return fmt.Errorf("%w: usage id, trace id and key id are required", ErrInvalid)
+	}
+	if usage.CostMicroUSD != nil {
+		return fmt.Errorf("%w: usage cost is derived from the request price snapshot", ErrInvalid)
 	}
 	tokens, err := normalizeTokens(usage.Tokens)
 	if err != nil {
@@ -227,9 +233,6 @@ func (s *Store) RecordUsage(ctx context.Context, usage Usage) error {
 	if usage.Quality, err = normalizeQuality(usage.Quality); err != nil {
 		return err
 	}
-	if usage.CostMicroUSD != nil && *usage.CostMicroUSD < 0 {
-		return fmt.Errorf("%w: cost must not be negative", ErrInvalid)
-	}
 	at := s.resolveAt(usage.At)
 	usage.At = at
 	reliable := accountingReliable(usage)
@@ -238,9 +241,12 @@ func (s *Store) RecordUsage(ctx context.Context, usage Usage) error {
 		if err != nil {
 			return err
 		}
-		if strings.TrimSpace(usage.RequestID) != "" && usage.RequestID != req.id {
+		if supplied := strings.TrimSpace(usage.RequestID); supplied != "" && supplied != req.id {
 			return fmt.Errorf("%w: usage belongs to request %s", ErrConflict, req.id)
 		}
+		// Canonicalize the request id before comparison: the native bridge only
+		// supplies a trace, so an empty id must still replay idempotently.
+		usage.RequestID = req.id
 		existing, err := loadUsageByID(ctx, tx, usage.ID)
 		switch {
 		case err == nil:
@@ -253,11 +259,7 @@ func (s *Store) RecordUsage(ctx context.Context, usage Usage) error {
 			return err
 		}
 		var cost *int64
-		switch {
-		case usage.CostMicroUSD != nil:
-			v := *usage.CostMicroUSD
-			cost = &v
-		case reliable:
+		if reliable {
 			v, err := computeCost(req.price, tokens)
 			if err != nil {
 				return err
@@ -281,15 +283,16 @@ func (s *Store) RecordUsage(ctx context.Context, usage Usage) error {
 				return err
 			}
 		}
-		switch {
-		case req.state == stateSettled && cost != nil:
+		// A trustworthy cost is booked in the same transaction that records it,
+		// even while the request stays open, so a later write-off can never
+		// discard a real charge.
+		if cost != nil {
 			if err := s.applyCharge(ctx, tx, req, usage.ID, *cost); err != nil {
 				return err
 			}
-		case req.state == statePending:
-			if err := s.evaluateSettle(ctx, tx, req, at); err != nil {
-				return err
-			}
+		}
+		if req.state == statePending {
+			return s.evaluateSettle(ctx, tx, req, at)
 		}
 		return nil
 	})
@@ -324,7 +327,7 @@ func (s *Store) Complete(ctx context.Context, c Completion) error {
 		return fmt.Errorf("%w: completion id is required", ErrInvalid)
 	}
 	switch c.Outcome {
-	case OutcomeSucceeded, OutcomeFailed:
+	case OutcomeSucceeded, OutcomeFailed, OutcomeRejected, OutcomeCanceled:
 	default:
 		return fmt.Errorf("%w: unsupported outcome %q", ErrInvalid, c.Outcome)
 	}
@@ -337,19 +340,18 @@ func (s *Store) Complete(ctx context.Context, c Completion) error {
 		if strings.TrimSpace(c.TraceID) != "" && c.TraceID != req.traceID {
 			return fmt.Errorf("%w: completion trace does not match request", ErrConflict)
 		}
-		switch req.state {
-		case stateSettled:
-			if req.outcome == c.Outcome {
+		if req.outcome != "" {
+			// A repeated completion must agree, otherwise the ledger would
+			// silently change what was already recorded.
+			if req.outcome != c.Outcome || req.statusCode != c.StatusCode {
+				return fmt.Errorf("%w: request already completed as %s/%d",
+					ErrConflict, req.outcome, req.statusCode)
+			}
+			if req.state == stateSettled {
 				return nil
 			}
-			return fmt.Errorf("%w: request already closed with outcome %s", ErrConflict, req.outcome)
-		case statePending:
-			if req.outcome != "" {
-				if req.outcome == c.Outcome {
-					return nil
-				}
-				return fmt.Errorf("%w: request already completed with outcome %s", ErrConflict, req.outcome)
-			}
+			// Still unresolved: a late usage may have made it closable.
+			return s.evaluateSettle(ctx, tx, req, at)
 		}
 		if _, err := tx.ExecContext(ctx, `UPDATE requests SET state = ?, outcome = ?, status_code = ?, completed_at = ?
 			WHERE id = ?`, statePending, c.Outcome, c.StatusCode, unixNano(at), req.id); err != nil {

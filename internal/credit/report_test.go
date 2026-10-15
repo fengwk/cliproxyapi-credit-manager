@@ -1,6 +1,8 @@
 package credit
 
 import (
+	"context"
+	"sync"
 	"testing"
 	"time"
 )
@@ -34,7 +36,7 @@ func buildDataset(t *testing.T, h *harness) dataset {
 
 	// A proven rejection settles with no execution.
 	rejected := h.mustReserve(ReserveInput{ID: "r3", TraceID: "t3", KeyID: a.ID, RequestedModel: "m1"})
-	h.mustComplete(Completion{ID: rejected.ID, TraceID: rejected.TraceID, Outcome: OutcomeFailed, StatusCode: 403})
+	h.mustComplete(Completion{ID: rejected.ID, TraceID: rejected.TraceID, Outcome: OutcomeRejected, StatusCode: 403})
 
 	// A completed execution without trustworthy usage stays pending.
 	pending := h.mustReserve(ReserveInput{ID: "r4", TraceID: "t4", KeyID: a.ID, RequestedModel: "m1"})
@@ -107,6 +109,8 @@ func TestReportSummaryFiltersAndItems(t *testing.T) {
 		{"by provider and model", Filter{Provider: "openai", Model: "m2"}, 1, "r2"},
 		{"by pending", Filter{Result: statePending}, 1, "r4"},
 		{"by failed", Filter{Result: OutcomeFailed}, 1, "r3"},
+		{"by rejected", Filter{Result: OutcomeRejected}, 1, "r3"},
+		{"by canceled", Filter{Result: OutcomeCanceled}, 0, ""},
 		{"by succeeded", Filter{Result: OutcomeSucceeded}, 3, ""},
 		{"by search", Filter{Search: "r5"}, 1, "r5"},
 		{"by label search", Filter{Search: "beta"}, 1, "r5"},
@@ -265,5 +269,72 @@ func TestReportDefaultsToRetentionWindow(t *testing.T) {
 	want := addMonthsClamped(testEpoch, -3)
 	if !rep.RetentionFrom.Equal(want) {
 		t.Fatalf("retention from = %s, want %s", rep.RetentionFrom, want)
+	}
+}
+
+// TestReportSnapshotIsConsistentUnderConcurrentWrites asserts that every derived
+// number of one report comes from the same snapshot. Without a single read
+// transaction a concurrent writer could make the page, the total and the trend
+// disagree.
+func TestReportSnapshotIsConsistentUnderConcurrentWrites(t *testing.T) {
+	h, key := billingHarness(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	const writes = 200
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < writes; i++ {
+			id := "w-" + itoa(i)
+			req, err := h.store.Reserve(ctx, ReserveInput{ID: id, TraceID: "t-" + id, KeyID: key.ID,
+				RequestedModel: "m1", InputEstimate: 1})
+			if err != nil {
+				return
+			}
+			if err := h.store.RecordUsage(ctx, usageFor("u-"+id, req, "m1", tokens(1, 0, 0, 0, 0))); err != nil {
+				return
+			}
+			if err := h.store.Complete(ctx, Completion{ID: req.ID, TraceID: req.TraceID,
+				Outcome: OutcomeSucceeded}); err != nil {
+				return
+			}
+		}
+	}()
+
+	from, to := testEpoch.AddDate(-1, 0, 0), testEpoch.AddDate(1, 0, 0)
+	checks := 0
+	for i := 0; i < 120; i++ {
+		rep, err := h.store.Report(ctx, Filter{From: from, To: to, PageSize: 5, Bucket: "day"})
+		if err != nil {
+			t.Fatalf("report: %v", err)
+		}
+		if rep.Summary.Requests != rep.Total {
+			t.Fatalf("summary requests %d != total %d", rep.Summary.Requests, rep.Total)
+		}
+		var bucketSum, bucketCost int64
+		for _, p := range rep.Trend {
+			bucketSum += p.Summary.Requests
+			bucketCost += p.Summary.CostMicroUSD
+		}
+		if bucketSum != rep.Total {
+			t.Fatalf("trend requests %d != total %d", bucketSum, rep.Total)
+		}
+		if bucketCost != rep.Summary.CostMicroUSD {
+			t.Fatalf("trend cost %d != summary cost %d", bucketCost, rep.Summary.CostMicroUSD)
+		}
+		want := rep.Total
+		if want > int64(rep.PageSize) {
+			want = int64(rep.PageSize)
+		}
+		if int64(len(rep.Items)) != want {
+			t.Fatalf("page size %d != want %d for total %d", len(rep.Items), want, rep.Total)
+		}
+		checks++
+	}
+	wg.Wait()
+	if checks == 0 {
+		t.Fatal("no report was verified")
 	}
 }
