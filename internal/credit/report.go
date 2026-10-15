@@ -449,8 +449,12 @@ func (s *Store) Resolve(ctx context.Context, id string, resolution Resolution) e
 		if err != nil {
 			return err
 		}
-		if req.state == stateSettled {
-			return fmt.Errorf("%w: request is already settled", ErrConflict)
+		// Only a pending request may be resolved: an active execution still
+		// holds a concurrency slot, and resolving it would bypass MaxConcurrent
+		// and HasActive accounting.
+		if req.state != statePending {
+			return fmt.Errorf("%w: request %s is %s, only pending requests can be resolved",
+				ErrConflict, req.id, req.state)
 		}
 		if _, err := tx.ExecContext(ctx, `INSERT INTO adjustments
 			(request_id, key_id, action, amount_micro_usd, reason, at) VALUES(?,?,?,?,?,?)`,

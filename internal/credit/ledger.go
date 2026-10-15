@@ -24,6 +24,12 @@ type reqRow struct {
 	tokenEstimate int64
 	charge        int64
 	resolved      string
+	// initialHold is the pre-authorization hold taken at admission. It is kept
+	// after settlement so a late unaccounted execution can restore it.
+	initialHold int64
+	// completionSeen marks that an administrator closed the request and its
+	// late completion metadata was recorded once already.
+	completionSeen bool
 }
 
 func (r *reqRow) toRequest(executions []Usage, adjustment int64) Request {
@@ -48,7 +54,8 @@ func (r *reqRow) toRequest(executions []Usage, adjustment int64) Request {
 
 const requestColumns = `id, trace_id, key_id, model, state, outcome, status_code, started_at,
 	completed_at, held_micro_usd, price_input, price_output, price_reasoning, price_cache_read,
-	price_cache_write, price_version, token_estimate, charge_micro_usd, resolved`
+	price_cache_write, price_version, token_estimate, charge_micro_usd, resolved,
+	initial_hold_micro_usd, completion_seen`
 
 func scanRequest(scan func(...any) error) (*reqRow, error) {
 	var (
@@ -59,12 +66,14 @@ func scanRequest(scan func(...any) error) (*reqRow, error) {
 		in, out   int64
 		cr, cw    int64
 		version   int64
+		seen      int
 	)
 	if err := scan(&r.id, &r.traceID, &r.keyID, &r.model, &r.state, &r.outcome, &r.statusCode,
 		&started, &completed, &r.held, &in, &out, &reasoning, &cr, &cw, &version,
-		&r.tokenEstimate, &r.charge, &r.resolved); err != nil {
+		&r.tokenEstimate, &r.charge, &r.resolved, &r.initialHold, &seen); err != nil {
 		return nil, err
 	}
+	r.completionSeen = seen != 0
 	r.startedAt = fromUnixNano(started)
 	r.completedAt = scanNano(completed)
 	r.price = priceFromRequestRow(in, out, cr, cw, version, reasoning, r.model)
@@ -285,14 +294,18 @@ type usageAgg struct {
 	total    int64
 	reliable int64
 	unknown  int64
+	// success counts reliable executions that did not fail: only those prove a
+	// successful request lifecycle.
+	success int64
 }
 
 func usageStats(ctx context.Context, q querier, requestID string) (usageAgg, error) {
 	var a usageAgg
 	err := q.QueryRowContext(ctx, `SELECT COUNT(*),
 		COALESCE(SUM(reliable),0),
-		COALESCE(SUM(CASE WHEN cost_micro_usd IS NULL THEN 1 ELSE 0 END),0)
-		FROM usages WHERE request_id = ?`, requestID).Scan(&a.total, &a.reliable, &a.unknown)
+		COALESCE(SUM(CASE WHEN cost_micro_usd IS NULL THEN 1 ELSE 0 END),0),
+		COALESCE(SUM(CASE WHEN reliable = 1 AND failed = 0 THEN 1 ELSE 0 END),0)
+		FROM usages WHERE request_id = ?`, requestID).Scan(&a.total, &a.reliable, &a.unknown, &a.success)
 	if err != nil {
 		return a, fmt.Errorf("summarize usages: %w", err)
 	}
@@ -376,7 +389,9 @@ func (s *Store) evaluateSettle(ctx context.Context, tx *sql.Tx, req *reqRow, at 
 			return nil
 		}
 	case OutcomeSucceeded:
-		if agg.reliable == 0 || agg.unknown > 0 {
+		// Only a successful execution whose accounting is complete and not
+		// failed can prove a success; a failed lifecycle event never does.
+		if agg.success == 0 || agg.unknown > 0 {
 			return nil
 		}
 	case OutcomeFailed, OutcomeCanceled:
@@ -387,6 +402,26 @@ func (s *Store) evaluateSettle(ctx context.Context, tx *sql.Tx, req *reqRow, at 
 		return nil
 	}
 	return s.settleRequest(ctx, tx, req, at, resolvedAuto)
+}
+
+// reopenRequest returns an automatically closed request to pending, restoring
+// the pre-authorization hold it originally took. It is used when a late
+// execution with untrustworthy accounting arrives: the outstanding work must be
+// visible again instead of being written off silently.
+func (s *Store) reopenRequest(ctx context.Context, tx *sql.Tx, req *reqRow) error {
+	if req.initialHold != 0 {
+		if err := bumpKeyColumn(ctx, tx, req.keyID, "held_micro_usd", req.initialHold); err != nil {
+			return fmt.Errorf("restore hold: %w", err)
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE requests SET state = ?, resolved = '', held_micro_usd = ?
+		WHERE id = ?`, statePending, req.initialHold, req.id); err != nil {
+		return fmt.Errorf("reopen request: %w", err)
+	}
+	req.state = statePending
+	req.resolved = ""
+	req.held = req.initialHold
+	return nil
 }
 
 func checkedAdd(a, b int64) (int64, error) {

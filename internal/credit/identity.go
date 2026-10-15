@@ -7,14 +7,21 @@ import (
 	"encoding/hex"
 	"fmt"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 )
 
 const (
 	principalPrefix = "cmk:"
 	materialPrefix  = "sk-"
 	materialChars   = 48
-	alphabet        = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
-	fingerprintLen  = 16
+	// materialMinLen and materialMaxLen bound caller supplied key material.
+	// The upper bound also keeps lookup cheap: rejecting an oversized value
+	// before hashing prevents an unauthenticated HMAC denial of service.
+	materialMinLen = 8
+	materialMaxLen = 4096
+	alphabet       = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+	fingerprintLen = 16
 )
 
 func readRandom(b []byte) (int, error) {
@@ -87,6 +94,34 @@ func callerScope(principal string) string {
 	}
 	sum := sha256.Sum256([]byte(callerScopeSalt + value))
 	return hex.EncodeToString(sum[:])
+}
+
+// validateMaterial checks caller supplied key material. CPA trims the value on
+// its way through the host, so surrounding whitespace could never round trip
+// and is rejected instead of being silently rewritten. The prefix and character
+// set stay free form: only NUL/control characters and broken UTF-8 are refused.
+func validateMaterial(material string) error {
+	if material == "" {
+		return fmt.Errorf("%w: key material is empty", ErrInvalid)
+	}
+	if len(material) < materialMinLen {
+		return fmt.Errorf("%w: key material is too short", ErrInvalid)
+	}
+	if len(material) > materialMaxLen {
+		return fmt.Errorf("%w: key material is too long", ErrInvalid)
+	}
+	if strings.TrimSpace(material) != material {
+		return fmt.Errorf("%w: key material must not have leading or trailing whitespace", ErrInvalid)
+	}
+	if !utf8.ValidString(material) {
+		return fmt.Errorf("%w: key material must be valid UTF-8", ErrInvalid)
+	}
+	for _, r := range material {
+		if unicode.IsControl(r) {
+			return fmt.Errorf("%w: key material must not contain control characters", ErrInvalid)
+		}
+	}
+	return nil
 }
 
 // materialHMAC is the irreversible key verifier. Plain material is never stored.

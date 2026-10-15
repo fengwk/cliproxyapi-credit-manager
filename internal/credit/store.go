@@ -64,6 +64,7 @@ const (
 	pepperLen              = 32
 	microPerUnit           = 1_000_000 // rates are microUSD per million tokens
 	cleanupBatch           = 512
+	vacuumPages            = 4096
 	maxPageSize            = 500
 )
 
@@ -128,7 +129,9 @@ CREATE TABLE IF NOT EXISTS requests (
   price_version INTEGER NOT NULL,
   token_estimate INTEGER NOT NULL DEFAULT 0,
   charge_micro_usd INTEGER NOT NULL DEFAULT 0,
-  resolved TEXT NOT NULL DEFAULT ''
+  resolved TEXT NOT NULL DEFAULT '',
+  initial_hold_micro_usd INTEGER NOT NULL DEFAULT 0,
+  completion_seen INTEGER NOT NULL DEFAULT 0
 );
 CREATE UNIQUE INDEX IF NOT EXISTS requests_trace ON requests(trace_id);
 CREATE INDEX IF NOT EXISTS requests_key_state ON requests(key_id, state);

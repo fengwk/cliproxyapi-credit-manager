@@ -233,6 +233,7 @@ func (s *Store) RecordUsage(ctx context.Context, usage Usage) error {
 	if usage.Quality, err = normalizeQuality(usage.Quality); err != nil {
 		return err
 	}
+	explicitAt := !usage.At.IsZero()
 	at := s.resolveAt(usage.At)
 	usage.At = at
 	reliable := accountingReliable(usage)
@@ -250,7 +251,14 @@ func (s *Store) RecordUsage(ctx context.Context, usage Usage) error {
 		existing, err := loadUsageByID(ctx, tx, usage.ID)
 		switch {
 		case err == nil:
-			if existing.materialEqual(usage) {
+			candidate := usage
+			if !explicitAt {
+				// The caller omitted the timestamp, so a replay must compare
+				// against the stored instant instead of the wall clock that
+				// moved on since the original event.
+				candidate.At = existing.at
+			}
+			if existing.materialEqual(candidate) {
 				return nil // idempotent replay
 			}
 			return fmt.Errorf("%w: usage id reused with different content", ErrConflict)
@@ -288,6 +296,15 @@ func (s *Store) RecordUsage(ctx context.Context, usage Usage) error {
 		// discard a real charge.
 		if cost != nil {
 			if err := s.applyCharge(ctx, tx, req, usage.ID, *cost); err != nil {
+				return err
+			}
+		}
+		if cost == nil && req.state == stateSettled && req.resolved == resolvedAuto {
+			// Untrustworthy accounting arrived after the request was closed
+			// automatically: reopen it so the work stays visible until an
+			// administrator decides. A manually resolved request is left
+			// closed because an administrator already ruled on it.
+			if err := s.reopenRequest(ctx, tx, req); err != nil {
 				return err
 			}
 		}
@@ -339,6 +356,20 @@ func (s *Store) Complete(ctx context.Context, c Completion) error {
 		}
 		if strings.TrimSpace(c.TraceID) != "" && c.TraceID != req.traceID {
 			return fmt.Errorf("%w: completion trace does not match request", ErrConflict)
+		}
+		if req.state == stateSettled && req.resolved != resolvedAuto {
+			// An administrator already closed this request. A late completion
+			// may record its outcome metadata once, but it must never reopen
+			// the request or touch the released hold.
+			if req.completionSeen {
+				return fmt.Errorf("%w: request was already closed by %s and its completion was recorded",
+					ErrConflict, req.resolved)
+			}
+			if _, err := tx.ExecContext(ctx, `UPDATE requests SET outcome = ?, status_code = ?,
+				completion_seen = 1 WHERE id = ?`, c.Outcome, c.StatusCode, req.id); err != nil {
+				return fmt.Errorf("record late completion: %w", err)
+			}
+			return nil
 		}
 		if req.outcome != "" {
 			// A repeated completion must agree, otherwise the ledger would

@@ -223,13 +223,16 @@ func (s *Store) CreateKey(ctx context.Context, spec KeySpec) (Key, string, error
 	if err != nil {
 		return Key{}, "", err
 	}
-	material := strings.TrimSpace(spec.Material)
+	// Only an empty value is generated. Anything else, including an all blank
+	// string, is validated as caller supplied material so a typo can never
+	// silently mint a different key than the operator intended.
+	material := spec.Material
 	if material == "" {
 		if material, err = newMaterial(); err != nil {
 			return Key{}, "", err
 		}
-	} else if len(material) < 8 {
-		return Key{}, "", fmt.Errorf("%w: key material is too short", ErrInvalid)
+	} else if err := validateMaterial(material); err != nil {
+		return Key{}, "", err
 	}
 	allowed, err := marshalAllowedModels(norm.AllowedModels)
 	if err != nil {
@@ -289,7 +292,9 @@ func (s *Store) UpdateKey(ctx context.Context, id string, spec KeySpec) (Key, er
 	if strings.TrimSpace(id) == "" {
 		return Key{}, fmt.Errorf("%w: key id is required", ErrInvalid)
 	}
-	if strings.TrimSpace(spec.Material) != "" {
+	// Any non empty material, including a whitespace only value, is refused
+	// rather than silently ignored: material changes go through RotateKey.
+	if spec.Material != "" {
 		return Key{}, fmt.Errorf("%w: use RotateKey to change key material", ErrInvalid)
 	}
 	norm, err := normalizeSpec(spec)
@@ -338,12 +343,14 @@ func (s *Store) RotateKey(ctx context.Context, id string, custom string) (Key, s
 	if strings.TrimSpace(id) == "" {
 		return Key{}, "", fmt.Errorf("%w: key id is required", ErrInvalid)
 	}
-	material := strings.TrimSpace(custom)
+	material := custom
 	var err error
 	if material == "" {
 		if material, err = newMaterial(); err != nil {
 			return Key{}, "", err
 		}
+	} else if err := validateMaterial(material); err != nil {
+		return Key{}, "", err
 	}
 	hmac := materialHMAC(s.pepper, material)
 	var out Key
@@ -427,7 +434,10 @@ func (s *Store) GetKey(ctx context.Context, id string) (Key, error) {
 
 // Authenticate verifies raw key material and rejects disabled or expired keys.
 func (s *Store) Authenticate(ctx context.Context, material string) (Key, error) {
-	if strings.TrimSpace(material) == "" {
+	// Reject oversized and empty input before hashing so an unauthenticated
+	// caller cannot force an expensive HMAC. The opaque value is passed to the
+	// verifier unchanged, never normalized.
+	if strings.TrimSpace(material) == "" || len(material) > materialMaxLen {
 		return Key{}, ErrUnauthorized
 	}
 	hmac := materialHMAC(s.pepper, material)
