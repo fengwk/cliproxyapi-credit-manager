@@ -227,14 +227,16 @@ func Open(opts Options) (*Store, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, fmt.Errorf("create data dir: %w", err)
 	}
-	pepper, err := loadPepper(filepath.Join(dir, pepperFileName))
+	// The lock is taken before any other file is read or created: a second
+	// instance must neither run recovery over live executions nor observe a
+	// half written pepper left behind by an owner that just started.
+	lock, err := acquireDirLock(filepath.Join(dir, lockFileName))
 	if err != nil {
 		return nil, err
 	}
-	// The lock is taken before touching the database so a second instance can
-	// never run recovery against another process's live executions.
-	lock, err := acquireDirLock(filepath.Join(dir, lockFileName))
+	pepper, err := loadPepper(filepath.Join(dir, pepperFileName))
 	if err != nil {
+		_ = lock.release()
 		return nil, err
 	}
 	dbPath := filepath.Join(dir, dbFileName)
@@ -304,8 +306,11 @@ func loadPepper(path string) ([]byte, error) {
 		if len(b) != pepperLen {
 			return nil, fmt.Errorf("%w: pepper file is corrupt", ErrInvalid)
 		}
-		// Never keep the pepper group/world readable.
-		_ = os.Chmod(path, 0o600)
+		// Never keep the pepper group/world readable. A directory that cannot
+		// be secured must not be used for financial data.
+		if err := os.Chmod(path, 0o600); err != nil {
+			return nil, fmt.Errorf("secure pepper: %w", err)
+		}
 		return b, nil
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return nil, fmt.Errorf("read pepper: %w", err)
@@ -327,6 +332,23 @@ func loadPepper(path string) ([]byte, error) {
 	}
 	if _, err := f.Write(b); err != nil {
 		return nil, fmt.Errorf("write pepper: %w", err)
+	}
+	// The pepper has to be durable before the first financial commit: losing it
+	// while the ledger survives would leave every stored verifier unusable.
+	if err := f.Sync(); err != nil {
+		return nil, fmt.Errorf("sync pepper: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		return nil, fmt.Errorf("close pepper: %w", err)
+	}
+	// Flushing the file only makes its content durable; flushing the directory
+	// makes the new name durable as well.
+	if d, err := os.Open(filepath.Dir(path)); err == nil {
+		syncErr := d.Sync()
+		_ = d.Close()
+		if syncErr != nil {
+			return nil, fmt.Errorf("sync data dir: %w", syncErr)
+		}
 	}
 	return b, nil
 }

@@ -641,3 +641,27 @@ func TestScopeStableAcrossRotationAndRestart(t *testing.T) {
 		}
 	}
 }
+
+// TestOpenTakesLockBeforeTouchingPepper proves the directory lock is acquired
+// before the pepper is read or created: an instance that loses the race must
+// fail with ErrLocked without leaving a pepper behind for the owner to trip on.
+func TestOpenTakesLockBeforeTouchingPepper(t *testing.T) {
+	dir := t.TempDir()
+	// Stand in for an owner that holds the directory but has not written its
+	// pepper yet, which is exactly the window a second instance would race into.
+	lock, err := acquireDirLock(filepath.Join(dir, lockFileName))
+	if err != nil {
+		t.Fatalf("acquire dir lock: %v", err)
+	}
+	defer func() { _ = lock.release() }()
+
+	if _, err := Open(Options{DataDir: dir}); !errors.Is(err, ErrLocked) {
+		t.Fatalf("open err = %v, want ErrLocked", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, pepperFileName)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("pepper was touched while another instance held the lock: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, dbFileName)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("database was created while another instance held the lock: %v", err)
+	}
+}

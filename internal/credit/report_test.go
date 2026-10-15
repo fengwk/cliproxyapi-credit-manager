@@ -488,3 +488,104 @@ func TestReportSeparatesCostFromAdjustments(t *testing.T) {
 		t.Fatalf("adjustment leaked into an unrelated key: %d", byKey.Summary.AdjustmentMicroUSD)
 	}
 }
+
+// TestCacheReadRatioUsesOnlyCompleteExecutions keeps the documented cache read
+// ratio honest: the canonical token totals still sum every execution, but the
+// ratio only measures executions whose accounting is complete, so a partial
+// execution cannot pollute it.
+func TestCacheReadRatioUsesOnlyCompleteExecutions(t *testing.T) {
+	h := newHarness(t)
+	h.mustPrice("m1", Rates{Input: million, CacheRead: million})
+	key, _ := h.mustKey(KeySpec{Enabled: true})
+	ctx := h.ctx()
+	from := testEpoch.AddDate(0, 0, -1)
+	to := testEpoch.AddDate(0, 0, 2)
+
+	trusted := h.mustReserve(ReserveInput{ID: "r1", TraceID: "t1", KeyID: key.ID,
+		RequestedModel: "m1", InputEstimate: 100})
+	h.mustUsage(usageFor("u1", trusted, "m1", tokens(100, 100, 0, 0, 0))) // quality complete
+	h.mustComplete(Completion{ID: trusted.ID, TraceID: trusted.TraceID, Outcome: OutcomeSucceeded})
+
+	sloppy := h.mustReserve(ReserveInput{ID: "r2", TraceID: "t2", KeyID: key.ID,
+		RequestedModel: "m1", InputEstimate: 100})
+	partial := usageFor("u2", sloppy, "m1", tokens(100, 900, 0, 0, 0))
+	partial.Quality = QualityPartial
+	h.mustUsage(partial)
+
+	rep, err := h.store.Report(ctx, Filter{From: from, To: to, Bucket: "day"})
+	if err != nil {
+		t.Fatalf("report: %v", err)
+	}
+	// Canonical totals keep counting every execution: 200 input, 1000 cache read.
+	if rep.Summary.Tokens.Total != 1200 || rep.Summary.Tokens.Input != 200 || rep.Summary.Tokens.CacheRead != 1000 {
+		t.Fatalf("summary tokens = %+v, want every execution counted", rep.Summary.Tokens)
+	}
+	if rep.Summary.Executions != 2 {
+		t.Fatalf("executions = %d, want 2", rep.Summary.Executions)
+	}
+	if rep.Summary.CacheReadRatio == nil {
+		t.Fatal("ratio = nil, want the complete execution ratio")
+	}
+	// Only the complete execution is measured: 100 / (100 input + 100 cache read).
+	if got := *rep.Summary.CacheReadRatio; got != 0.5 {
+		t.Fatalf("ratio = %v, want 0.5", got)
+	}
+	if len(rep.Trend) != 1 {
+		t.Fatalf("trend points = %d, want 1", len(rep.Trend))
+	}
+	if rep.Trend[0].Summary.CacheReadRatio == nil || *rep.Trend[0].Summary.CacheReadRatio != 0.5 {
+		t.Fatalf("trend ratio = %v, want the same complete-only ratio", rep.Trend[0].Summary.CacheReadRatio)
+	}
+
+	// An execution set without a single complete execution reports no ratio at
+	// all instead of dividing partial counters by themselves.
+	other, _ := h.mustKey(KeySpec{Enabled: true})
+	untrusted := h.mustReserve(ReserveInput{ID: "r3", TraceID: "t3", KeyID: other.ID,
+		RequestedModel: "m1", InputEstimate: 100})
+	unknown := usageFor("u3", untrusted, "m1", tokens(100, 900, 0, 0, 0))
+	unknown.Quality = QualityPartial
+	h.mustUsage(unknown)
+	onlyPartial, err := h.store.Report(ctx, Filter{From: from, To: to, KeyID: other.ID})
+	if err != nil {
+		t.Fatalf("report other key: %v", err)
+	}
+	if onlyPartial.Summary.CacheReadRatio != nil {
+		t.Fatalf("ratio = %v, want none without complete executions", *onlyPartial.Summary.CacheReadRatio)
+	}
+	if onlyPartial.Summary.Tokens.Total != 1000 {
+		t.Fatalf("partial tokens = %d, want them still reported", onlyPartial.Summary.Tokens.Total)
+	}
+}
+
+// TestReportRejectsAggregateOverflow pins the accepted behaviour for sums that
+// no int64 can hold: the aggregate is rejected with an error instead of being
+// returned as a silently truncated or floating point total.
+func TestReportRejectsAggregateOverflow(t *testing.T) {
+	h := newHarness(t)
+	h.mustPrice("big", Rates{Input: 1_000_000_000_000})
+	from := testEpoch.AddDate(0, 0, -1)
+	to := testEpoch.AddDate(0, 0, 1)
+	const tokensNearMax = 9_000_000_000_000 // * rate / 1M = 9e18 microUSD
+
+	keys := make([]Key, 0, 2)
+	for i := 0; i < 2; i++ {
+		key, _ := h.mustKey(KeySpec{Label: "big-" + itoa(i), Enabled: true})
+		keys = append(keys, key)
+		req := h.mustReserve(ReserveInput{ID: "r" + itoa(i), TraceID: "t" + itoa(i), KeyID: key.ID,
+			RequestedModel: "big", InputEstimate: tokensNearMax})
+		h.mustUsage(usageFor("u"+itoa(i), req, "big", tokens(tokensNearMax, 0, 0, 0, 0)))
+		h.mustComplete(Completion{ID: req.ID, TraceID: req.TraceID, Outcome: OutcomeSucceeded})
+	}
+	// Each key alone is representable and stays exact.
+	single, err := h.store.Report(h.ctx(), Filter{From: from, To: to, KeyID: keys[0].ID})
+	if err != nil {
+		t.Fatalf("single key report: %v", err)
+	}
+	if single.Summary.CostMicroUSD != 9_000_000_000_000_000_000 {
+		t.Fatalf("single key cost = %d, want the exact near limit value", single.Summary.CostMicroUSD)
+	}
+	// The unrepresentable sum of both keys is refused rather than truncated.
+	if _, err := h.store.Report(h.ctx(), Filter{From: from, To: to}); err == nil {
+		t.Fatal("cross key report: want an explicit overflow error, got a summary")
+	}
+}
