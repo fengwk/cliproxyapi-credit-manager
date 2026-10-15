@@ -207,7 +207,8 @@ metadata.json                            # id/name/version/goos/goarch/sdk/commi
 | 文档 | 内容 |
 | --- | --- |
 | [`docs/operations.md`](docs/operations.md) | 安装/升级、配置、备份恢复、保留与清理、快照、预热、故障处理 |
-| [`docs/release-notes-v0.1.0.md`](docs/release-notes-v0.1.0.md) | v0.1.0 发布说明 |
+| [`docs/release-notes-v0.1.1.md`](docs/release-notes-v0.1.1.md) | v0.1.1 请求详情布局修复 |
+| [`docs/release-notes-v0.1.0.md`](docs/release-notes-v0.1.0.md) | 首次发布功能与保证边界 |
 | [`docs/IMPLEMENTATION.md`](docs/IMPLEMENTATION.md) | 实现契约（评审/维护用） |
 | [`config.example.yaml`](config.example.yaml) | 可直接套用的 CPA v8 配置示例 |
 | [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) | 第三方许可与改编说明 |

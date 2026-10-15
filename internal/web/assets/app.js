@@ -2183,7 +2183,7 @@
       executions.length ? executions[0].response_model : ''
     );
 
-    var meta = el('div', { class: 'grid-2' }, [
+    var meta = el('div', { class: 'request-meta' }, [
       el('div', { class: 'kv' }, [
         el('span', { class: 'kv-k', text: '请求模型' }),
         el('span', { class: 'kv-v', text: request.model ? String(request.model) : '—' }),
@@ -2199,11 +2199,11 @@
           text: executions.length && executions[0].response_model ? String(executions[0].response_model) : '未上报',
         }),
       ]),
-      el('div', { class: 'kv' }, [
+      el('div', { class: 'kv kv-wide' }, [
         el('span', { class: 'kv-k', text: '价格' }),
         el('span', { class: 'kv-v', text: requestPriceText(request) }),
       ]),
-      el('div', { class: 'kv' }, [
+      el('div', { class: 'kv kv-wide' }, [
         el('span', { class: 'kv-k', text: '人工补记（adjustment_micro_usd）' }),
         el('span', { class: 'kv-v', text: formatMicroUSDPair(adjustmentMicro) + '（管理员 Resolve 记账，独立于执行成本）' }),
       ]),

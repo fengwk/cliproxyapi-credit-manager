@@ -312,6 +312,12 @@ table.data tbody tr.row-main:hover { background: rgba(76, 141, 255, 0.06); }
 .kv-k { color: var(--text-faint); flex: 0 0 auto; }
 .kv-v { font-family: var(--mono); word-break: break-all; min-width: 0; }
 
+/* 请求模型并列，长价格/人工补记独占整行，标签不得挤占数值宽度。 */
+.request-meta { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px 16px; }
+.request-meta .kv { display: grid; grid-template-columns: minmax(0, 1fr); align-content: start; gap: 4px; }
+.request-meta .kv-v { word-break: normal; overflow-wrap: anywhere; }
+.request-meta .kv-wide { grid-column: 1 / -1; }
+
 /* ---------- 徽标 ---------- */
 
 .badge {
@@ -493,4 +499,5 @@ pre.code {
   .modal-root { padding: 2vh 8px; }
   .toast-root { left: 10px; right: 10px; bottom: 10px; max-width: none; }
   .form-grid { grid-template-columns: 1fr; }
+  .request-meta { grid-template-columns: minmax(0, 1fr); }
 }

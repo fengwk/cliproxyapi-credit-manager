@@ -346,6 +346,18 @@ async function main() {
 
     const itemsText = await cdp.text('#usage-items');
     check('明细标注请求/执行/响应模型', itemsText.includes('请求模型') && itemsText.includes('执行模型') && itemsText.includes('响应模型'));
+    const requestLayout = () => cdp.evaluate(`(() => {
+      const values = [...document.querySelectorAll('#usage-items .kv-v')];
+      const cards = [...document.querySelectorAll('#usage-items > .card')];
+      return {
+        fields: values.length,
+        minValueWidth: Math.min(...values.map(n => n.getBoundingClientRect().width)),
+        maxCardHeight: Math.max(...cards.map(n => n.getBoundingClientRect().height))
+      };
+    })()`);
+    const desktopLayout = await requestLayout();
+    check('桌面请求字段保留可读宽度而非逐字竖排', desktopLayout.fields === 30 && desktopLayout.minValueWidth >= 160, JSON.stringify(desktopLayout));
+    check('桌面长价格和人工补记不撑高请求卡片', desktopLayout.maxCardHeight < 600, JSON.stringify(desktopLayout));
     check('命名空间差异仅提示不当作异常', itemsText.includes('仅命名空间前缀不同'), itemsText.slice(0, 200));
     // 质量非完整（partial/unknown）且服务端未给金额时必须是「未结算」，不能显示 0。
     const execCosts = await cdp.evaluate(
@@ -681,6 +693,12 @@ async function main() {
     await sleep(300);
     const overflow = await cdp.evaluate('document.documentElement.scrollWidth - window.innerWidth');
     check('移动端页面无横向溢出', overflow <= 1, 'overflow=' + overflow);
+    const mobileLayout = await requestLayout();
+    check('移动端请求字段保留可读宽度', mobileLayout.fields > 0 && mobileLayout.minValueWidth >= 160, JSON.stringify(mobileLayout));
+    check('移动端长文本卡片高度有界', mobileLayout.maxCardHeight < 1000, JSON.stringify(mobileLayout));
+    await cdp.evaluate("document.querySelector('#usage-items > .card').scrollIntoView({block: 'start'})");
+    await cdp.screenshot('12b-mobile-request.png');
+    await cdp.evaluate("window.scrollTo(0, 0)");
     const chartScroll = await cdp.evaluate(
       "(() => { const c = document.querySelector('#usage-chart'); return { inner: c.clientWidth, outer: c.scrollWidth }; })()"
     );
