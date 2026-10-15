@@ -1,0 +1,77 @@
+# CLIProxyAPI v8 配置示例（cliproxyapi-credit-manager）
+#
+# 复制为 CLIProxyAPI 可执行文件旁边的 config.yaml，并按注释替换所有占位值。
+# 切勿把真实的客户端 Key、上游凭据或管理密钥提交进版本库。
+#
+# 本文件只包含运行本插件所需的字段；其余 CPA 选项保持 v8 默认值。文件中的
+# 插件配置块与 tests/integration 的验收宿主（tests/integration/acceptance/host.py）
+# 渲染出的格式一致，并由插件自身的严格解析器校验（未知键会直接报错）。
+
+config-version: 8
+
+server:
+  host: "127.0.0.1"
+  port: 8317
+
+# 管理接口。保持关闭远程访问、关闭自带控制面板：财务界面由插件资源路由提供。
+management:
+  allow-remote: false
+  secret-key: "replace-with-management-password"
+  disable-control-panel: true
+
+# CPA 原生客户端 Key。本插件是独占式前端鉴权提供方，真正对外分发的只有插件
+# 内的客户端 Key；这里保留一项是为了满足宿主对原生鉴权的既有结构，属于“部署
+# 守卫”，必须保密，绝不能分发给任何调用方。详见 docs/operations.md 的“安全边界”。
+access:
+  api-keys:
+    - "replace-with-undistributed-cpa-native-key"
+
+# 上游凭据由 CPA 自己保管（通过控制面板/管理接口添加），不会写入本文件，
+# 也不会写入插件的任何文件或数据库。
+oauth:
+  auth-dir: "./auths"
+
+routing:
+  retry:
+    request-retry: 3
+
+plugins:
+  enabled: true
+  dir: "./plugins"
+  configs:
+    # 键名 = 宿主加载的动态库 id，也就是库文件名去掉扩展名。
+    # 发布归档中的库文件名为 cliproxyapi-credit-manager.so（darwin 为 .dylib），
+    # 因此实例 id 是 cliproxyapi-credit-manager。
+    cliproxyapi-credit-manager:
+      # enabled 由宿主解释：关闭它只停用本插件实例，不会改动 plugins.enabled。
+      enabled: true
+
+      # 插件数据目录（pepper、账务库、快照库、目录锁都在这里）。
+      # 相对路径按 CPA 进程工作目录解析为绝对路径，运行期不可修改。
+      data_dir: "./data/cliproxyapi-credit-manager"
+
+      # 历史保留：3 个 UTC 日历月（1..1200）。终身累计计数不受清理影响。
+      history:
+        retention_months: 3
+
+      # 每个 Key 允许同时在途（active + pending）的请求上限（1..10000）。
+      max_pending_requests: 16
+
+      # 请求快照。默认关闭；这是执行入口诊断快照，不是网络原始报文。
+      request_capture:
+        enabled: false          # 默认 false：不抓取任何请求
+        retention: "24h"        # 允许保留时长，Go duration，必须为正
+        max_body_bytes: 10485760     # 单个请求体上限 10 MiB（1B..100MiB）
+        max_storage_bytes: 1073741824 # 物理上限 1 GiB（1MiB..1TiB），含 WAL
+
+      # 账号预热。默认关闭，且本插件不建议默认开启：开启后会对真实凭据发起真实请求。
+      warmup:
+        enabled: false
+        interval: "1h"
+        # targets 必须逐个写死 auth_id / provider / model，插件不会替你猜测；
+        # 留空即不产生任何后台请求。
+        # targets:
+        #   - auth_id: "replace-with-cpa-credential-auth-id"
+        #     provider: "replace-with-provider"
+        #     model: "replace-with-model-id"
+        #     protocol: "openai"    # openai | claude | gemini，缺省 openai
