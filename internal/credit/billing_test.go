@@ -173,10 +173,11 @@ func TestUsageBeforeCompletionIsChargedOnce(t *testing.T) {
 	if req.HeldMicroUSD != 300 {
 		t.Fatalf("hold = %d, want 300", req.HeldMicroUSD)
 	}
-	// Usage arrives first, while the execution is still active.
+	// Usage arrives first, while the execution is still active. A trustworthy
+	// charge is booked immediately; only the hold waits for completion.
 	h.mustUsage(usageFor("u1", req, "m1", tokens(100, 0, 0, 100, 0)))
-	if got := h.key(key.ID); got.SpentMicroUSD != 0 || got.HeldMicroUSD != 300 {
-		t.Fatalf("active accounting = spent %d held %d, want 0/300", got.SpentMicroUSD, got.HeldMicroUSD)
+	if got := h.key(key.ID); got.SpentMicroUSD != 300 || got.HeldMicroUSD != 300 {
+		t.Fatalf("active accounting = spent %d held %d, want 300/300", got.SpentMicroUSD, got.HeldMicroUSD)
 	}
 	h.mustComplete(Completion{ID: req.ID, TraceID: req.TraceID, Outcome: OutcomeSucceeded})
 	got := h.key(key.ID)
@@ -201,7 +202,10 @@ func TestUsageBeforeCompletionIsChargedOnce(t *testing.T) {
 	}
 }
 
-func TestUsageAfterCompletionSettlesAndUnknownStaysPending(t *testing.T) {
+// TestUnknownExecutionBlocksClosureButStillCharges proves that an unreliable
+// execution keeps the request (and its remaining hold) open while every
+// trustworthy charge is booked immediately and never written off twice.
+func TestUnknownExecutionBlocksClosureButStillCharges(t *testing.T) {
 	h, key := billingHarness(t)
 	req := h.mustReserve(ReserveInput{ID: "r1", TraceID: "t1", KeyID: key.ID, RequestedModel: "m1",
 		InputEstimate: 100, OutputEstimate: 100})
@@ -212,7 +216,7 @@ func TestUsageAfterCompletionSettlesAndUnknownStaysPending(t *testing.T) {
 	if held := h.key(key.ID).HeldMicroUSD; held != 300 {
 		t.Fatalf("hold after completion without usage = %d, want 300", held)
 	}
-	// Unknown accounting must not be billed as zero.
+	// Unknown accounting is recorded but never billed as a zero.
 	unknown := usageFor("u-unknown", req, "m1", Tokens{})
 	unknown.Quality = QualityUnknown
 	h.mustUsage(unknown)
@@ -222,14 +226,24 @@ func TestUsageAfterCompletionSettlesAndUnknownStaysPending(t *testing.T) {
 	if got := h.key(key.ID).SpentMicroUSD; got != 0 {
 		t.Fatalf("unknown usage charged %d, want 0", got)
 	}
-	// A later reliable usage closes the request with the known amount only.
+	// A trustworthy usage charges immediately but the unknown sibling still
+	// blocks closure, so the remaining hold is kept instead of written off.
 	h.mustUsage(usageFor("u-known", req, "m1", tokens(100, 0, 0, 100, 0)))
 	got := h.request(req.ID)
-	if got.State != stateSettled {
-		t.Fatalf("state = %q, want settled", got.State)
+	if got.State != statePending {
+		t.Fatalf("state with unknown execution = %q, want pending", got.State)
 	}
 	if spent := h.key(key.ID).SpentMicroUSD; spent != 300 {
-		t.Fatalf("spent = %d, want 300", spent)
+		t.Fatalf("spent = %d, want the immediate 300", spent)
+	}
+	if held := h.key(key.ID).HeldMicroUSD; held != 300 {
+		t.Fatalf("hold with unknown execution = %d, want 300 retained", held)
+	}
+	// A repeated completion must not change anything while the request is
+	// unresolved, but it is still checked for agreement.
+	h.mustComplete(Completion{ID: req.ID, TraceID: req.TraceID, Outcome: OutcomeSucceeded})
+	if got := h.request(req.ID); got.State != statePending {
+		t.Fatalf("state after replay = %q, want pending", got.State)
 	}
 	if len(got.Executions) != 2 {
 		t.Fatalf("executions = %d, want 2", len(got.Executions))
@@ -246,52 +260,182 @@ func TestUsageAfterCompletionSettlesAndUnknownStaysPending(t *testing.T) {
 			}
 		}
 	}
+	// Only an administrator decision can close it; the charge stays booked.
+	if err := h.store.Resolve(h.ctx(), req.ID, Resolution{Action: ActionRelease, Reason: "unknown accounting"}); err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	if k := h.key(key.ID); k.SpentMicroUSD != 300 || k.HeldMicroUSD != 0 {
+		t.Fatalf("after resolve spent %d held %d, want 300/0", k.SpentMicroUSD, k.HeldMicroUSD)
+	}
 }
 
-func TestFailedOutcomeSettlementRules(t *testing.T) {
+// TestUnknownExecutionOrderingAndIdempotency covers the event orders the native
+// bridge can produce for one execution set.
+func TestUnknownExecutionOrderingAndIdempotency(t *testing.T) {
 	h, key := billingHarness(t)
-	// A 5xx failure with no usage might still have consumed tokens: stay pending.
-	r1 := h.mustReserve(ReserveInput{ID: "r1", TraceID: "t1", KeyID: key.ID, RequestedModel: "m1",
-		InputEstimate: 10, OutputEstimate: 10})
-	h.mustComplete(Completion{ID: r1.ID, TraceID: r1.TraceID, Outcome: OutcomeFailed, StatusCode: 500})
-	if got := h.request(r1.ID); got.State != statePending {
-		t.Fatalf("5xx failure state = %q, want pending", got.State)
+	ctx := h.ctx()
+	reserve := func(id string) Request {
+		return h.mustReserve(ReserveInput{ID: id, TraceID: "t-" + id, KeyID: key.ID, RequestedModel: "m1",
+			InputEstimate: 100, OutputEstimate: 100})
 	}
-	// A proven 4xx rejection closes with no charge.
-	r2 := h.mustReserve(ReserveInput{ID: "r2", TraceID: "t2", KeyID: key.ID, RequestedModel: "m1",
-		InputEstimate: 10, OutputEstimate: 10})
-	h.mustComplete(Completion{ID: r2.ID, TraceID: r2.TraceID, Outcome: OutcomeFailed, StatusCode: 429})
-	if got := h.request(r2.ID); got.State != stateSettled {
-		t.Fatalf("rejected state = %q, want settled", got.State)
+	// Order A: unknown first, completion second, trustworthy usage last.
+	a := reserve("a")
+	unknownA := usageFor("ua", a, "m1", Tokens{})
+	unknownA.Quality = QualityUnknown
+	h.mustUsage(unknownA)
+	h.mustComplete(Completion{ID: a.ID, TraceID: a.TraceID, Outcome: OutcomeSucceeded})
+	if got := h.request(a.ID).State; got != statePending {
+		t.Fatalf("order A state = %q, want pending", got)
 	}
-	if held := h.key(key.ID).HeldMicroUSD; held != 30 {
-		t.Fatalf("held = %d, want only the unresolved request's 30", held)
+	h.mustUsage(usageFor("ua2", a, "m1", tokens(100, 0, 0, 100, 0)))
+	if got := h.key(key.ID).SpentMicroUSD; got != 300 {
+		t.Fatalf("order A spent = %d, want 300", got)
 	}
-	// A failed execution that reported real usage is charged.
-	r3 := h.mustReserve(ReserveInput{ID: "r3", TraceID: "t3", KeyID: key.ID, RequestedModel: "m1",
-		InputEstimate: 10, OutputEstimate: 10})
-	failed := usageFor("u-failed", r3, "m1", tokens(100, 0, 0, 100, 0))
-	failed.Failed = true
-	failed.Quality = ""
-	failed.StatusCode = 500
-	h.mustUsage(failed)
-	h.mustComplete(Completion{ID: r3.ID, TraceID: r3.TraceID, Outcome: OutcomeFailed, StatusCode: 500})
-	if got := h.request(r3.ID); got.State != stateSettled {
-		t.Fatalf("failed-with-usage state = %q, want settled", got.State)
+	// Order B: unknown first, trustworthy second, completion last.
+	b := reserve("b")
+	unknownB := usageFor("ub", b, "m1", Tokens{})
+	unknownB.Quality = QualityPartial
+	h.mustUsage(unknownB)
+	h.mustUsage(usageFor("ub2", b, "m1", tokens(100, 0, 0, 100, 0)))
+	h.mustComplete(Completion{ID: b.ID, TraceID: b.TraceID, Outcome: OutcomeSucceeded})
+	if got := h.request(b.ID).State; got != statePending {
+		t.Fatalf("order B state = %q, want pending", got)
 	}
-	if spent := h.key(key.ID).SpentMicroUSD; spent != 300 {
-		t.Fatalf("spent = %d, want 300", spent)
+	if got := h.key(key.ID).SpentMicroUSD; got != 600 {
+		t.Fatalf("order B spent = %d, want 600", got)
 	}
-	// A failed execution with zero tokens and no quality stays unknown.
-	r4 := h.mustReserve(ReserveInput{ID: "r4", TraceID: "t4", KeyID: key.ID, RequestedModel: "m1",
-		InputEstimate: 10, OutputEstimate: 10})
-	zero := usageFor("u-zero", r4, "m1", Tokens{})
+	// Both events are replayable without changing money.
+	h.mustUsage(unknownA)
+	h.mustUsage(usageFor("ua2", a, "m1", tokens(100, 0, 0, 100, 0)))
+	h.mustUsage(unknownB)
+	h.mustUsage(usageFor("ub2", b, "m1", tokens(100, 0, 0, 100, 0)))
+	if got := h.key(key.ID).SpentMicroUSD; got != 600 {
+		t.Fatalf("replay spent = %d, want 600", got)
+	}
+	// Resolving with a charge adds on top of the already booked usage.
+	if err := h.store.Resolve(ctx, b.ID, Resolution{Action: ActionCharge, AmountMicroUSD: 50, Reason: "manual"}); err != nil {
+		t.Fatalf("resolve charge: %v", err)
+	}
+	if got := h.key(key.ID).SpentMicroUSD; got != 650 {
+		t.Fatalf("resolve charge spent = %d, want 650", got)
+	}
+}
+
+// TestCompletionOutcomes pins down which outcomes may close a request without
+// an execution event. A 4xx status is never proof on its own.
+func TestCompletionOutcomes(t *testing.T) {
+	h, key := billingHarness(t)
+	ctx := h.ctx()
+	reserve := func(id string) Request {
+		return h.mustReserve(ReserveInput{ID: id, TraceID: "t-" + id, KeyID: key.ID, RequestedModel: "m1",
+			InputEstimate: 10, OutputEstimate: 10})
+	}
+	closeOrNot := func(id, outcome string, status int, wantState string) Request {
+		req := reserve(id)
+		h.mustComplete(Completion{ID: req.ID, TraceID: req.TraceID, Outcome: outcome, StatusCode: status})
+		got := h.request(id)
+		if got.State != wantState {
+			t.Fatalf("%s/%d state = %q, want %q", outcome, status, got.State, wantState)
+		}
+		return got
+	}
+	// Failures without evidence stay pending regardless of the status code.
+	closeOrNot("f500", OutcomeFailed, 500, statePending)
+	closeOrNot("f429", OutcomeFailed, 429, statePending)
+	closeOrNot("f401", OutcomeFailed, 401, statePending)
+	closeOrNot("f400", OutcomeFailed, 400, statePending)
+	// A cancellation is treated like a failure: partial usage may be missing.
+	closeOrNot("c001", OutcomeCanceled, 0, statePending)
+	closeOrNot("c499", OutcomeCanceled, 499, statePending)
+	// Only a proven rejection closes without usage, whatever the status.
+	closeOrNot("r000", OutcomeRejected, 0, stateSettled)
+	closeOrNot("r403", OutcomeRejected, 403, stateSettled)
+	// A trustworthy usage closes failures and cancellations.
+	failed := reserve("f-with-usage")
+	failedUsage := usageFor("uf", failed, "m1", tokens(100, 0, 0, 0, 0))
+	failedUsage.Failed = true
+	h.mustUsage(failedUsage)
+	h.mustComplete(Completion{ID: failed.ID, TraceID: failed.TraceID, Outcome: OutcomeFailed, StatusCode: 500})
+	if got := h.request(failed.ID).State; got != stateSettled {
+		t.Fatalf("failed with usage state = %q, want settled", got)
+	}
+	canceled := reserve("c-with-usage")
+	h.mustUsage(usageFor("uc", canceled, "m1", tokens(50, 0, 0, 0, 0)))
+	h.mustComplete(Completion{ID: canceled.ID, TraceID: canceled.TraceID, Outcome: OutcomeCanceled})
+	if got := h.request(canceled.ID).State; got != stateSettled {
+		t.Fatalf("canceled with usage state = %q, want settled", got)
+	}
+	// A rejection still charges what was reported.
+	rejected := reserve("r-with-usage")
+	h.mustUsage(usageFor("ur", rejected, "m1", tokens(10, 0, 0, 0, 0)))
+	h.mustComplete(Completion{ID: rejected.ID, TraceID: rejected.TraceID, Outcome: OutcomeRejected, StatusCode: 403})
+	if got := h.request(rejected.ID).State; got != stateSettled {
+		t.Fatalf("rejected with usage state = %q, want settled", got)
+	}
+	// Unsupported outcomes are rejected outright.
+	if err := h.store.Complete(ctx, Completion{ID: failed.ID, Outcome: "timedout"}); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("unknown outcome err = %v, want ErrInvalid", err)
+	}
+	// Failed-zero with unknown accounting stays pending.
+	unknownZero := reserve("f-zero")
+	zero := usageFor("uz", unknownZero, "m1", Tokens{})
 	zero.Failed = true
 	zero.Quality = QualityUnknown
 	h.mustUsage(zero)
-	h.mustComplete(Completion{ID: r4.ID, TraceID: r4.TraceID, Outcome: OutcomeFailed, StatusCode: 500})
-	if got := h.request(r4.ID); got.State != statePending {
-		t.Fatalf("failed-zero state = %q, want pending", got.State)
+	h.mustComplete(Completion{ID: unknownZero.ID, TraceID: unknownZero.TraceID, Outcome: OutcomeFailed, StatusCode: 400})
+	if got := h.request(unknownZero.ID).State; got != statePending {
+		t.Fatalf("failed-zero-unknown state = %q, want pending", got)
+	}
+	// An unaccounted execution contradicts a rejection claim, so the request
+	// stays open for reconciliation instead of writing the hold off.
+	rejectedUnknown := reserve("r-unknown")
+	ru := usageFor("uru", rejectedUnknown, "m1", Tokens{})
+	ru.Quality = QualityUnknown
+	h.mustUsage(ru)
+	h.mustComplete(Completion{ID: rejectedUnknown.ID, TraceID: rejectedUnknown.TraceID,
+		Outcome: OutcomeRejected, StatusCode: 403})
+	if got := h.request(rejectedUnknown.ID).State; got != statePending {
+		t.Fatalf("rejected with unknown execution state = %q, want pending", got)
+	}
+	// Money is only booked for trustworthy usage: 100 + 50 + 10 above.
+	if got := h.key(key.ID).SpentMicroUSD; got != 100+50+10 {
+		t.Fatalf("spent = %d, want 160", got)
+	}
+}
+
+// TestCompleteValidatesRepeatedOutcomeAndStatus rejects a repeated completion
+// that disagrees with what was already recorded.
+func TestCompleteValidatesRepeatedOutcomeAndStatus(t *testing.T) {
+	h, key := billingHarness(t)
+	req := h.mustReserve(ReserveInput{ID: "r1", TraceID: "t1", KeyID: key.ID, RequestedModel: "m1"})
+	h.mustComplete(Completion{ID: req.ID, TraceID: req.TraceID, Outcome: OutcomeFailed, StatusCode: 502})
+	h.mustComplete(Completion{ID: req.ID, TraceID: req.TraceID, Outcome: OutcomeFailed, StatusCode: 502})
+	if err := h.store.Complete(h.ctx(), Completion{ID: req.ID, TraceID: req.TraceID,
+		Outcome: OutcomeFailed, StatusCode: 503}); !errors.Is(err, ErrConflict) {
+		t.Fatalf("status drift err = %v, want ErrConflict", err)
+	}
+	if err := h.store.Complete(h.ctx(), Completion{ID: req.ID, TraceID: req.TraceID,
+		Outcome: OutcomeCanceled, StatusCode: 502}); !errors.Is(err, ErrConflict) {
+		t.Fatalf("outcome drift err = %v, want ErrConflict", err)
+	}
+	if got := h.request(req.ID).State; got != statePending {
+		t.Fatalf("state = %q, want pending", got)
+	}
+}
+
+// TestUsageRejectsCallerSuppliedCost keeps money and quality from disagreeing:
+// the core always derives the cost from the request price snapshot.
+func TestUsageRejectsCallerSuppliedCost(t *testing.T) {
+	h, key := billingHarness(t)
+	req := h.mustReserve(ReserveInput{ID: "r1", TraceID: "t1", KeyID: key.ID, RequestedModel: "m1"})
+	u := usageFor("u1", req, "m1", tokens(10, 0, 0, 10, 0))
+	cost := int64(1)
+	u.CostMicroUSD = &cost
+	if err := h.store.RecordUsage(h.ctx(), u); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("caller cost err = %v, want ErrInvalid", err)
+	}
+	if got := h.key(key.ID).SpentMicroUSD; got != 0 {
+		t.Fatalf("spent after rejected cost = %d, want 0", got)
 	}
 }
 
@@ -608,5 +752,122 @@ func TestBusyDatabaseIsObservable(t *testing.T) {
 	_ = conn.QueryRowContext(context.Background(), `SELECT COUNT(*) FROM requests`).Scan(&count)
 	if count != 0 {
 		t.Fatalf("requests after failed reserve = %d, want 0", count)
+	}
+}
+
+// TestUsageReplayWithEmptyRequestID covers the native bridge, which only
+// supplies a trace id: replaying the same event must be idempotent even though
+// the caller never learned the request id.
+func TestUsageReplayWithEmptyRequestID(t *testing.T) {
+	h, key := billingHarness(t)
+	req := h.mustReserve(ReserveInput{ID: "r1", TraceID: "t1", KeyID: key.ID, RequestedModel: "m1"})
+	u := usageFor("u1", req, "m1", tokens(10, 0, 0, 10, 0))
+	u.RequestID = ""
+	h.mustUsage(u)
+	h.mustUsage(u) // must be a no-op, not a conflict
+	if got := h.key(key.ID).SpentMicroUSD; got != 30 {
+		t.Fatalf("spent after replay = %d, want 30", got)
+	}
+	got := h.request(req.ID)
+	if len(got.Executions) != 1 {
+		t.Fatalf("executions = %d, want 1", len(got.Executions))
+	}
+	// The stored event is canonicalized onto the matching request.
+	if got.Executions[0].RequestID != req.ID {
+		t.Fatalf("stored request id = %q, want %q", got.Executions[0].RequestID, req.ID)
+	}
+	// An explicitly disagreeing id is still a conflict.
+	bad := u
+	bad.ID = "u2"
+	bad.RequestID = "elsewhere"
+	if err := h.store.RecordUsage(h.ctx(), bad); !errors.Is(err, ErrConflict) {
+		t.Fatalf("mismatched request id err = %v, want ErrConflict", err)
+	}
+}
+
+// TestHasActive exposes in-flight work so the native layer can refuse to close
+// and reopen the database while business requests are running.
+func TestHasActive(t *testing.T) {
+	h, key := billingHarness(t)
+	active, err := h.store.HasActive(h.ctx())
+	if err != nil || active {
+		t.Fatalf("initial HasActive = %v, %v", active, err)
+	}
+	req := h.mustReserve(ReserveInput{ID: "r1", TraceID: "t1", KeyID: key.ID, RequestedModel: "m1"})
+	if active, err = h.store.HasActive(h.ctx()); err != nil || !active {
+		t.Fatalf("HasActive during execution = %v, %v", active, err)
+	}
+	h.mustComplete(Completion{ID: req.ID, TraceID: req.TraceID, Outcome: OutcomeRejected, StatusCode: 401})
+	if active, err = h.store.HasActive(h.ctx()); err != nil || active {
+		t.Fatalf("HasActive after completion = %v, %v", active, err)
+	}
+}
+
+// TestSecondInstanceCannotOwnLockedDirectory proves the directory lock keeps a
+// second process from running recovery over live executions.
+func TestSecondInstanceCannotOwnLockedDirectory(t *testing.T) {
+	h := newHarness(t)
+	h.mustPrice("m1", Rates{Input: million})
+	key, _ := h.mustKey(KeySpec{Enabled: true})
+	h.mustReserve(ReserveInput{ID: "live", TraceID: "t-live", KeyID: key.ID, RequestedModel: "m1"})
+
+	second, err := Open(Options{DataDir: h.dir, Now: h.clock.now})
+	if !errors.Is(err, ErrLocked) {
+		if second != nil {
+			_ = second.Close()
+		}
+		t.Fatalf("second open err = %v, want ErrLocked", err)
+	}
+	if second != nil {
+		t.Fatal("second open returned a store for a locked directory")
+	}
+	// The refused instance must not have marked the live execution pending.
+	if got := h.request("live").State; got != stateActive {
+		t.Fatalf("live request state = %q, want active", got)
+	}
+	// Once the owner releases the directory, a new instance takes over and
+	// performs the restart transition exactly once.
+	if err := h.store.Close(); err != nil {
+		t.Fatalf("close owner: %v", err)
+	}
+	third, err := Open(Options{DataDir: h.dir, Now: h.clock.now})
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer third.Close()
+	rep, err := third.Report(h.ctx(), Filter{From: testEpoch.AddDate(-1, 0, 0),
+		To: h.clock.now().Add(time.Hour), PageSize: 10})
+	if err != nil {
+		t.Fatalf("report: %v", err)
+	}
+	if len(rep.Items) != 1 || rep.Items[0].State != statePending {
+		t.Fatalf("items after restart = %+v", rep.Items)
+	}
+}
+
+// TestZeroRatePriceStillRequiresUsage keeps "free" distinct from "unaccounted":
+// an all-zero rate is a real price, not evidence that nothing ran.
+func TestZeroRatePriceStillRequiresUsage(t *testing.T) {
+	h := newHarness(t)
+	h.mustPrice("free", Rates{})
+	key, _ := h.mustKey(KeySpec{Enabled: true})
+	req := h.mustReserve(ReserveInput{ID: "r1", TraceID: "t1", KeyID: key.ID, RequestedModel: "free",
+		InputEstimate: 100, OutputEstimate: 100})
+	if req.HeldMicroUSD != 0 {
+		t.Fatalf("free model hold = %d, want 0", req.HeldMicroUSD)
+	}
+	h.mustComplete(Completion{ID: req.ID, TraceID: req.TraceID, Outcome: OutcomeSucceeded})
+	if got := h.request(req.ID).State; got != statePending {
+		t.Fatalf("free success without usage state = %q, want pending", got)
+	}
+	// An explicit complete declaration closes it at zero cost.
+	u := usageFor("u1", req, "free", Tokens{})
+	u.Quality = QualityComplete
+	h.mustUsage(u)
+	if got := h.request(req.ID); got.State != stateSettled {
+		t.Fatalf("state = %q, want settled", got.State)
+	}
+	if got := h.key(key.ID).SpentMicroUSD; got != 0 {
+		t.Fatalf("spent = %d, want 0", got)
 	}
 }

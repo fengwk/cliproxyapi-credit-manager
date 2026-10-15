@@ -190,39 +190,12 @@ func (s *Store) applyCharge(ctx context.Context, tx *sql.Tx, req *reqRow, usageI
 	return nil
 }
 
-// settleRequest closes an unresolved request: every known usage is charged
-// exactly once and the monetary hold is released.
+// settleRequest closes an unresolved request and releases its remaining hold.
+// Known usage was already charged when it was recorded, so nothing is written
+// off twice and unknown accounting simply stays unknown.
 func (s *Store) settleRequest(ctx context.Context, tx *sql.Tx, req *reqRow, at time.Time, resolved string) error {
 	if req.state == stateSettled {
 		return nil
-	}
-	rows, err := tx.QueryContext(ctx, `SELECT id, cost_micro_usd FROM usages
-		WHERE request_id = ? AND charged = 0 AND cost_micro_usd IS NOT NULL`, req.id)
-	if err != nil {
-		return fmt.Errorf("load chargeable usages: %w", err)
-	}
-	type pending struct {
-		id     string
-		amount int64
-	}
-	var chargeable []pending
-	for rows.Next() {
-		var p pending
-		if err := rows.Scan(&p.id, &p.amount); err != nil {
-			rows.Close()
-			return fmt.Errorf("scan chargeable usage: %w", err)
-		}
-		chargeable = append(chargeable, p)
-	}
-	if err := rows.Err(); err != nil {
-		rows.Close()
-		return fmt.Errorf("iterate chargeable usages: %w", err)
-	}
-	rows.Close()
-	for _, p := range chargeable {
-		if err := s.applyCharge(ctx, tx, req, p.id, p.amount); err != nil {
-			return err
-		}
 	}
 	if req.held != 0 {
 		res, err := tx.ExecContext(ctx, `UPDATE keys SET held_micro_usd = held_micro_usd - ?
@@ -256,6 +229,11 @@ func (s *Store) settleRequest(ctx context.Context, tx *sql.Tx, req *reqRow, at t
 
 // evaluateSettle closes a completed request only when its accounting is
 // trustworthy; otherwise the request stays pending with its hold intact.
+//
+// A rejection is the only outcome that may close without any execution event.
+// Anything else needs a trustworthy usage record, and a single unknown
+// execution keeps the request (and the remaining hold) open so leaked charges
+// cannot be written off silently.
 func (s *Store) evaluateSettle(ctx context.Context, tx *sql.Tx, req *reqRow, at time.Time) error {
 	if req.state == stateSettled || req.outcome == "" {
 		return nil
@@ -265,15 +243,18 @@ func (s *Store) evaluateSettle(ctx context.Context, tx *sql.Tx, req *reqRow, at 
 		return err
 	}
 	switch req.outcome {
-	case OutcomeSucceeded:
-		if agg.reliable == 0 {
-			return nil // asset accounting not yet reported: never bill a fake zero
-		}
-	case OutcomeFailed:
+	case OutcomeRejected:
+		// Proven rejection before any execution: no usage is expected. An
+		// unaccounted execution still contradicts that claim, so it stays open.
 		if agg.unknown > 0 {
 			return nil
 		}
-		if agg.total == 0 && !isRejectionStatus(req.statusCode) {
+	case OutcomeSucceeded:
+		if agg.reliable == 0 || agg.unknown > 0 {
+			return nil
+		}
+	case OutcomeFailed, OutcomeCanceled:
+		if agg.total == 0 || agg.unknown > 0 {
 			return nil
 		}
 	default:
@@ -281,9 +262,6 @@ func (s *Store) evaluateSettle(ctx context.Context, tx *sql.Tx, req *reqRow, at 
 	}
 	return s.settleRequest(ctx, tx, req, at, resolvedAuto)
 }
-
-// isRejectionStatus reports a proven pre-execution rejection (4xx upstream).
-func isRejectionStatus(code int) bool { return code >= 400 && code < 500 }
 
 func checkedAdd(a, b int64) (int64, error) {
 	if b > 0 && a > math.MaxInt64-b {

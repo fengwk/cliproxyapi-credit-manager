@@ -223,3 +223,119 @@ func TestCleanupIsRepeatable(t *testing.T) {
 		t.Fatalf("first cleanup deleted %d, want 4", first.Deleted)
 	}
 }
+
+// TestCleanupPrunesAgedPeriodsButKeepsTotals bounds the period counter tables:
+// lifetime totals always stay, aged periods go once nothing can charge them,
+// and an unresolved request keeps its own periods alive.
+func TestCleanupPrunesAgedPeriodsButKeepsTotals(t *testing.T) {
+	h := newHarness(t)
+	h.mustPrice("m1", Rates{Input: million, Output: million})
+	key, _ := h.mustKey(KeySpec{Enabled: true})
+	ctx := h.ctx()
+	january := time.Date(2026, 1, 10, 9, 0, 0, 0, time.UTC)
+	february := time.Date(2026, 2, 5, 9, 0, 0, 0, time.UTC)
+
+	// A closed January request that books January periods and 100 tokens.
+	h.clock.set(january)
+	closed := h.mustReserve(ReserveInput{ID: "closed", TraceID: "t-closed", KeyID: key.ID,
+		RequestedModel: "m1", InputEstimate: 100})
+	h.mustUsage(usageFor("u-closed", closed, "m1", tokens(100, 0, 0, 0, 0)))
+	h.mustComplete(Completion{ID: closed.ID, TraceID: closed.TraceID, Outcome: OutcomeSucceeded})
+
+	// An unresolved February request keeps its own periods alive.
+	h.clock.set(february)
+	stuck := h.mustReserve(ReserveInput{ID: "stuck", TraceID: "t-stuck", KeyID: key.ID,
+		RequestedModel: "m1", InputEstimate: 100})
+	h.mustUsage(usageFor("u-stuck", stuck, "m1", tokens(100, 0, 0, 0, 0)))
+	unknown := usageFor("u-stuck-unknown", stuck, "m1", Tokens{})
+	unknown.Quality = QualityUnknown
+	h.mustUsage(unknown)
+	h.mustComplete(Completion{ID: stuck.ID, TraceID: stuck.TraceID, Outcome: OutcomeSucceeded})
+
+	assertCounter := func(win, period string, want int64) {
+		t.Helper()
+		got, err := moneyCounter(ctx, h.store.db, key.ID, win, period)
+		if err != nil {
+			t.Fatalf("money counter %s/%s: %v", win, period, err)
+		}
+		if got != want {
+			t.Fatalf("money counter %s/%s = %d, want %d", win, period, got, want)
+		}
+	}
+	// Before cleanup both periods are recorded.
+	assertCounter(windowDay, dayPeriod(january), 100)
+	assertCounter(windowWeek, weekPeriod(january), 100)
+	assertCounter(windowMonth, monthPeriod(january), 100)
+	assertCounter(windowDay, dayPeriod(february), 100)
+	assertCounter(windowTotal, "", 200)
+
+	h.clock.set(testEpoch) // cutoff = 2026-03-15
+	maint, err := h.store.Cleanup(ctx)
+	if err != nil {
+		t.Fatalf("cleanup: %v", err)
+	}
+	if maint.Deleted != 1 {
+		t.Fatalf("deleted = %d, want 1 (the closed January request)", maint.Deleted)
+	}
+	// Aged periods with no unresolved reference are gone.
+	assertCounter(windowDay, dayPeriod(january), 0)
+	assertCounter(windowWeek, weekPeriod(january), 0)
+	assertCounter(windowMonth, monthPeriod(january), 0)
+	// Periods an unresolved request may still charge are kept.
+	assertCounter(windowDay, dayPeriod(february), 100)
+	assertCounter(windowWeek, weekPeriod(february), 100)
+	assertCounter(windowMonth, monthPeriod(february), 100)
+	// The lifetime total is the durable record and survives everything.
+	assertCounter(windowTotal, "", 200)
+
+	tokenTotal, err := tokenCounter(ctx, h.store.db, key.ID, "m1", windowTotal, "")
+	if err != nil {
+		t.Fatalf("token total: %v", err)
+	}
+	if tokenTotal != 200 {
+		t.Fatalf("lifetime tokens = %d, want 200", tokenTotal)
+	}
+	janTokens, err := tokenCounter(ctx, h.store.db, key.ID, "m1", windowDay, dayPeriod(january))
+	if err != nil {
+		t.Fatalf("january tokens: %v", err)
+	}
+	if janTokens != 0 {
+		t.Fatalf("january token counter = %d, want pruned", janTokens)
+	}
+
+	// A late charge for the unresolved request still lands in its own period.
+	if err := h.store.Resolve(ctx, stuck.ID, Resolution{Action: ActionCharge, AmountMicroUSD: 40,
+		Reason: "late usage"}); err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	assertCounter(windowDay, dayPeriod(february), 140)
+	assertCounter(windowTotal, "", 240)
+}
+
+// TestCleanupWithoutRunKeepsPeriodHistory proves pruning only happens through
+// Cleanup: a report and the counters stay untouched otherwise.
+func TestCleanupWithoutRunKeepsPeriodHistory(t *testing.T) {
+	h := newHarness(t)
+	h.mustPrice("m1", Rates{Input: million})
+	key, _ := h.mustKey(KeySpec{Enabled: true})
+	january := time.Date(2026, 1, 10, 9, 0, 0, 0, time.UTC)
+	h.clock.set(january)
+	req := h.mustReserve(ReserveInput{ID: "old", TraceID: "t-old", KeyID: key.ID, RequestedModel: "m1",
+		InputEstimate: 100})
+	h.mustUsage(usageFor("u-old", req, "m1", tokens(100, 0, 0, 0, 0)))
+	h.mustComplete(Completion{ID: req.ID, TraceID: req.TraceID, Outcome: OutcomeSucceeded})
+	h.clock.set(testEpoch)
+
+	// No cleanup ran: the aged history and its counters are intact.
+	got, err := moneyCounter(h.ctx(), h.store.db, key.ID, windowMonth, monthPeriod(january))
+	if err != nil || got != 100 {
+		t.Fatalf("january counter without cleanup = %d, %v", got, err)
+	}
+	rep, err := h.store.Report(h.ctx(), Filter{From: january.Add(-time.Hour), To: testEpoch, PageSize: 10})
+	if err != nil {
+		t.Fatalf("report: %v", err)
+	}
+	if rep.Total != 1 {
+		t.Fatalf("total without cleanup = %d, want 1", rep.Total)
+	}
+}

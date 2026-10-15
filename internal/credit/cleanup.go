@@ -30,6 +30,9 @@ func (s *Store) Cleanup(ctx context.Context) (Maintenance, error) {
 	// Reclaim physical space: the WAL is first folded into the database, then
 	// incremental vacuum returns free pages to the filesystem, then the WAL is
 	// truncated to zero.
+	if err := s.pruneCounters(ctx, cutoff); err != nil {
+		return Maintenance{}, err
+	}
 	if _, err := s.db.ExecContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
 		return Maintenance{}, fmt.Errorf("checkpoint wal: %w", err)
 	}
@@ -72,6 +75,91 @@ func (s *Store) reclaimSpace(ctx context.Context) error {
 	return nil
 }
 
+// pruneCounters bounds the per-period counter tables. Lifetime totals are the
+// durable record and are never pruned; day/week/month rows disappear only once
+// they are older than the retention window and no unresolved request can still
+// be charged into them. Without a cleanup run nothing is removed.
+func (s *Store) pruneCounters(ctx context.Context, cutoff time.Time) error {
+	return s.inTx(ctx, func(tx *sql.Tx) error {
+		keep, err := unresolvedPeriods(ctx, tx)
+		if err != nil {
+			return err
+		}
+		for _, win := range []string{windowDay, windowWeek, windowMonth} {
+			age := periodOf(win, cutoff)
+			periods := keep[win]
+			if err := pruneCounterTable(ctx, tx, "key_money_counters", win, age, periods); err != nil {
+				return err
+			}
+			if err := pruneCounterTable(ctx, tx, "key_token_counters", win, age, periods); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+// unresolvedPeriods collects the periods still reachable by a late charge: only
+// unresolved requests can be charged after history was purged.
+func unresolvedPeriods(ctx context.Context, q querier) (map[string][]string, error) {
+	rows, err := q.QueryContext(ctx, `SELECT started_at FROM requests WHERE state IN (?,?)`,
+		stateActive, statePending)
+	if err != nil {
+		return nil, fmt.Errorf("load unresolved periods: %w", err)
+	}
+	defer rows.Close()
+	seen := map[string]map[string]struct{}{}
+	for rows.Next() {
+		var started int64
+		if err := rows.Scan(&started); err != nil {
+			return nil, fmt.Errorf("scan unresolved period: %w", err)
+		}
+		at := fromUnixNano(started)
+		for _, win := range []string{windowDay, windowWeek, windowMonth} {
+			if seen[win] == nil {
+				seen[win] = map[string]struct{}{}
+			}
+			seen[win][periodOf(win, at)] = struct{}{}
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate unresolved periods: %w", err)
+	}
+	out := map[string][]string{}
+	for win, set := range seen {
+		periods := make([]string, 0, len(set))
+		for p := range set {
+			periods = append(periods, p)
+		}
+		out[win] = periods
+	}
+	return out, nil
+}
+
+// pruneCounterTable drops aged rows of one window, except the periods an
+// unresolved request may still charge.
+func pruneCounterTable(ctx context.Context, tx *sql.Tx, table, win, age string, keep []string) error {
+	query := `DELETE FROM ` + table + ` WHERE win = ? AND period < ?`
+	args := []any{win, age}
+	if len(keep) > 0 {
+		query += ` AND period NOT IN (` + placeholders(len(keep)) + `)`
+		for _, p := range keep {
+			args = append(args, p)
+		}
+	}
+	if _, err := tx.ExecContext(ctx, query, args...); err != nil {
+		return fmt.Errorf("prune %s: %w", table, err)
+	}
+	return nil
+}
+
+func placeholders(n int) string {
+	if n <= 0 {
+		return ""
+	}
+	return strings.TrimSuffix(strings.Repeat("?,", n), ",")
+}
+
 func (s *Store) cleanupBatchIDs(ctx context.Context, cutoff time.Time) ([]string, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT id FROM requests
 		WHERE state = ? AND started_at < ? ORDER BY started_at LIMIT ?`,
@@ -95,18 +183,17 @@ func (s *Store) cleanupBatchIDs(ctx context.Context, cutoff time.Time) ([]string
 }
 
 func deleteHistory(ctx context.Context, tx *sql.Tx, ids []string) error {
-	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(ids)), ",")
 	args := make([]any, 0, len(ids))
 	for _, id := range ids {
 		args = append(args, id)
 	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM usages WHERE request_id IN (`+placeholders+`)`, args...); err != nil {
+	if _, err := tx.ExecContext(ctx, `DELETE FROM usages WHERE request_id IN (`+placeholders(len(ids))+`)`, args...); err != nil {
 		return fmt.Errorf("delete usages: %w", err)
 	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM adjustments WHERE request_id IN (`+placeholders+`)`, args...); err != nil {
+	if _, err := tx.ExecContext(ctx, `DELETE FROM adjustments WHERE request_id IN (`+placeholders(len(ids))+`)`, args...); err != nil {
 		return fmt.Errorf("delete adjustments: %w", err)
 	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM requests WHERE id IN (`+placeholders+`)`, args...); err != nil {
+	if _, err := tx.ExecContext(ctx, `DELETE FROM requests WHERE id IN (`+placeholders(len(ids))+`)`, args...); err != nil {
 		return fmt.Errorf("delete requests: %w", err)
 	}
 	return nil
