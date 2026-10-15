@@ -46,7 +46,9 @@ completion with at least one reliable success (or proven rejection before any
 execution). Unknown/failed-zero/no event => pending not fake zero billing.
 Outstanding pending per Key is bounded. Restart marks unfinished execution
 stopped/pending, not free. Administrator Resolve accepts release or charge with a
-mandatory reason; ledger adjustments append, no silent reprice.
+mandatory reason; ledger adjustments append, no silent reprice, and the report
+shows execution cost and administrator adjustments as separate figures (an
+adjustment is never merged into an execution's cost).
 Only associated requests may accept usage; after retention purge, unknown old
 events cannot resurrect requests. Unresolved requests retain necessary rows.
 Cleanup default 3 calendar months UTC (clamp day at month end), batch deletes
@@ -122,8 +124,10 @@ which is the point, and it never excludes or reserves an account on its own.
 
 ## Management HTTP contract
 
-Base `/v0/management/plugins/credit-manager`, all API paths management-authenticated.
-Resources `/v0/resource/plugins/credit-manager/` serve public static shell ONLY.
+Base `/v0/management/plugins/credit-manager` (the plugin's own fixed, declared
+route segment, distinct from the host plugin instance/library id), all API paths
+management-authenticated.
+Resources `/v0/resource/plugins/<library-id>/` serve public static shell ONLY.
 Never put financial APIs in resources or localStorage any credentials.
 Envelope errors `{"error":"safe message"}`.
 - GET `/api/keys` => `{"items":[Key]}`
@@ -156,5 +160,8 @@ Do not implement key import/OAuth form changes or modify other provider pages.
 v0.1.0 initial release only after unit/race/vet, real isolated native CPA/mock
 auth+retry+cancel+providers probes and browser checks. ZIPs linux/amd64,
 linux/arm64,darwin/arm64 + checksums.txt. Metadata version/full commit/sdk.
+Curated notes live at `docs/release-notes-<tag>.md`; the release workflow refuses
+to publish a tag without them. Config example and operations guidance live in
+`config.example.yaml` and `docs/operations.md`.
 Do not publish placeholders or hide incomplete requirements. Event delivery is
 memory-only CPA queue: no end-to-end crash-safe exactly-once billing claim.
