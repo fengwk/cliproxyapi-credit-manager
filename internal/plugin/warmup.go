@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
@@ -15,43 +16,113 @@ import (
 )
 
 // warmupSessionHeader carries the per-probe random session marker. It is a
-// correlation label owned by this plugin: it identifies one specific probe so
-// an operator can follow it through the host, and it is never a customer value.
-//
-// The marker is deliberately NOT a billing gate. Usage attribution never
-// consults it: the host resolves UsageRecord.AccessProvider from the client
-// authentication path, so a probe (which has no client identity) can not be
-// attributed to a customer key, and a customer that forges this header can not
-// obtain a billing exemption because no code path reads it for that purpose.
+// correlation label owned by this plugin, never a customer value and never a
+// billing gate: usage attribution is decided by the host-resolved
+// UsageRecord.AccessProvider, which a background execution does not have.
 const warmupSessionHeader = "X-Credit-Manager-Warmup-Session"
 
-// warmupSwapGrace bounds how long a reconfiguration waits for an in-flight
-// warmup host callback before refusing the swap.
-//
-// A host model execution is a synchronous host call this plugin can not cancel,
-// so the grace exists only to keep reconfiguration from waiting on a stuck
-// probe. It is NOT a safety bound: a worker that does not drain inside the
-// grace is never abandoned or replaced, the swap is refused with 409 and the
-// previous configuration keeps running. Shutdown, which is followed by
-// dlclose() of this library, waits for the callback without a bound instead.
-//
-// It is a variable so tests can shorten the wait.
+// warmupSwapGrace bounds how long a reconfiguration waits for an in-flight pass
+// before refusing the swap. It is a reconfiguration bound only: shutdown drains
+// the same non-cancellable host callback for as long as it takes. It is a
+// variable so tests can shorten it.
 var warmupSwapGrace = 5 * time.Second
 
 // errWarmupUnavailable reports that warmup is enabled but the host callback
 // bridge is missing, so no probe can be issued.
 var errWarmupUnavailable = errors.New("warmup enabled but host callback bridge is unavailable")
 
-// errWarmupBusy reports that a warmup host callback is still in flight, so the
-// plugin refuses to replace the worker that owns it.
-var errWarmupBusy = errors.New("a warmup probe is still in flight")
-
-// warmupWorker is the single serial background warmup worker. At most one
-// worker exists at a time and it issues at most one host call at a time; a
-// worker is never dropped while it can still be inside a host callback.
+// warmupWorker is the single serial probe loop. At most one worker exists at a
+// time and it runs at most one pass, hence one host call, at a time. Disabling,
+// quiescing or a failed reconfiguration pauses it and shutdown drains it; it is
+// never abandoned, replaced or duplicated.
 type warmupWorker struct {
 	cancel context.CancelFunc
 	done   chan struct{}
+
+	// wake is signalled without blocking whenever the state changes, so a
+	// parked loop re-evaluates it promptly.
+	wake chan struct{}
+
+	mu        sync.Mutex
+	cfg       config.Warmup
+	paused    bool
+	passDone  chan struct{}      // non-nil while a pass runs; closed when it ends
+	passAbort context.CancelFunc // cancels the running pass when paused
+}
+
+func newWarmupWorker(cfg config.Warmup) *warmupWorker {
+	return &warmupWorker{wake: make(chan struct{}, 1), cfg: cfg}
+}
+
+// signal wakes the loop without ever blocking the caller.
+func (w *warmupWorker) signal() {
+	select {
+	case w.wake <- struct{}{}:
+	default:
+	}
+}
+
+// start makes the worker probe cfg and clears any pause. A cfg that is disabled
+// or has no target parks the loop, so reusing a worker never probes on its own.
+func (w *warmupWorker) start(cfg config.Warmup) {
+	w.mu.Lock()
+	w.cfg = cfg
+	w.paused = false
+	w.mu.Unlock()
+	w.signal()
+}
+
+// pause stops new probes, including the rest of a running pass, without
+// touching the worker or its in-flight host callback.
+func (w *warmupWorker) pause() {
+	w.mu.Lock()
+	w.paused = true
+	abort := w.passAbort
+	w.mu.Unlock()
+	if abort != nil {
+		abort()
+	}
+	w.signal()
+}
+
+// resume clears a pause and keeps the configured period.
+func (w *warmupWorker) resume() {
+	w.mu.Lock()
+	w.paused = false
+	w.mu.Unlock()
+	w.signal()
+}
+
+// pauseAndWaitIdle pauses the worker and reports whether it became idle inside
+// grace. The in-flight pass observed here is the only one that can still run:
+// pause and pass registration take the same lock, so no pass can start after
+// this returns.
+func (w *warmupWorker) pauseAndWaitIdle(grace time.Duration) bool {
+	w.mu.Lock()
+	w.paused = true
+	abort := w.passAbort
+	inFlight := w.passDone
+	w.mu.Unlock()
+	if abort != nil {
+		abort()
+	}
+	w.signal()
+	if inFlight == nil {
+		return true
+	}
+	timer := time.NewTimer(grace)
+	defer timer.Stop()
+	select {
+	case <-inFlight:
+		return true
+	case <-timer.C:
+		return false
+	}
+}
+
+// probeable reports whether a configuration should issue probes at all.
+func probeable(cfg config.Warmup) bool {
+	return cfg.Enabled && len(cfg.Targets) > 0 && cfg.Period > 0
 }
 
 // SetHostCall installs the native host callback bridge. It must be called by
@@ -70,14 +141,26 @@ func (m *Manager) hostCallSnapshot() func(string, []byte) ([]byte, error) {
 	return m.hostCall
 }
 
-// startWarmup launches the background warmup worker when warmup is enabled with
-// at least one target. It must be called while the exclusive gate is held (or
-// before the manager is visible to handlers), like startMaintenance.
+// warmupRunning returns the current worker, nil when none is installed.
+func (m *Manager) warmupRunning() *warmupWorker {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.warmup
+}
+
+// startWarmup makes the warmup configuration effective. It must be called
+// while the exclusive gate is held (or before the manager is visible to
+// handlers), like startMaintenance.
 //
-// No target, a disabled warmup, an invalid period, a missing host bridge or a
-// worker that is still running starts no worker: the default configuration
-// issues no request, and two workers never probe in parallel.
+// An installed worker is reconfigured in place rather than replaced, so two
+// probe loops never run at once. A disabled configuration, an invalid period
+// and a missing host bridge start no worker at all: the default configuration
+// issues no request.
 func (m *Manager) startWarmup(cfg config.Warmup) {
+	if worker := m.warmupRunning(); worker != nil {
+		worker.start(cfg)
+		return
+	}
 	if !cfg.Enabled || len(cfg.Targets) == 0 {
 		return
 	}
@@ -90,58 +173,49 @@ func (m *Manager) startWarmup(cfg config.Warmup) {
 		m.recordError(errWarmupUnavailable)
 		return
 	}
+	ctx, cancel := context.WithCancel(context.Background())
+	worker := newWarmupWorker(cfg)
+	worker.cancel = cancel
+	worker.done = make(chan struct{})
 	m.mu.Lock()
 	if m.warmup != nil {
-		// Every caller drains the previous worker first, so this is only
-		// reachable from a bug: refuse to run two probes at once.
+		// Lifecycle transitions are serialized, so this is unreachable unless a
+		// caller skipped the pause/drain step: never run two probe loops.
 		m.mu.Unlock()
-		m.recordError(errWarmupBusy)
+		cancel()
+		m.recordError(errors.New("a warmup worker is already installed"))
 		return
 	}
-	ctx, cancel := context.WithCancel(context.Background())
-	worker := &warmupWorker{cancel: cancel, done: make(chan struct{})}
 	m.warmup = worker
 	m.mu.Unlock()
-	go m.warmupLoop(ctx, worker.done, cfg)
+	go m.warmupLoop(ctx, call, worker)
 }
 
-// warmupRunning returns the current worker, nil when none is installed.
-func (m *Manager) warmupRunning() *warmupWorker {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.warmup
-}
-
-// cancelWarmup stops new probes without waiting for a probe already inside the
-// host. The worker reference stays installed so a later transition can still
-// wait for that callback to return.
-func (m *Manager) cancelWarmup() {
+// pauseWarmup stops new probes and keeps the worker installed, so a later
+// resume restores the same loop instead of starting a second one.
+func (m *Manager) pauseWarmup() {
 	if worker := m.warmupRunning(); worker != nil {
-		worker.cancel()
+		worker.pause()
 	}
 }
 
-// drainWarmupForSwap cancels the running worker and waits up to warmupSwapGrace
-// for its in-flight host callback to return, reporting whether the worker is
-// gone.
+// stopWarmupForSwap pauses the worker and retires it once its pass is idle.
 //
-// Safety contract: a worker that does not drain is left installed and RUNNING
-// its callback; the caller must therefore keep the current configuration and
-// refuse the swap. Replacing it would start a second probe and would leave the
-// library's goroutine alive past the teardown that follows.
-func (m *Manager) drainWarmupForSwap() bool {
+// A pass that does not go idle inside warmupSwapGrace is left installed and
+// running: the worker is resumed and the caller must refuse the swap, so a
+// failed reconfiguration keeps the previous periodic warmup instead of leaving
+// it dead. The worker is never abandoned and a second loop is never started.
+func (m *Manager) stopWarmupForSwap() bool {
 	worker := m.warmupRunning()
 	if worker == nil {
 		return true
 	}
-	worker.cancel()
-	timer := time.NewTimer(warmupSwapGrace)
-	defer timer.Stop()
-	select {
-	case <-worker.done:
-	case <-timer.C:
+	if !worker.pauseAndWaitIdle(warmupSwapGrace) {
+		worker.resume()
 		return false
 	}
+	worker.cancel()
+	<-worker.done
 	m.mu.Lock()
 	if m.warmup == worker {
 		m.warmup = nil
@@ -164,6 +238,7 @@ func (m *Manager) drainWarmupForShutdown() {
 	if worker == nil {
 		return
 	}
+	worker.pause()
 	worker.cancel()
 	<-worker.done
 	m.mu.Lock()
@@ -173,37 +248,64 @@ func (m *Manager) drainWarmupForShutdown() {
 	m.mu.Unlock()
 }
 
-// warmupLoop probes every target once immediately and then once per interval
-// until ctx is canceled. The pass is serial: at most one host call is in flight.
-func (m *Manager) warmupLoop(ctx context.Context, done chan struct{}, cfg config.Warmup) {
-	defer close(done)
-	timer := time.NewTimer(0)
-	defer timer.Stop()
+// warmupLoop runs one pass immediately, then one per interval, until ctx is
+// canceled. Pausing aborts the rest of the running pass and parks the loop;
+// resuming probes again.
+func (m *Manager) warmupLoop(ctx context.Context, call func(string, []byte) ([]byte, error), w *warmupWorker) {
+	defer close(w.done)
 	for {
+		// The pass decision and its registration share one critical section, so
+		// a pause can never interleave and leave a pass running unobserved.
+		w.mu.Lock()
+		cfg := w.cfg
+		run := !w.paused && probeable(cfg) && ctx.Err() == nil
+		var (
+			passCtx  context.Context
+			passDone chan struct{}
+		)
+		if run {
+			passCtx, w.passAbort = context.WithCancel(ctx)
+			passDone = make(chan struct{})
+			w.passDone = passDone
+		}
+		w.mu.Unlock()
+
+		if !run {
+			select {
+			case <-ctx.Done():
+				return
+			case <-w.wake:
+			}
+			continue
+		}
+
+		m.warmupPass(passCtx, call, cfg.Targets)
+		w.mu.Lock()
+		abort := w.passAbort
+		w.passAbort = nil
+		w.passDone = nil
+		w.mu.Unlock()
+		if abort != nil {
+			abort()
+		}
+		close(passDone)
+
+		timer := time.NewTimer(cfg.Period)
 		select {
 		case <-ctx.Done():
+			timer.Stop()
 			return
+		case <-w.wake:
+			timer.Stop()
 		case <-timer.C:
 		}
-		m.warmupPass(ctx, cfg.Targets)
-		if !timer.Stop() {
-			select {
-			case <-timer.C:
-			default:
-			}
-		}
-		timer.Reset(cfg.Period)
 	}
 }
 
 // warmupPass issues one probe per target, in order, and returns how many probes
-// were attempted before ctx was canceled. A failing target is recorded through
-// health and never stops the remaining targets or any customer request.
-func (m *Manager) warmupPass(ctx context.Context, targets []config.WarmupTarget) int {
-	call := m.hostCallSnapshot()
-	if call == nil {
-		return 0
-	}
+// were attempted before the pass was aborted. A failing target is recorded
+// through health and never stops the remaining targets or any customer request.
+func (m *Manager) warmupPass(ctx context.Context, call func(string, []byte) ([]byte, error), targets []config.WarmupTarget) int {
 	attempted := 0
 	for _, target := range targets {
 		if ctx.Err() != nil {

@@ -225,6 +225,10 @@ func outputEstimate(body []byte) int64 {
 // because of that request, its key or its model. Those are normal outcomes: the
 // caller gets an error response while every other key keeps working. Only an
 // unrecognized failure indicates that the accounting store itself is broken.
+//
+// A conflicting request id is included: Resolve/Reserve reject a duplicate or
+// contradictory event for one request with 409, which must not be escalated
+// into a global admission block for every key.
 func isBusinessRejection(err error) bool {
 	switch {
 	case errors.Is(err, credit.ErrQuota),
@@ -233,6 +237,7 @@ func isBusinessRejection(err error) bool {
 		errors.Is(err, credit.ErrUnauthorized),
 		errors.Is(err, credit.ErrDenied),
 		errors.Is(err, credit.ErrUnpriced),
+		errors.Is(err, credit.ErrConflict),
 		errors.Is(err, credit.ErrInvalid):
 		return true
 	default:
@@ -291,6 +296,19 @@ func terminate(status int, message string) pluginapi.RequestInterceptResponse {
 		ResponseHeaders: http.Header{"Content-Type": {"application/json; charset=utf-8"}},
 		ResponseBody:    body,
 	}
+}
+
+// FailClosedInterceptEnvelope is the ABI-level answer for a before-auth
+// interception the plugin could not even process: an oversized request or a
+// panic at the CGO boundary. It carries the same fail-closed Terminate the hook
+// itself returns for that method, because an error envelope or a non-zero
+// return code would make the host continue the request unmetered.
+func FailClosedInterceptEnvelope() []byte {
+	raw, err := okEnvelope(terminate(http.StatusServiceUnavailable, "credit manager is unavailable"))
+	if err != nil {
+		return []byte(`{"ok":true,"result":{"terminate":true,"status_code":503}}`)
+	}
+	return raw
 }
 
 // terminationErrorType maps a status to the error type shared by the OpenAI and
