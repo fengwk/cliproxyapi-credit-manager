@@ -22,17 +22,14 @@ func (s *Store) Cleanup(ctx context.Context) (Maintenance, error) {
 	cutoff := s.retentionFrom(s.nowUTC())
 	var deleted int64
 	for {
-		ids, err := s.cleanupBatchIDs(ctx, cutoff)
+		n, err := s.cleanupBatch(ctx, cutoff)
 		if err != nil {
 			return Maintenance{}, err
 		}
-		if len(ids) == 0 {
+		if n == 0 {
 			break
 		}
-		if err := s.inTx(ctx, func(tx *sql.Tx) error { return deleteHistory(ctx, tx, ids) }); err != nil {
-			return Maintenance{}, err
-		}
-		deleted += int64(len(ids))
+		deleted += n
 	}
 	// Reclaim physical space: the WAL is first folded into the database, then
 	// incremental vacuum returns free pages to the filesystem, then the WAL is
@@ -183,8 +180,34 @@ func placeholders(n int) string {
 	return strings.TrimSuffix(strings.Repeat("?,", n), ",")
 }
 
-func (s *Store) cleanupBatchIDs(ctx context.Context, cutoff time.Time) ([]string, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id FROM requests
+// cleanupBatch removes one bounded batch of expired settled history and returns
+// how many requests actually disappeared. Selection and deletion share a single
+// write transaction: with a separate read a late unaccounted execution could
+// reopen a settled request in between, and deleting its row would leave the
+// hold it just restored dangling in the key ledger.
+func (s *Store) cleanupBatch(ctx context.Context, cutoff time.Time) (int64, error) {
+	var deleted int64
+	err := s.inTx(ctx, func(tx *sql.Tx) error {
+		ids, err := expiredRequestIDs(ctx, tx, cutoff)
+		if err != nil {
+			return err
+		}
+		if len(ids) == 0 {
+			return nil
+		}
+		deleted, err = deleteHistory(ctx, tx, ids, cutoff)
+		return err
+	})
+	if err != nil {
+		return 0, err
+	}
+	return deleted, nil
+}
+
+// expiredRequestIDs lists the oldest closed requests that the retention window
+// has passed, bounded so maintenance stays a fixed cost per run.
+func expiredRequestIDs(ctx context.Context, q querier, cutoff time.Time) ([]string, error) {
+	rows, err := q.QueryContext(ctx, `SELECT id FROM requests
 		WHERE state = ? AND started_at < ? ORDER BY started_at LIMIT ?`,
 		stateSettled, unixNano(cutoff), cleanupBatch)
 	if err != nil {
@@ -205,19 +228,54 @@ func (s *Store) cleanupBatchIDs(ctx context.Context, cutoff time.Time) ([]string
 	return ids, nil
 }
 
-func deleteHistory(ctx context.Context, tx *sql.Tx, ids []string) error {
-	args := make([]any, 0, len(ids))
+// deleteHistory removes the history of the given candidates, but only for the
+// requests that are still settled and still past the retention window. The
+// check runs inside the same write transaction as the delete, so a request that
+// was reopened by a late execution keeps its row, its executions and the hold
+// that was restored with it.
+func deleteHistory(ctx context.Context, tx *sql.Tx, ids []string, cutoff time.Time) (int64, error) {
+	args := make([]any, 0, len(ids)+2)
 	for _, id := range ids {
 		args = append(args, id)
 	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM usages WHERE request_id IN (`+placeholders(len(ids))+`)`, args...); err != nil {
-		return fmt.Errorf("delete usages: %w", err)
+	args = append(args, stateSettled, unixNano(cutoff))
+	rows, err := tx.QueryContext(ctx, `SELECT id FROM requests WHERE id IN (`+placeholders(len(ids))+`)
+		AND state = ? AND started_at < ?`, args...)
+	if err != nil {
+		return 0, fmt.Errorf("recheck expired requests: %w", err)
 	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM adjustments WHERE request_id IN (`+placeholders(len(ids))+`)`, args...); err != nil {
-		return fmt.Errorf("delete adjustments: %w", err)
+	var actual []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return 0, fmt.Errorf("scan expired request: %w", err)
+		}
+		actual = append(actual, id)
 	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM requests WHERE id IN (`+placeholders(len(ids))+`)`, args...); err != nil {
-		return fmt.Errorf("delete requests: %w", err)
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return 0, fmt.Errorf("iterate expired requests: %w", err)
 	}
-	return nil
+	rows.Close()
+	if len(actual) == 0 {
+		return 0, nil
+	}
+	// Every row of the surviving set is removed together: no request can keep
+	// half of its history.
+	actualArgs := make([]any, 0, len(actual))
+	for _, id := range actual {
+		actualArgs = append(actualArgs, id)
+	}
+	list := placeholders(len(actual))
+	if _, err := tx.ExecContext(ctx, `DELETE FROM usages WHERE request_id IN (`+list+`)`, actualArgs...); err != nil {
+		return 0, fmt.Errorf("delete usages: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM adjustments WHERE request_id IN (`+list+`)`, actualArgs...); err != nil {
+		return 0, fmt.Errorf("delete adjustments: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM requests WHERE id IN (`+list+`)`, actualArgs...); err != nil {
+		return 0, fmt.Errorf("delete requests: %w", err)
+	}
+	return int64(len(actual)), nil
 }

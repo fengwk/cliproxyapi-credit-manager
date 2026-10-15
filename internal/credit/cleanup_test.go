@@ -396,3 +396,117 @@ func TestCleanupSurfacesBusyCheckpoint(t *testing.T) {
 		t.Fatalf("cleanup after the reader left: %v", err)
 	}
 }
+
+// assertHoldAligned checks the ledger invariant that survived this bug: the key
+// hold always equals the holds of the requests that are still open.
+func assertHoldAligned(t *testing.T, h *harness, keyID string) {
+	t.Helper()
+	held := h.key(keyID).HeldMicroUSD
+	sum, err := counterValue(context.Background(), h.store.db,
+		`SELECT COALESCE(SUM(held_micro_usd),0) FROM requests WHERE key_id = ? AND state IN (?,?)`,
+		keyID, stateActive, statePending)
+	if err != nil {
+		t.Fatalf("sum unresolved holds: %v", err)
+	}
+	if held != sum {
+		t.Fatalf("key hold %d does not match unresolved requests %d", held, sum)
+	}
+}
+
+// TestCleanupKeepsRequestReopenedByLateExecution reproduces the removal race:
+// candidates are collected, a late execution reopens a request and restores its
+// hold, and the delete path must then leave that request, its history and the
+// hold alone.
+func TestCleanupKeepsRequestReopenedByLateExecution(t *testing.T) {
+	h := newHarness(t)
+	h.mustPrice("m1", Rates{Input: million})
+	key, _ := h.mustKey(KeySpec{Enabled: true})
+	ctx := h.ctx()
+	old := testEpoch.AddDate(0, -4, 0)
+
+	// A settled request the retention window has already passed.
+	req := h.mustReserve(ReserveInput{ID: "old", TraceID: "t-old", KeyID: key.ID,
+		RequestedModel: "m1", InputEstimate: 5, At: old})
+	first := usageFor("u-old", req, "m1", tokens(5, 0, 0, 0, 0))
+	first.At = old
+	h.mustUsage(first)
+	h.mustComplete(Completion{ID: req.ID, TraceID: req.TraceID, Outcome: OutcomeSucceeded, At: old})
+	spent := h.key(key.ID).SpentMicroUSD
+	assertHoldAligned(t, h, key.ID)
+
+	cutoff := h.store.retentionFrom(h.clock.now())
+	stale, err := expiredRequestIDs(ctx, h.store.db, cutoff)
+	if err != nil {
+		t.Fatalf("expired candidates: %v", err)
+	}
+	if len(stale) != 1 || stale[0] != "old" {
+		t.Fatalf("candidates = %v, want [old]", stale)
+	}
+
+	// The late execution arrives after the candidate list was collected.
+	late := usageFor("u-late", req, "m1", Tokens{})
+	late.Quality = QualityUnknown
+	h.mustUsage(late)
+	if got := h.request(req.ID); got.State != statePending || got.HeldMicroUSD != 5 {
+		t.Fatalf("reopened request = %+v, want pending with the hold restored", got)
+	}
+	assertHoldAligned(t, h, key.ID)
+
+	// Deleting the stale list must not touch the reopened request.
+	var deleted int64
+	if err := h.store.inTx(ctx, func(tx *sql.Tx) error {
+		n, err := deleteHistory(ctx, tx, stale, cutoff)
+		deleted = n
+		return err
+	}); err != nil {
+		t.Fatalf("delete stale batch: %v", err)
+	}
+	if deleted != 0 {
+		t.Fatalf("deleted %d requests, want the reopened one kept", deleted)
+	}
+	kept := func(stage string) {
+		t.Helper()
+		if got := h.request(req.ID); got.State != statePending || got.HeldMicroUSD != 5 {
+			t.Fatalf("%s: request = %+v, want the pending accounting kept", stage, got)
+		}
+		n, err := counterValue(ctx, h.store.db, `SELECT COUNT(*) FROM usages WHERE request_id = ?`, req.ID)
+		if err != nil || n != 2 {
+			t.Fatalf("%s: usages = %d (%v), want both retained", stage, n, err)
+		}
+		assertHoldAligned(t, h, key.ID)
+	}
+	kept("after the stale delete")
+
+	// A full maintenance run behaves the same way.
+	maintenance, err := h.store.Cleanup(ctx)
+	if err != nil {
+		t.Fatalf("cleanup: %v", err)
+	}
+	if maintenance.Deleted != 0 {
+		t.Fatalf("cleanup deleted %d, want nothing while the request is unresolved", maintenance.Deleted)
+	}
+	kept("after cleanup")
+
+	// Once an administrator closes it the history is collectable, and the key
+	// hold still agrees with the requests that remain.
+	if err := h.store.Resolve(ctx, req.ID, Resolution{Action: ActionRelease, Reason: "operator"}); err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	maintenance, err = h.store.Cleanup(ctx)
+	if err != nil {
+		t.Fatalf("cleanup after resolve: %v", err)
+	}
+	if maintenance.Deleted != 1 {
+		t.Fatalf("deleted = %d, want 1", maintenance.Deleted)
+	}
+	if n, err := counterValue(ctx, h.store.db, `SELECT COUNT(*) FROM requests WHERE id = ?`, req.ID); err != nil || n != 0 {
+		t.Fatalf("request survived cleanup: %d (%v)", n, err)
+	}
+	if n, err := counterValue(ctx, h.store.db, `SELECT COUNT(*) FROM usages WHERE request_id = ?`, req.ID); err != nil || n != 0 {
+		t.Fatalf("executions survived cleanup: %d (%v)", n, err)
+	}
+	assertHoldAligned(t, h, key.ID)
+	if k := h.key(key.ID); k.HeldMicroUSD != 0 || k.SpentMicroUSD != spent {
+		t.Fatalf("ledger after cleanup = %+v, want held 0 and spent %d", k, spent)
+	}
+}

@@ -811,3 +811,34 @@ func TestKeyMaterialValidationMatrix(t *testing.T) {
 		t.Fatalf("created %d custom keys, want %d", len(created), len(valid))
 	}
 }
+
+// TestOpenFailsClosedWhenDataDirCannotBeSynced proves the directory sync is not
+// optional: a directory whose entry cannot be flushed must abort Open before the
+// ledger exists, and retrying must not create one either.
+func TestOpenFailsClosedWhenDataDirCannotBeSynced(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("running as root: directory permissions are not enforced, so the sync cannot be made to fail")
+	}
+	parent := t.TempDir()
+	dir := filepath.Join(parent, "data")
+	// Write and traverse but not read: the pepper can still be created inside,
+	// while the directory itself cannot be opened to flush its entry.
+	if err := os.Mkdir(dir, 0o300); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+
+	for attempt := 1; attempt <= 2; attempt++ {
+		s, err := Open(Options{DataDir: dir})
+		if err == nil {
+			_ = s.Close()
+			t.Fatalf("attempt %d: open succeeded without a durable secret", attempt)
+		}
+		if s != nil {
+			t.Fatalf("attempt %d: store was half built", attempt)
+		}
+		if _, statErr := os.Stat(filepath.Join(dir, dbFileName)); !errors.Is(statErr, os.ErrNotExist) {
+			t.Fatalf("attempt %d: ledger created without a durable secret: %v", attempt, statErr)
+		}
+	}
+}
