@@ -55,6 +55,7 @@ class HostConfig:
         gemini_models,
         plugin_id: str = "credit-manager",
         plugin_config: dict | None = None,
+        plugins_dir=None,
         extra_plugin_yaml: str = "",
         enable_plugins: bool = True,
         request_retry: int = 3,
@@ -70,6 +71,7 @@ class HostConfig:
         self.gemini_models = list(gemini_models)
         self.plugin_id = plugin_id
         self.plugin_config = dict(plugin_config or {})
+        self.plugins_dir = Path(plugins_dir) if plugins_dir else None
         self.extra_plugin_yaml = extra_plugin_yaml
         self.enable_plugins = enable_plugins
         self.request_retry = request_retry
@@ -81,8 +83,11 @@ class HostConfig:
     def base_url(self) -> str:
         return f"http://127.0.0.1:{self.port}"
 
+    def _plugins_root(self) -> Path:
+        return self.plugins_dir or (self.root / "plugins")
+
     def _plugin_path(self) -> Path:
-        return self.root / "plugins" / "linux" / "amd64" / f"{self.plugin_id}.so"
+        return self._plugins_root() / "linux" / "amd64" / f"{self.plugin_id}.so"
 
     def render(self) -> str:
         lines = []
@@ -134,7 +139,7 @@ class HostConfig:
                 lines.append(f'        - api-key: "{key}"')
         lines.append('plugins:')
         lines.append(f'  enabled: {str(self.enable_plugins).lower()}')
-        lines.append(f'  dir: "{self.root / "plugins"}"')
+        lines.append(f'  dir: "{self._plugins_root()}"')
         lines.append('  configs:')
         lines.append(f'    {self.plugin_id}:')
         lines.append('      enabled: true')

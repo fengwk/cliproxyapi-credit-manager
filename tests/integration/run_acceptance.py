@@ -28,7 +28,8 @@ from acceptance.context import Context, load_specs  # noqa: E402
 from acceptance.mock import Script  # noqa: E402
 from acceptance.report import Recorder  # noqa: E402
 
-DEFAULT_MODULES = ["abi", "core", "accounting", "auth", "capture", "report", "lifecycle", "retry", "gemini", "browser"]
+DEFAULT_MODULES = ["abi", "core", "accounting", "auth", "capture", "report", "resources",
+                   "namespace", "lifecycle", "retry", "gemini", "browser"]
 
 
 def parse_args(argv):
@@ -93,8 +94,15 @@ def main(argv=None):
             (artifacts / "host-plugins.error.txt").write_text(str(error))
 
         for spec in specs:
-            # Cases run against the shared isolated host; a case that needs a
-            # fresh database or different configuration calls ctx.recreate_host.
+            # Every case starts from a fresh isolated host (its own SQLite DB and
+            # config), so no case can contaminate another's ledger or limits.
+            try:
+                ctx.recreate_host(spec["name"])
+            except Exception as error:  # noqa: BLE001 - boot failure is its own result
+                recorder.cases.append({"case": spec["name"], "expects": spec["expects"], "pass": False,
+                                       "observed": {"error": f"host boot failed: {type(error).__name__}: {error}"}})
+                print(f"[FAIL] {spec['name']} (host boot)", file=sys.stderr)
+                continue
             ctx.mock.reset()
             ctx.mock.default_script = Script()
             ctx.mock.fail_first = 0
