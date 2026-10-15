@@ -357,23 +357,11 @@ func (s *Store) Complete(ctx context.Context, c Completion) error {
 		if strings.TrimSpace(c.TraceID) != "" && c.TraceID != req.traceID {
 			return fmt.Errorf("%w: completion trace does not match request", ErrConflict)
 		}
-		if req.state == stateSettled && req.resolved != resolvedAuto {
-			// An administrator already closed this request. A late completion
-			// may record its outcome metadata once, but it must never reopen
-			// the request or touch the released hold.
-			if req.completionSeen {
-				return fmt.Errorf("%w: request was already closed by %s and its completion was recorded",
-					ErrConflict, req.resolved)
-			}
-			if _, err := tx.ExecContext(ctx, `UPDATE requests SET outcome = ?, status_code = ?,
-				completion_seen = 1 WHERE id = ?`, c.Outcome, c.StatusCode, req.id); err != nil {
-				return fmt.Errorf("record late completion: %w", err)
-			}
-			return nil
-		}
 		if req.outcome != "" {
-			// A repeated completion must agree, otherwise the ledger would
-			// silently change what was already recorded.
+			// A recorded outcome is authoritative: a repeated completion must
+			// agree, otherwise the ledger would silently change what was
+			// already recorded. An agreeing repeat is a no-op, whether the
+			// request is already closed or still unresolved.
 			if req.outcome != c.Outcome || req.statusCode != c.StatusCode {
 				return fmt.Errorf("%w: request already completed as %s/%d",
 					ErrConflict, req.outcome, req.statusCode)
@@ -383,6 +371,22 @@ func (s *Store) Complete(ctx context.Context, c Completion) error {
 			}
 			// Still unresolved: a late usage may have made it closable.
 			return s.evaluateSettle(ctx, tx, req, at)
+		}
+		if req.state == stateSettled {
+			if req.resolved == resolvedAuto {
+				// Unreachable by construction: an automatic close always
+				// records an outcome.
+				return nil
+			}
+			// An administrator closed this request before its completion
+			// arrived. Record that outcome metadata once, without reopening the
+			// request or touching the released hold.
+			if _, err := tx.ExecContext(ctx, `UPDATE requests SET outcome = ?, status_code = ?,
+				completed_at = ? WHERE id = ?`,
+				c.Outcome, c.StatusCode, unixNano(at), req.id); err != nil {
+				return fmt.Errorf("record late completion: %w", err)
+			}
+			return nil
 		}
 		if _, err := tx.ExecContext(ctx, `UPDATE requests SET state = ?, outcome = ?, status_code = ?, completed_at = ?
 			WHERE id = ?`, statePending, c.Outcome, c.StatusCode, unixNano(at), req.id); err != nil {

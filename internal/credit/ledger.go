@@ -27,9 +27,6 @@ type reqRow struct {
 	// initialHold is the pre-authorization hold taken at admission. It is kept
 	// after settlement so a late unaccounted execution can restore it.
 	initialHold int64
-	// completionSeen marks that an administrator closed the request and its
-	// late completion metadata was recorded once already.
-	completionSeen bool
 }
 
 func (r *reqRow) toRequest(executions []Usage, adjustment int64) Request {
@@ -55,7 +52,7 @@ func (r *reqRow) toRequest(executions []Usage, adjustment int64) Request {
 const requestColumns = `id, trace_id, key_id, model, state, outcome, status_code, started_at,
 	completed_at, held_micro_usd, price_input, price_output, price_reasoning, price_cache_read,
 	price_cache_write, price_version, token_estimate, charge_micro_usd, resolved,
-	initial_hold_micro_usd, completion_seen`
+	initial_hold_micro_usd`
 
 func scanRequest(scan func(...any) error) (*reqRow, error) {
 	var (
@@ -66,14 +63,12 @@ func scanRequest(scan func(...any) error) (*reqRow, error) {
 		in, out   int64
 		cr, cw    int64
 		version   int64
-		seen      int
 	)
 	if err := scan(&r.id, &r.traceID, &r.keyID, &r.model, &r.state, &r.outcome, &r.statusCode,
 		&started, &completed, &r.held, &in, &out, &reasoning, &cr, &cw, &version,
-		&r.tokenEstimate, &r.charge, &r.resolved, &r.initialHold, &seen); err != nil {
+		&r.tokenEstimate, &r.charge, &r.resolved, &r.initialHold); err != nil {
 		return nil, err
 	}
-	r.completionSeen = seen != 0
 	r.startedAt = fromUnixNano(started)
 	r.completedAt = scanNano(completed)
 	r.price = priceFromRequestRow(in, out, cr, cw, version, reasoning, r.model)

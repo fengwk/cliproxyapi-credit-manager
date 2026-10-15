@@ -130,8 +130,7 @@ CREATE TABLE IF NOT EXISTS requests (
   token_estimate INTEGER NOT NULL DEFAULT 0,
   charge_micro_usd INTEGER NOT NULL DEFAULT 0,
   resolved TEXT NOT NULL DEFAULT '',
-  initial_hold_micro_usd INTEGER NOT NULL DEFAULT 0,
-  completion_seen INTEGER NOT NULL DEFAULT 0
+  initial_hold_micro_usd INTEGER NOT NULL DEFAULT 0
 );
 CREATE UNIQUE INDEX IF NOT EXISTS requests_trace ON requests(trace_id);
 CREATE INDEX IF NOT EXISTS requests_key_state ON requests(key_id, state);

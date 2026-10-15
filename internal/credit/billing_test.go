@@ -1214,11 +1214,13 @@ func TestLateCompletionAfterManualResolve(t *testing.T) {
 	if resolved != ActionRelease {
 		t.Fatalf("resolved = %q, want the administrator decision kept", resolved)
 	}
-	// Repeating it, or changing it, is refused.
+	// Repeating the same completion stays idempotent, so a retried native
+	// event never turns into a failure.
 	if err := h.store.Complete(ctx, Completion{ID: req.ID, TraceID: req.TraceID,
-		Outcome: OutcomeSucceeded, StatusCode: 200}); !errors.Is(err, ErrConflict) {
-		t.Fatalf("repeat completion err = %v, want ErrConflict", err)
+		Outcome: OutcomeSucceeded, StatusCode: 200}); err != nil {
+		t.Fatalf("repeated late completion: %v", err)
 	}
+	// Changing it is still refused.
 	if err := h.store.Complete(ctx, Completion{ID: req.ID, TraceID: req.TraceID,
 		Outcome: OutcomeFailed, StatusCode: 500}); !errors.Is(err, ErrConflict) {
 		t.Fatalf("conflicting completion err = %v, want ErrConflict", err)
@@ -1387,5 +1389,51 @@ func TestUsageReplayWithoutTimestamp(t *testing.T) {
 	}
 	if k := h.key(key.ID); k.SpentMicroUSD != 10 {
 		t.Fatalf("spent = %d, want a single charge", k.SpentMicroUSD)
+	}
+}
+
+// TestCompletionAfterManualResolveKeepsRecordedOutcome covers a request that
+// completed normally and was then closed by an administrator: the recorded
+// outcome stays authoritative and is never rewritten by a later completion.
+func TestCompletionAfterManualResolveKeepsRecordedOutcome(t *testing.T) {
+	h := newHarness(t)
+	h.mustPrice("m1", Rates{Input: million})
+	key, _ := h.mustKey(KeySpec{Enabled: true})
+	ctx := h.ctx()
+	req := h.mustReserve(ReserveInput{ID: "r1", TraceID: "t1", KeyID: key.ID,
+		RequestedModel: "m1", InputEstimate: 5})
+
+	h.mustComplete(Completion{ID: req.ID, TraceID: req.TraceID, Outcome: OutcomeFailed, StatusCode: 502})
+	// An unresolved request repeats its outcome idempotently.
+	if err := h.store.Complete(ctx, Completion{ID: req.ID, TraceID: req.TraceID,
+		Outcome: OutcomeFailed, StatusCode: 502}); err != nil {
+		t.Fatalf("repeat before resolve: %v", err)
+	}
+	if got := h.request(req.ID); got.State != statePending || got.Outcome != OutcomeFailed {
+		t.Fatalf("before resolve = %+v, want a pending failure", got)
+	}
+	if err := h.store.Resolve(ctx, req.ID, Resolution{Action: ActionRelease, Reason: "operator"}); err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	// The same completion is still a no-op once the request is closed.
+	if err := h.store.Complete(ctx, Completion{ID: req.ID, TraceID: req.TraceID,
+		Outcome: OutcomeFailed, StatusCode: 502}); err != nil {
+		t.Fatalf("repeat after resolve: %v", err)
+	}
+	// A different outcome must not be mistaken for a first late completion.
+	if err := h.store.Complete(ctx, Completion{ID: req.ID, TraceID: req.TraceID,
+		Outcome: OutcomeSucceeded, StatusCode: 200}); !errors.Is(err, ErrConflict) {
+		t.Fatalf("changed outcome err = %v, want ErrConflict", err)
+	}
+	if err := h.store.Complete(ctx, Completion{ID: req.ID, TraceID: req.TraceID,
+		Outcome: OutcomeFailed, StatusCode: 500}); !errors.Is(err, ErrConflict) {
+		t.Fatalf("changed status err = %v, want ErrConflict", err)
+	}
+	got := h.request(req.ID)
+	if got.State != stateSettled || got.Outcome != OutcomeFailed {
+		t.Fatalf("request = %+v, want the recorded failure kept", got)
+	}
+	if k := h.key(key.ID); k.HeldMicroUSD != 0 || k.SpentMicroUSD != 0 {
+		t.Fatalf("money changed: %+v", k)
 	}
 }
