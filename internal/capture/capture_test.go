@@ -876,3 +876,68 @@ func TestQueueReservationCoversEncodedHeaders(t *testing.T) {
 		t.Fatalf("rejected status = %q, want %q", got, StatusDropped)
 	}
 }
+
+// TestUndecodableJSONBodiesAreNeverStored verifies the privacy boundary end to
+// end: a JSON shaped body that cannot be decoded as one complete document is
+// dropped with an explicit status, is never written unredacted and never
+// surfaces as a storage failure.
+func TestUndecodableJSONBodiesAreNeverStored(t *testing.T) {
+	clock := newTestClock()
+	store, _ := openTestStore(t, testConfig(64<<10, 1<<30), clock, nil)
+
+	deep := bytes.Repeat([]byte("["), 10000)
+	deep = append(deep, []byte(`{"secret":"leak"}`)...)
+	deep = append(deep, bytes.Repeat([]byte("]"), 10000)...)
+
+	bodies := map[string][]byte{
+		"truncated": []byte(`{"secret":"leak"`),
+		"trailing":  []byte(`{"secret":"leak"} trailing`),
+		"deep":      deep,
+	}
+	originals := make(map[string][]byte, len(bodies))
+	for id, body := range bodies {
+		originals[id] = append([]byte(nil), body...)
+		store.Enqueue(Snapshot{RequestID: id, Body: body})
+	}
+	flush(t, store)
+
+	if rows := countRows(t, store); rows != 0 {
+		t.Fatalf("%d rows stored, want none: an undecodable JSON body must not be stored", rows)
+	}
+	stats := store.Stats()
+	if stats.Dropped != int64(len(bodies)) {
+		t.Fatalf("Dropped = %d, want %d", stats.Dropped, len(bodies))
+	}
+	if !strings.Contains(stats.LastError, "unredacted") {
+		t.Fatalf("LastError = %q, want the refusal reported", stats.LastError)
+	}
+	for id, original := range originals {
+		detail, err := store.Get(id)
+		if err != nil {
+			t.Fatalf("Get(%s) must explain the drop instead of failing: %v", id, err)
+		}
+		if detail.Status != StatusDropped {
+			t.Fatalf("Get(%s) status = %q, want %q", id, detail.Status, StatusDropped)
+		}
+		if detail.Body != "" {
+			t.Fatalf("Get(%s) served %d bytes of an unredacted body", id, len(detail.Body))
+		}
+		if !bytes.Equal(bodies[id], original) {
+			t.Fatalf("forwarded body %s was mutated", id)
+		}
+	}
+
+	// A well formed JSON body with the same secret is still captured and redacted.
+	enqueue(store, "valid", []byte(`{"secret":"leak","keep":"me"}`))
+	flush(t, store)
+	detail, err := store.Get("valid")
+	if err != nil {
+		t.Fatalf("Get(valid): %v", err)
+	}
+	if detail.Status != StatusCaptured {
+		t.Fatalf("valid status = %q, want %q", detail.Status, StatusCaptured)
+	}
+	if strings.Contains(detail.Body, "leak") || !strings.Contains(detail.Body, redactedValue) {
+		t.Fatalf("valid body = %q, want redacted secret", detail.Body)
+	}
+}

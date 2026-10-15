@@ -10,6 +10,12 @@
 // promise: authorization style headers and obvious JSON secret fields are
 // redacted, but arbitrary private payloads are stored as supplied by the
 // caller. Bodies are stored gzip compressed; headers are stored separately.
+//
+// Body handling is deliberately safety first at the boundary: bodies that are
+// not JSON shaped (plain text, multipart, binary) are stored as supplied, while
+// bodies that look like JSON but are not one complete document are dropped
+// rather than stored unredacted, because their secrets cannot be located
+// reliably.
 package capture
 
 import (
