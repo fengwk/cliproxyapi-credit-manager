@@ -2,6 +2,7 @@ package credit
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"strings"
 	"testing"
@@ -337,5 +338,61 @@ func TestCleanupWithoutRunKeepsPeriodHistory(t *testing.T) {
 	}
 	if rep.Total != 1 {
 		t.Fatalf("total without cleanup = %d, want 1", rep.Total)
+	}
+}
+
+// TestCleanupSurfacesBusyCheckpoint proves a blocked WAL truncation is reported
+// instead of being presented as successful maintenance.
+func TestCleanupSurfacesBusyCheckpoint(t *testing.T) {
+	h := newHarness(t)
+	h.mustPrice("m1", Rates{Input: million})
+	key, _ := h.mustKey(KeySpec{Enabled: true})
+	ctx := h.ctx()
+	// History is needed so the WAL actually holds pages to fold back.
+	for i := 0; i < 5; i++ {
+		id := "r" + itoa(i)
+		req := h.mustReserve(ReserveInput{ID: id, TraceID: "t-" + id, KeyID: key.ID,
+			RequestedModel: "m1", InputEstimate: 1})
+		h.mustUsage(usageFor("u-"+id, req, "m1", tokens(1, 0, 0, 0, 0)))
+		h.mustComplete(Completion{ID: req.ID, TraceID: req.TraceID, Outcome: OutcomeSucceeded})
+	}
+
+	// A second connection holds a read transaction open on the WAL.
+	reader, err := sql.Open(driverName, dsnFor(h.store.dbPath))
+	if err != nil {
+		t.Fatalf("open reader: %v", err)
+	}
+	defer reader.Close()
+	reader.SetMaxOpenConns(1)
+	conn, err := reader.Conn(ctx)
+	if err != nil {
+		t.Fatalf("reader conn: %v", err)
+	}
+	defer conn.Close()
+	if _, err := conn.ExecContext(ctx, `BEGIN`); err != nil {
+		t.Fatalf("begin reader: %v", err)
+	}
+	var count int64
+	if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM requests`).Scan(&count); err != nil {
+		t.Fatalf("reader query: %v", err)
+	}
+	if count != 5 {
+		t.Fatalf("reader sees %d requests, want 5", count)
+	}
+
+	if _, err := h.store.Cleanup(ctx); err == nil {
+		t.Fatal("cleanup reported success while a reader blocked the WAL truncation")
+	} else if !strings.Contains(err.Error(), "busy") {
+		t.Fatalf("cleanup err = %v, want a busy checkpoint error", err)
+	}
+	// Once the reader releases the WAL, maintenance succeeds again.
+	if _, err := conn.ExecContext(ctx, `COMMIT`); err != nil {
+		t.Fatalf("commit reader: %v", err)
+	}
+	if err := conn.Close(); err != nil && !errors.Is(err, sql.ErrConnDone) {
+		t.Fatalf("close reader conn: %v", err)
+	}
+	if _, err := h.store.Cleanup(ctx); err != nil {
+		t.Fatalf("cleanup after the reader left: %v", err)
 	}
 }

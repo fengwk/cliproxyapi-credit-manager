@@ -233,6 +233,7 @@ func (s *Store) RecordUsage(ctx context.Context, usage Usage) error {
 	if usage.Quality, err = normalizeQuality(usage.Quality); err != nil {
 		return err
 	}
+	explicitAt := !usage.At.IsZero()
 	at := s.resolveAt(usage.At)
 	usage.At = at
 	reliable := accountingReliable(usage)
@@ -250,7 +251,14 @@ func (s *Store) RecordUsage(ctx context.Context, usage Usage) error {
 		existing, err := loadUsageByID(ctx, tx, usage.ID)
 		switch {
 		case err == nil:
-			if existing.materialEqual(usage) {
+			candidate := usage
+			if !explicitAt {
+				// The caller omitted the timestamp, so a replay must compare
+				// against the stored instant instead of the wall clock that
+				// moved on since the original event.
+				candidate.At = existing.at
+			}
+			if existing.materialEqual(candidate) {
 				return nil // idempotent replay
 			}
 			return fmt.Errorf("%w: usage id reused with different content", ErrConflict)
@@ -288,6 +296,15 @@ func (s *Store) RecordUsage(ctx context.Context, usage Usage) error {
 		// discard a real charge.
 		if cost != nil {
 			if err := s.applyCharge(ctx, tx, req, usage.ID, *cost); err != nil {
+				return err
+			}
+		}
+		if cost == nil && req.state == stateSettled && req.resolved == resolvedAuto {
+			// Untrustworthy accounting arrived after the request was closed
+			// automatically: reopen it so the work stays visible until an
+			// administrator decides. A manually resolved request is left
+			// closed because an administrator already ruled on it.
+			if err := s.reopenRequest(ctx, tx, req); err != nil {
 				return err
 			}
 		}
@@ -341,8 +358,10 @@ func (s *Store) Complete(ctx context.Context, c Completion) error {
 			return fmt.Errorf("%w: completion trace does not match request", ErrConflict)
 		}
 		if req.outcome != "" {
-			// A repeated completion must agree, otherwise the ledger would
-			// silently change what was already recorded.
+			// A recorded outcome is authoritative: a repeated completion must
+			// agree, otherwise the ledger would silently change what was
+			// already recorded. An agreeing repeat is a no-op, whether the
+			// request is already closed or still unresolved.
 			if req.outcome != c.Outcome || req.statusCode != c.StatusCode {
 				return fmt.Errorf("%w: request already completed as %s/%d",
 					ErrConflict, req.outcome, req.statusCode)
@@ -352,6 +371,22 @@ func (s *Store) Complete(ctx context.Context, c Completion) error {
 			}
 			// Still unresolved: a late usage may have made it closable.
 			return s.evaluateSettle(ctx, tx, req, at)
+		}
+		if req.state == stateSettled {
+			if req.resolved == resolvedAuto {
+				// Unreachable by construction: an automatic close always
+				// records an outcome.
+				return nil
+			}
+			// An administrator closed this request before its completion
+			// arrived. Record that outcome metadata once, without reopening the
+			// request or touching the released hold.
+			if _, err := tx.ExecContext(ctx, `UPDATE requests SET outcome = ?, status_code = ?,
+				completed_at = ? WHERE id = ?`,
+				c.Outcome, c.StatusCode, unixNano(at), req.id); err != nil {
+				return fmt.Errorf("record late completion: %w", err)
+			}
+			return nil
 		}
 		if _, err := tx.ExecContext(ctx, `UPDATE requests SET state = ?, outcome = ?, status_code = ?, completed_at = ?
 			WHERE id = ?`, statePending, c.Outcome, c.StatusCode, unixNano(at), req.id); err != nil {

@@ -164,32 +164,46 @@ const execAggregate = `COUNT(*),
 	COALESCE(SUM(u.tokens_cache_write),0),
 	COALESCE(SUM(u.tokens_output),0),
 	COALESCE(SUM(u.tokens_reasoning),0),
-	COALESCE(SUM(u.tokens_total),0)`
+	COALESCE(SUM(u.tokens_total),0),
+	COALESCE(SUM(CASE WHEN u.quality = '` + QualityComplete + `' THEN u.tokens_cache_read ELSE 0 END),0),
+	COALESCE(SUM(CASE WHEN u.quality = '` + QualityComplete + `' THEN u.tokens_input + u.tokens_cache_write ELSE 0 END),0)`
 
 type execTotals struct {
 	executions int64
 	known      int64
 	cost       int64
 	tokens     Tokens
+	// completeCacheRead and completeInputTotal are restricted to executions of
+	// complete quality. A NULL or partial quality row contributes zero to both,
+	// so the ratio below never mixes trustworthy counters with partial ones.
+	completeCacheRead  int64
+	completeInputTotal int64
 }
 
 func scanExecTotals(scan func(...any) error) (execTotals, error) {
 	var t execTotals
 	err := scan(&t.executions, &t.known, &t.cost, &t.tokens.Input, &t.tokens.CacheRead,
-		&t.tokens.CacheWrite, &t.tokens.Output, &t.tokens.Reasoning, &t.tokens.Total)
+		&t.tokens.CacheWrite, &t.tokens.Output, &t.tokens.Reasoning, &t.tokens.Total,
+		&t.completeCacheRead, &t.completeInputTotal)
 	return t, err
 }
 
-func (t execTotals) apply(sum *Summary) {
+// apply folds one aggregate batch into a summary. The token totals keep their
+// documented all-executions meaning; only CacheReadRatio is complete-only.
+func (t execTotals) apply(sum *Summary) error {
 	sum.Executions = t.executions
 	sum.CompleteExecutions = t.known
 	sum.CostMicroUSD = t.cost
 	sum.Tokens = t.tokens
-	canonical := t.tokens.Input + t.tokens.CacheRead + t.tokens.CacheWrite
+	canonical, err := checkedAdd(t.completeInputTotal, t.completeCacheRead)
+	if err != nil {
+		return err
+	}
 	if canonical > 0 {
-		ratio := float64(t.tokens.CacheRead) / float64(canonical)
+		ratio := float64(t.completeCacheRead) / float64(canonical)
 		sum.CacheReadRatio = &ratio
 	}
+	return nil
 }
 
 func (s *Store) reportSummary(ctx context.Context, q querier, where string, args []any, execWhere string, execArgs []any) (Summary, error) {
@@ -208,7 +222,9 @@ func (s *Store) reportSummary(ctx context.Context, q querier, where string, args
 	if err != nil {
 		return Summary{}, fmt.Errorf("summarize executions: %w", err)
 	}
-	totals.apply(&sum)
+	if err := totals.apply(&sum); err != nil {
+		return Summary{}, err
+	}
 	adjustments, err := adjustmentTotals(ctx, q, where, args)
 	if err != nil {
 		return Summary{}, err
@@ -273,7 +289,8 @@ func (s *Store) reportTrend(ctx context.Context, q querier, where string, args [
 		var totals execTotals
 		err := execRows.Scan(&b, &totals.executions, &totals.known, &totals.cost, &totals.tokens.Input,
 			&totals.tokens.CacheRead, &totals.tokens.CacheWrite, &totals.tokens.Output,
-			&totals.tokens.Reasoning, &totals.tokens.Total)
+			&totals.tokens.Reasoning, &totals.tokens.Total,
+			&totals.completeCacheRead, &totals.completeInputTotal)
 		if err != nil {
 			return nil, fmt.Errorf("scan trend executions: %w", err)
 		}
@@ -283,7 +300,9 @@ func (s *Store) reportTrend(ctx context.Context, q querier, where string, args [
 			points[b] = point
 			order = append(order, b)
 		}
-		totals.apply(point)
+		if err := totals.apply(point); err != nil {
+			return nil, err
+		}
 	}
 	if err := execRows.Err(); err != nil {
 		return nil, fmt.Errorf("iterate trend executions: %w", err)
@@ -430,8 +449,12 @@ func (s *Store) Resolve(ctx context.Context, id string, resolution Resolution) e
 		if err != nil {
 			return err
 		}
-		if req.state == stateSettled {
-			return fmt.Errorf("%w: request is already settled", ErrConflict)
+		// Only a pending request may be resolved: an active execution still
+		// holds a concurrency slot, and resolving it would bypass MaxConcurrent
+		// and HasActive accounting.
+		if req.state != statePending {
+			return fmt.Errorf("%w: request %s is %s, only pending requests can be resolved",
+				ErrConflict, req.id, req.state)
 		}
 		if _, err := tx.ExecContext(ctx, `INSERT INTO adjustments
 			(request_id, key_id, action, amount_micro_usd, reason, at) VALUES(?,?,?,?,?,?)`,

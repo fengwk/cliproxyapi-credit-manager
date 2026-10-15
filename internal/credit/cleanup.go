@@ -10,7 +10,14 @@ import (
 
 // Cleanup purges closed history older than the retention window. Durable
 // counters and unresolved requests are never removed, and free pages are
-// physically reclaimed from the database and the WAL.
+// physically reclaimed from the database and the WAL. Space reclamation is
+// bounded per run, so a single call may leave the file larger than its content;
+// the counters above are exact, the sizes are not.
+//
+// Idempotency note: keyed requests, usages and resolutions stay replayable only
+// while their history is retained. History older than the retention window is
+// physically deleted, so a very late replay of a long closed request is not
+// recognised again.
 func (s *Store) Cleanup(ctx context.Context) (Maintenance, error) {
 	cutoff := s.retentionFrom(s.nowUTC())
 	var deleted int64
@@ -33,24 +40,40 @@ func (s *Store) Cleanup(ctx context.Context) (Maintenance, error) {
 	if err := s.pruneCounters(ctx, cutoff); err != nil {
 		return Maintenance{}, err
 	}
-	if _, err := s.db.ExecContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
-		return Maintenance{}, fmt.Errorf("checkpoint wal: %w", err)
+	if err := s.checkpointWAL(ctx); err != nil {
+		return Maintenance{}, err
 	}
 	if err := s.reclaimSpace(ctx); err != nil {
 		return Maintenance{}, err
 	}
-	if _, err := s.db.ExecContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
-		return Maintenance{}, fmt.Errorf("truncate wal: %w", err)
+	if err := s.checkpointWAL(ctx); err != nil {
+		return Maintenance{}, err
 	}
 	dbBytes, walBytes := s.fileSizes()
 	return Maintenance{Deleted: deleted, DatabaseBytes: dbBytes, WALBytes: walBytes}, nil
 }
 
-// reclaimSpace drives the incremental auto-vacuum to completion. SQLite reports
-// one row per reclaimed page, so all rows must be consumed for the file to
-// actually shrink.
+// checkpointWAL folds the WAL back into the database and truncates it. SQLite
+// reports the outcome instead of failing, so a busy result has to be surfaced:
+// claiming a truncated WAL while a reader still blocks it would hide a real
+// maintenance failure behind a green health check.
+func (s *Store) checkpointWAL(ctx context.Context) error {
+	var busy, logPages, checkpointed int64
+	if err := s.db.QueryRowContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`).
+		Scan(&busy, &logPages, &checkpointed); err != nil {
+		return fmt.Errorf("checkpoint wal: %w", err)
+	}
+	if busy != 0 {
+		return fmt.Errorf("checkpoint wal: database is busy after %d of %d pages", checkpointed, logPages)
+	}
+	return nil
+}
+
+// reclaimSpace frees a bounded number of pages per run. SQLite reports one row
+// per page it actually reclaims, so all rows must be consumed, and asking for a
+// page budget keeps routine maintenance from scanning a whole large database.
 func (s *Store) reclaimSpace(ctx context.Context) error {
-	rows, err := s.db.QueryContext(ctx, `PRAGMA incremental_vacuum(2147483647)`)
+	rows, err := s.db.QueryContext(ctx, fmt.Sprintf(`PRAGMA incremental_vacuum(%d)`, vacuumPages))
 	if err != nil {
 		return fmt.Errorf("incremental vacuum: %w", err)
 	}

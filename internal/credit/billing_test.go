@@ -492,6 +492,18 @@ func TestResolveReleaseAndCharge(t *testing.T) {
 	if err := h.store.Resolve(ctx, release.ID, Resolution{Action: "refund", Reason: "x"}); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("bad action err = %v, want ErrInvalid", err)
 	}
+	// An active execution still owns a concurrency slot, so resolving it would
+	// bypass admission accounting.
+	if err := h.store.Resolve(ctx, release.ID, Resolution{Action: ActionRelease, Reason: "too early"}); !errors.Is(err, ErrConflict) {
+		t.Fatalf("resolving an active request err = %v, want ErrConflict", err)
+	}
+	// 100 input + 100 output at the harness rates.
+	if k := h.key(key.ID); k.HeldMicroUSD != 300 {
+		t.Fatalf("hold after refused resolve = %d, want 300", k.HeldMicroUSD)
+	}
+	// A failed lifecycle without a trustworthy execution is what an
+	// administrator actually has to rule on.
+	h.mustComplete(Completion{ID: release.ID, TraceID: release.TraceID, Outcome: OutcomeFailed, StatusCode: 502})
 	if err := h.store.Resolve(ctx, release.ID, Resolution{Action: ActionRelease, Reason: "provider outage"}); err != nil {
 		t.Fatalf("release: %v", err)
 	}
@@ -508,6 +520,7 @@ func TestResolveReleaseAndCharge(t *testing.T) {
 	}
 	charge := h.mustReserve(ReserveInput{ID: "r2", TraceID: "t2", KeyID: key.ID, RequestedModel: "m1",
 		InputEstimate: 10, OutputEstimate: 10})
+	h.mustComplete(Completion{ID: charge.ID, TraceID: charge.TraceID, Outcome: OutcomeFailed, StatusCode: 502})
 	if err := h.store.Resolve(ctx, charge.ID, Resolution{Action: ActionCharge, AmountMicroUSD: 777, Reason: "manual"}); err != nil {
 		t.Fatalf("charge: %v", err)
 	}
@@ -524,6 +537,12 @@ func TestResolveReleaseAndCharge(t *testing.T) {
 	// A released request that already reported usage still charges that usage.
 	partial := h.mustReserve(ReserveInput{ID: "r3", TraceID: "t3", KeyID: key.ID, RequestedModel: "m1"})
 	h.mustUsage(usageFor("u3", partial, "m1", tokens(100, 0, 0, 0, 0)))
+	// The unaccounted execution keeps the request pending, which is the only
+	// state an administrator may still rule on.
+	unaccounted := usageFor("u3-unknown", partial, "m1", Tokens{})
+	unaccounted.Quality = QualityUnknown
+	h.mustUsage(unaccounted)
+	h.mustComplete(Completion{ID: partial.ID, TraceID: partial.TraceID, Outcome: OutcomeFailed, StatusCode: 500})
 	if err := h.store.Resolve(ctx, partial.ID, Resolution{Action: ActionRelease, Reason: "partial"}); err != nil {
 		t.Fatalf("release partial: %v", err)
 	}
@@ -1066,9 +1085,7 @@ func TestLedgerArithmeticDoesNotOverflowToReal(t *testing.T) {
 			t.Fatalf("rejected reservation was kept: %d (%v)", n, err)
 		}
 		// Releasing is still exact and the charged spend survives.
-		if err := h.store.Resolve(h.ctx(), req.ID, Resolution{Action: ActionRelease, Reason: "overflow probe"}); err != nil {
-			t.Fatalf("resolve: %v", err)
-		}
+		h.mustComplete(Completion{ID: req.ID, TraceID: req.TraceID, Outcome: OutcomeSucceeded})
 		final := h.key(key.ID)
 		if final.HeldMicroUSD != 0 || final.SpentMicroUSD != before.SpentMicroUSD {
 			t.Fatalf("after release spent %d held %d, want %d/0", final.SpentMicroUSD, final.HeldMicroUSD, before.SpentMicroUSD)
@@ -1102,4 +1119,321 @@ func TestLedgerArithmeticDoesNotOverflowToReal(t *testing.T) {
 		}
 		assertExactIntegers(t, h, key.ID, req.ID)
 	})
+}
+
+// TestResolveRequiresPendingRequest verifies the state machine: an active
+// execution owns a concurrency slot and a hold, so only an administrator
+// decision on an already pending request may close it.
+func TestResolveRequiresPendingRequest(t *testing.T) {
+	h := newHarness(t)
+	h.mustPrice("m1", Rates{Input: million})
+	key, _ := h.mustKey(KeySpec{Enabled: true, MaxConcurrent: 1})
+	ctx := h.ctx()
+
+	active := h.mustReserve(ReserveInput{ID: "a", TraceID: "ta", KeyID: key.ID,
+		RequestedModel: "m1", InputEstimate: 5})
+	if err := h.store.Resolve(ctx, active.ID, Resolution{Action: ActionRelease, Reason: "sneaky"}); !errors.Is(err, ErrConflict) {
+		t.Fatalf("resolve active err = %v, want ErrConflict", err)
+	}
+	if k := h.key(key.ID); k.HeldMicroUSD != 5 {
+		t.Fatalf("held = %d, want the hold untouched", k.HeldMicroUSD)
+	}
+	if has, err := h.store.HasActive(ctx); err != nil || !has {
+		t.Fatalf("HasActive = %v/%v, want true", has, err)
+	}
+	// The concurrency slot is still owned by the active execution.
+	if _, err := h.store.Reserve(ctx, ReserveInput{ID: "b", TraceID: "tb", KeyID: key.ID,
+		RequestedModel: "m1", InputEstimate: 5}); !errors.Is(err, ErrConcurrency) {
+		t.Fatalf("second reserve err = %v, want ErrConcurrency", err)
+	}
+
+	// Once the lifecycle closes without trustworthy accounting the request is
+	// pending and an administrator may rule on it.
+	h.mustComplete(Completion{ID: active.ID, TraceID: active.TraceID, Outcome: OutcomeFailed, StatusCode: 500})
+	if err := h.store.Resolve(ctx, active.ID, Resolution{Action: ActionRelease, Reason: "manual"}); err != nil {
+		t.Fatalf("resolve pending: %v", err)
+	}
+	if k := h.key(key.ID); k.HeldMicroUSD != 0 {
+		t.Fatalf("held = %d, want released", k.HeldMicroUSD)
+	}
+	if has, err := h.store.HasActive(ctx); err != nil || has {
+		t.Fatalf("HasActive = %v/%v, want false", has, err)
+	}
+	if _, err := h.store.Reserve(ctx, ReserveInput{ID: "b", TraceID: "tb", KeyID: key.ID,
+		RequestedModel: "m1", InputEstimate: 5}); err != nil {
+		t.Fatalf("slot after resolve: %v", err)
+	}
+}
+
+// TestLateCompletionAfterManualResolve proves a completion that arrives after
+// an administrator closed a restarted request only records its metadata: the
+// settlement, the released hold and the booked money stay untouched.
+func TestLateCompletionAfterManualResolve(t *testing.T) {
+	h := newHarness(t)
+	h.mustPrice("m1", Rates{Input: million})
+	key, _ := h.mustKey(KeySpec{Enabled: true})
+	ctx := h.ctx()
+
+	req := h.mustReserve(ReserveInput{ID: "r1", TraceID: "t1", KeyID: key.ID,
+		RequestedModel: "m1", InputEstimate: 7})
+	// A restart turns the in flight execution into pending without an outcome,
+	// which is exactly what an administrator then has to decide about.
+	if err := h.store.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	reopened, err := Open(Options{DataDir: h.dir, Now: h.clock.now})
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	h.store = reopened
+	if got := h.request(req.ID); got.State != statePending || got.Outcome != "" {
+		t.Fatalf("after restart = %+v, want a pending request without outcome", got)
+	}
+	if err := h.store.Resolve(ctx, req.ID, Resolution{Action: ActionRelease, Reason: "operator"}); err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	settled := h.request(req.ID)
+	if settled.State != stateSettled {
+		t.Fatalf("state = %q, want settled", settled.State)
+	}
+	spent := h.key(key.ID).SpentMicroUSD
+
+	// The first late completion records the outcome only.
+	h.mustComplete(Completion{ID: req.ID, TraceID: req.TraceID, Outcome: OutcomeSucceeded, StatusCode: 200})
+	after := h.request(req.ID)
+	if after.State != stateSettled || after.Outcome != OutcomeSucceeded {
+		t.Fatalf("late completion = %+v, want settled with the outcome recorded", after)
+	}
+	if k := h.key(key.ID); k.SpentMicroUSD != spent || k.HeldMicroUSD != 0 {
+		t.Fatalf("late completion changed money: spent %d held %d, want %d/0", k.SpentMicroUSD, k.HeldMicroUSD, spent)
+	}
+	var resolved string
+	if err := h.store.db.QueryRow(`SELECT resolved FROM requests WHERE id = ?`, req.ID).Scan(&resolved); err != nil {
+		t.Fatalf("read resolved: %v", err)
+	}
+	if resolved != ActionRelease {
+		t.Fatalf("resolved = %q, want the administrator decision kept", resolved)
+	}
+	// Repeating the same completion stays idempotent, so a retried native
+	// event never turns into a failure.
+	if err := h.store.Complete(ctx, Completion{ID: req.ID, TraceID: req.TraceID,
+		Outcome: OutcomeSucceeded, StatusCode: 200}); err != nil {
+		t.Fatalf("repeated late completion: %v", err)
+	}
+	// Changing it is still refused.
+	if err := h.store.Complete(ctx, Completion{ID: req.ID, TraceID: req.TraceID,
+		Outcome: OutcomeFailed, StatusCode: 500}); !errors.Is(err, ErrConflict) {
+		t.Fatalf("conflicting completion err = %v, want ErrConflict", err)
+	}
+	if k := h.key(key.ID); k.HeldMicroUSD != 0 || k.SpentMicroUSD != spent {
+		t.Fatalf("refused completions changed money: %+v", k)
+	}
+}
+
+// TestLateUnaccountedExecutionReopensSettledRequest covers the asynchronous
+// case: a closed request receives an execution whose accounting is unknown, so
+// it must become pending again with its original hold restored instead of
+// silently absorbing the leak.
+func TestLateUnaccountedExecutionReopensSettledRequest(t *testing.T) {
+	h := newHarness(t)
+	h.mustPrice("m1", Rates{Input: million})
+	key, _ := h.mustKey(KeySpec{Enabled: true})
+	ctx := h.ctx()
+
+	req := h.mustReserve(ReserveInput{ID: "r1", TraceID: "t1", KeyID: key.ID,
+		RequestedModel: "m1", InputEstimate: 9})
+	h.mustUsage(usageFor("u1", req, "m1", tokens(9, 0, 0, 0, 0)))
+	h.mustComplete(Completion{ID: req.ID, TraceID: req.TraceID, Outcome: OutcomeSucceeded})
+	if got := h.request(req.ID); got.State != stateSettled {
+		t.Fatalf("state = %q, want settled", got.State)
+	}
+	spent := h.key(key.ID).SpentMicroUSD
+	if k := h.key(key.ID); k.HeldMicroUSD != 0 {
+		t.Fatalf("held = %d, want released", k.HeldMicroUSD)
+	}
+	var initial int64
+	if err := h.store.db.QueryRow(`SELECT initial_hold_micro_usd FROM requests WHERE id = ?`, req.ID).Scan(&initial); err != nil {
+		t.Fatalf("read initial hold: %v", err)
+	}
+	if initial != 9 {
+		t.Fatalf("initial hold = %d, want 9", initial)
+	}
+
+	late := usageFor("u2", req, "m1", Tokens{})
+	late.Quality = QualityUnknown
+	h.mustUsage(late)
+	got := h.request(req.ID)
+	if got.State != statePending {
+		t.Fatalf("state = %q, want pending after a late unaccounted execution", got.State)
+	}
+	if got.HeldMicroUSD != 9 {
+		t.Fatalf("held = %d, want the pre-authorization restored", got.HeldMicroUSD)
+	}
+	if k := h.key(key.ID); k.HeldMicroUSD != 9 || k.SpentMicroUSD != spent {
+		t.Fatalf("key after reopen = %+v, want held 9 and spent %d", k, spent)
+	}
+	// A second unknown event must not restore the hold twice.
+	second := usageFor("u3", req, "m1", Tokens{})
+	second.Quality = QualityUnknown
+	h.mustUsage(second)
+	if k := h.key(key.ID); k.HeldMicroUSD != 9 {
+		t.Fatalf("held = %d, want 9 after a second unknown event", k.HeldMicroUSD)
+	}
+	// Only an administrator can close it again.
+	if has, err := h.store.HasActive(ctx); err != nil || has {
+		t.Fatalf("HasActive = %v/%v, want false for a pending request", has, err)
+	}
+	if err := h.store.Resolve(ctx, req.ID, Resolution{Action: ActionCharge, AmountMicroUSD: 30,
+		Reason: "unaccounted execution"}); err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	if k := h.key(key.ID); k.HeldMicroUSD != 0 || k.SpentMicroUSD != spent+30 {
+		t.Fatalf("after resolution = %+v, want held 0 and spent %d", k, spent+30)
+	}
+
+	// A late known execution is charged without reopening anything, and a
+	// manually resolved request is never reopened behind the administrator.
+	lateKnown := h.mustReserve(ReserveInput{ID: "r2", TraceID: "t2", KeyID: key.ID,
+		RequestedModel: "m1", InputEstimate: 4})
+	h.mustUsage(usageFor("u4", lateKnown, "m1", tokens(4, 0, 0, 0, 0)))
+	if k := h.key(key.ID); k.SpentMicroUSD != spent+30+4 {
+		t.Fatalf("late known execution was not charged: %+v", k)
+	}
+	manual := h.mustReserve(ReserveInput{ID: "r3", TraceID: "t3", KeyID: key.ID,
+		RequestedModel: "m1", InputEstimate: 6})
+	h.mustComplete(Completion{ID: manual.ID, TraceID: manual.TraceID, Outcome: OutcomeFailed, StatusCode: 502})
+	if err := h.store.Resolve(ctx, manual.ID, Resolution{Action: ActionCharge, AmountMicroUSD: 11, Reason: "manual"}); err != nil {
+		t.Fatalf("resolve manual: %v", err)
+	}
+	afterManual := h.key(key.ID).SpentMicroUSD
+	unknownForManual := usageFor("u5", manual, "m1", Tokens{})
+	unknownForManual.Quality = QualityUnknown
+	h.mustUsage(unknownForManual)
+	if got := h.request(manual.ID); got.State != stateSettled || got.HeldMicroUSD != 0 {
+		t.Fatalf("manual resolution was reopened: %+v", got)
+	}
+	// The active r2 still owns its own hold; only the manual request must not
+	// have come back to life.
+	if k := h.key(key.ID); k.HeldMicroUSD != 4 || k.SpentMicroUSD != afterManual {
+		t.Fatalf("manual resolution changed the ledger: %+v, want held 4 and spent %d", k, afterManual)
+	}
+}
+
+// TestFailedExecutionDoesNotProveSuccess keeps the success outcome honest: a
+// reliable but failed lifecycle event never closes a successful request, while
+// a failed request with accounted cost still settles.
+func TestFailedExecutionDoesNotProveSuccess(t *testing.T) {
+	h := newHarness(t)
+	h.mustPrice("m1", Rates{Input: million})
+	key, _ := h.mustKey(KeySpec{Enabled: true})
+
+	req := h.mustReserve(ReserveInput{ID: "r1", TraceID: "t1", KeyID: key.ID,
+		RequestedModel: "m1", InputEstimate: 10})
+	failed := usageFor("u1", req, "m1", tokens(10, 0, 0, 0, 0))
+	failed.Failed = true
+	h.mustUsage(failed)
+	h.mustComplete(Completion{ID: req.ID, TraceID: req.TraceID, Outcome: OutcomeSucceeded})
+	if got := h.request(req.ID); got.State != statePending {
+		t.Fatalf("state = %q, want pending: a failed execution cannot prove success", got.State)
+	}
+	if k := h.key(key.ID); k.HeldMicroUSD != 10 {
+		t.Fatalf("held = %d, want the hold retained", k.HeldMicroUSD)
+	}
+	// A reliable successful execution then closes it.
+	h.mustUsage(usageFor("u2", req, "m1", tokens(10, 0, 0, 0, 0)))
+	if got := h.request(req.ID); got.State != stateSettled {
+		t.Fatalf("state = %q, want settled", got.State)
+	}
+
+	// A failed lifecycle with accounted executions is already terminal.
+	other := h.mustReserve(ReserveInput{ID: "r2", TraceID: "t2", KeyID: key.ID,
+		RequestedModel: "m1", InputEstimate: 10})
+	broken := usageFor("u3", other, "m1", tokens(10, 0, 0, 0, 0))
+	broken.Failed = true
+	h.mustUsage(broken)
+	h.mustComplete(Completion{ID: other.ID, TraceID: other.TraceID, Outcome: OutcomeFailed, StatusCode: 500})
+	if got := h.request(other.ID); got.State != stateSettled {
+		t.Fatalf("failed state = %q, want settled", got.State)
+	}
+}
+
+// TestUsageReplayWithoutTimestamp covers a caller that omits the event time: the
+// replay must be recognised even though the wall clock moved on.
+func TestUsageReplayWithoutTimestamp(t *testing.T) {
+	h, key := billingHarness(t)
+	ctx := h.ctx()
+	req := h.mustReserve(ReserveInput{ID: "r1", TraceID: "t1", KeyID: key.ID,
+		RequestedModel: "m1", InputEstimate: 10})
+
+	first := usageFor("u1", req, "m1", tokens(10, 0, 0, 0, 0))
+	if !first.At.IsZero() {
+		t.Fatal("the case needs an omitted timestamp")
+	}
+	if err := h.store.RecordUsage(ctx, first); err != nil {
+		t.Fatalf("record: %v", err)
+	}
+	h.clock.advance(3 * time.Hour)
+	replay := usageFor("u1", req, "m1", tokens(10, 0, 0, 0, 0))
+	if err := h.store.RecordUsage(ctx, replay); err != nil {
+		t.Fatalf("replay without a timestamp: %v", err)
+	}
+	// An explicit, different timestamp is still a conflicting reuse.
+	conflicting := usageFor("u1", req, "m1", tokens(10, 0, 0, 0, 0))
+	conflicting.At = h.clock.now()
+	if err := h.store.RecordUsage(ctx, conflicting); !errors.Is(err, ErrConflict) {
+		t.Fatalf("explicit timestamp err = %v, want ErrConflict", err)
+	}
+	if n, err := counterValue(ctx, h.store.db,
+		`SELECT COUNT(*) FROM usages WHERE request_id = ?`, req.ID); err != nil || n != 1 {
+		t.Fatalf("usages = %d (%v), want a single execution", n, err)
+	}
+	if k := h.key(key.ID); k.SpentMicroUSD != 10 {
+		t.Fatalf("spent = %d, want a single charge", k.SpentMicroUSD)
+	}
+}
+
+// TestCompletionAfterManualResolveKeepsRecordedOutcome covers a request that
+// completed normally and was then closed by an administrator: the recorded
+// outcome stays authoritative and is never rewritten by a later completion.
+func TestCompletionAfterManualResolveKeepsRecordedOutcome(t *testing.T) {
+	h := newHarness(t)
+	h.mustPrice("m1", Rates{Input: million})
+	key, _ := h.mustKey(KeySpec{Enabled: true})
+	ctx := h.ctx()
+	req := h.mustReserve(ReserveInput{ID: "r1", TraceID: "t1", KeyID: key.ID,
+		RequestedModel: "m1", InputEstimate: 5})
+
+	h.mustComplete(Completion{ID: req.ID, TraceID: req.TraceID, Outcome: OutcomeFailed, StatusCode: 502})
+	// An unresolved request repeats its outcome idempotently.
+	if err := h.store.Complete(ctx, Completion{ID: req.ID, TraceID: req.TraceID,
+		Outcome: OutcomeFailed, StatusCode: 502}); err != nil {
+		t.Fatalf("repeat before resolve: %v", err)
+	}
+	if got := h.request(req.ID); got.State != statePending || got.Outcome != OutcomeFailed {
+		t.Fatalf("before resolve = %+v, want a pending failure", got)
+	}
+	if err := h.store.Resolve(ctx, req.ID, Resolution{Action: ActionRelease, Reason: "operator"}); err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	// The same completion is still a no-op once the request is closed.
+	if err := h.store.Complete(ctx, Completion{ID: req.ID, TraceID: req.TraceID,
+		Outcome: OutcomeFailed, StatusCode: 502}); err != nil {
+		t.Fatalf("repeat after resolve: %v", err)
+	}
+	// A different outcome must not be mistaken for a first late completion.
+	if err := h.store.Complete(ctx, Completion{ID: req.ID, TraceID: req.TraceID,
+		Outcome: OutcomeSucceeded, StatusCode: 200}); !errors.Is(err, ErrConflict) {
+		t.Fatalf("changed outcome err = %v, want ErrConflict", err)
+	}
+	if err := h.store.Complete(ctx, Completion{ID: req.ID, TraceID: req.TraceID,
+		Outcome: OutcomeFailed, StatusCode: 500}); !errors.Is(err, ErrConflict) {
+		t.Fatalf("changed status err = %v, want ErrConflict", err)
+	}
+	got := h.request(req.ID)
+	if got.State != stateSettled || got.Outcome != OutcomeFailed {
+		t.Fatalf("request = %+v, want the recorded failure kept", got)
+	}
+	if k := h.key(key.ID); k.HeldMicroUSD != 0 || k.SpentMicroUSD != 0 {
+		t.Fatalf("money changed: %+v", k)
+	}
 }

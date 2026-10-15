@@ -641,3 +641,173 @@ func TestScopeStableAcrossRotationAndRestart(t *testing.T) {
 		}
 	}
 }
+
+// TestOpenTakesLockBeforeTouchingPepper proves the directory lock is acquired
+// before the pepper is read or created: an instance that loses the race must
+// fail with ErrLocked without leaving a pepper behind for the owner to trip on.
+func TestOpenTakesLockBeforeTouchingPepper(t *testing.T) {
+	dir := t.TempDir()
+	// Stand in for an owner that holds the directory but has not written its
+	// pepper yet, which is exactly the window a second instance would race into.
+	lock, err := acquireDirLock(filepath.Join(dir, lockFileName))
+	if err != nil {
+		t.Fatalf("acquire dir lock: %v", err)
+	}
+	defer func() { _ = lock.release() }()
+
+	if _, err := Open(Options{DataDir: dir}); !errors.Is(err, ErrLocked) {
+		t.Fatalf("open err = %v, want ErrLocked", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, pepperFileName)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("pepper was touched while another instance held the lock: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, dbFileName)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("database was created while another instance held the lock: %v", err)
+	}
+}
+
+// TestKeyMaterialValidationMatrix pins the caller supplied material contract for
+// creation and rotation. CPA trims material on its way through the host, so a
+// value that cannot round trip unchanged is rejected rather than rewritten, and
+// only a truly empty value is generated.
+func TestKeyMaterialValidationMatrix(t *testing.T) {
+	invalid := []struct {
+		name     string
+		material string
+	}{
+		{"too short", "1234567"},
+		{"too long", strings.Repeat("A", materialMaxLen+1)},
+		{"leading space", " 12345678"},
+		{"trailing space", "12345678 "},
+		{"tab inside", "1234\t5678"},
+		{"newline", "1234\n5678"},
+		{"carriage return", "1234\r5678"},
+		{"nul byte", "1234\x005678"},
+		{"delete", "1234\x7f5678"},
+		{"invalid utf8", "1234\xff5678"},
+		{"blank", "   "},
+		{"whitespace only", "\t\n"},
+	}
+	// validMaterials keeps the boundary values (minimum and maximum length)
+	// while staying unique per phase, because rotating onto material that is
+	// already registered is a conflict.
+	validMaterials := func(tag string) []string {
+		return []string{
+			"1234" + tag + "5678",
+			"sk-" + strings.Repeat("A", materialMaxLen-3-len(tag)) + tag,
+			"密钥-" + tag + "-abcdefgh",
+			"material " + tag + " with inner spaces",
+			"sk-" + tag + "_base32_LIKE_but_charset_is_free",
+		}
+	}
+	valid := validMaterials("c")
+	h := newHarness(t)
+	ctx := h.ctx()
+
+	keys, err := h.store.ListKeys(ctx)
+	if err != nil {
+		t.Fatalf("list keys: %v", err)
+	}
+	for _, tc := range invalid {
+		_, _, err := h.store.CreateKey(ctx, KeySpec{Material: tc.material, Enabled: true})
+		if !errors.Is(err, ErrInvalid) {
+			t.Fatalf("create with %s err = %v, want ErrInvalid", tc.name, err)
+		}
+	}
+	after, err := h.store.ListKeys(ctx)
+	if err != nil {
+		t.Fatalf("list keys: %v", err)
+	}
+	if len(after) != len(keys) {
+		t.Fatalf("rejected creation changed the store: %d keys, want %d", len(after), len(keys))
+	}
+	// A generated key and every valid custom material are accepted verbatim.
+	if key, material, err := h.store.CreateKey(ctx, KeySpec{Enabled: true}); err != nil || material == "" {
+		t.Fatalf("generated key = %v/%q", key.ID, material)
+	}
+	created := map[string]string{}
+	for _, m := range valid {
+		key, got, err := h.store.CreateKey(ctx, KeySpec{Material: m, Enabled: true})
+		if err != nil {
+			t.Fatalf("create %q: %v", m, err)
+		}
+		if got != m {
+			t.Fatalf("returned material %q, want the exact input %q", got, m)
+		}
+		if _, err := h.store.Authenticate(ctx, m); err != nil {
+			t.Fatalf("authenticate %q: %v", m, err)
+		}
+		created[key.ID] = m
+	}
+
+	// Rotation uses the same matrix and never leaves a trace when it fails.
+	target, current, err := h.store.CreateKey(ctx, KeySpec{Material: "original-material", Enabled: true})
+	if err != nil {
+		t.Fatalf("create target: %v", err)
+	}
+	before := h.key(target.ID)
+	for _, tc := range invalid {
+		if _, _, err := h.store.RotateKey(ctx, target.ID, tc.material); !errors.Is(err, ErrInvalid) {
+			t.Fatalf("rotate with %s err = %v, want ErrInvalid", tc.name, err)
+		}
+		now := h.key(target.ID)
+		if now.Fingerprint != before.Fingerprint {
+			t.Fatalf("rejected rotation with %s changed the key", tc.name)
+		}
+		if _, err := h.store.Authenticate(ctx, current); err != nil {
+			t.Fatalf("original material stopped working after %s: %v", tc.name, err)
+		}
+	}
+	rotated := validMaterials("r")
+	for _, m := range rotated {
+		key, got, err := h.store.RotateKey(ctx, target.ID, m)
+		if err != nil {
+			t.Fatalf("rotate %q: %v", m, err)
+		}
+		if got != m || key.ID != target.ID {
+			t.Fatalf("rotate returned %q for %s", got, key.ID)
+		}
+		if _, err := h.store.Authenticate(ctx, m); err != nil {
+			t.Fatalf("authenticate rotated %q: %v", m, err)
+		}
+		current = m
+	}
+	// Rotation without custom material still generates fresh material.
+	_, generated, err := h.store.RotateKey(ctx, target.ID, "")
+	if err != nil || generated == "" {
+		t.Fatalf("generated rotation = %q/%v", generated, err)
+	}
+	current = generated
+
+	// UpdateKey refuses every non empty material, including blank values, so a
+	// caller cannot believe a rotation happened when it did not.
+	spec := h.key(target.ID).Spec
+	for _, m := range []string{"new-material-value", "   ", "\t", current} {
+		spec.Material = m
+		if _, err := h.store.UpdateKey(ctx, target.ID, spec); !errors.Is(err, ErrInvalid) {
+			t.Fatalf("update with material %q err = %v, want ErrInvalid", m, err)
+		}
+	}
+	spec.Material = ""
+	if _, err := h.store.UpdateKey(ctx, target.ID, spec); err != nil {
+		t.Fatalf("update without material: %v", err)
+	}
+
+	// Lookup rejects oversized and empty input before hashing, and never
+	// normalises the opaque value.
+	if _, err := h.store.Authenticate(ctx, strings.Repeat("A", materialMaxLen+1)); !errors.Is(err, ErrUnauthorized) {
+		t.Fatalf("oversized lookup err = %v, want ErrUnauthorized", err)
+	}
+	if _, err := h.store.Authenticate(ctx, ""); !errors.Is(err, ErrUnauthorized) {
+		t.Fatalf("empty lookup err = %v, want ErrUnauthorized", err)
+	}
+	if _, err := h.store.Authenticate(ctx, " "+current+" "); !errors.Is(err, ErrUnauthorized) {
+		t.Fatal("lookup must not trim the opaque value")
+	}
+	if _, err := h.store.Authenticate(ctx, current); err != nil {
+		t.Fatalf("the exact stored material must still authenticate: %v", err)
+	}
+	if len(created) != len(valid) {
+		t.Fatalf("created %d custom keys, want %d", len(created), len(valid))
+	}
+}
