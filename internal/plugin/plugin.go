@@ -1,0 +1,117 @@
+// Package plugin implements the CLIProxyAPI native credit-manager plugin: an
+// exclusive frontend authenticator plus passive request-interception, request
+// lifecycle and usage hooks backed by the credit and capture stores, and a
+// management API.
+//
+// It never executes models: it deliberately declares no executor, router,
+// scheduler, response or stream hook, so the host can never route inference
+// through it.
+package plugin
+
+import (
+	"strings"
+
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
+)
+
+const (
+	// PluginID is the stable plugin route segment used for its Management API
+	// paths. The host derives its own library identifier from the plugin
+	// filename; this constant is the documented, stable route name.
+	PluginID = "credit-manager"
+	// PluginName is the human-readable plugin name shown by the host.
+	PluginName = "Credit Manager"
+	// Author identifies the plugin author for registration metadata.
+	Author = "fengwk"
+	// GitHubRepository satisfies the host registration metadata requirement.
+	GitHubRepository = "https://github.com/fengwk/cliproxyapi-credit-manager"
+)
+
+// Build-time variables, overridable with
+// -ldflags "-X github.com/fengwk/cliproxyapi-credit-manager/internal/plugin.PluginVersion=...".
+var (
+	// PluginVersion is the plugin release version.
+	PluginVersion = "0.1.0"
+	// GitCommit is the full commit hash of the build, empty for local builds.
+	GitCommit = ""
+	// SDKVersion is the CLIProxyAPI SDK the plugin was built against. It is the
+	// minimum host contract this plugin supports.
+	SDKVersion = "v8.0.30"
+)
+
+// minHostSchema is the lowest RPC schema this plugin supports. Schema 6 is the
+// CPA v8.0.30 contract and is required to preserve raw management JSON.
+const minHostSchema = pluginabi.SchemaVersionRawManagementResponse
+
+// Metadata returns the registration metadata reported to the host.
+func Metadata() pluginapi.Metadata {
+	return pluginapi.Metadata{
+		Name:             PluginName,
+		Version:          metadataVersion(),
+		Author:           Author,
+		GitHubRepository: GitHubRepository,
+	}
+}
+
+// metadataVersion composes the release version with the full build commit so
+// the reported version identifies the exact source revision.
+func metadataVersion() string {
+	version := strings.TrimSpace(PluginVersion)
+	if version == "" {
+		version = "0.0.0"
+	}
+	commit := strings.TrimSpace(GitCommit)
+	if commit == "" {
+		return version
+	}
+	return version + "+" + commit
+}
+
+// registration is the plugin.register / plugin.reconfigure response payload.
+type registration struct {
+	SchemaVersion uint32                 `json:"schema_version"`
+	Metadata      pluginapi.Metadata     `json:"metadata"`
+	Capabilities  registrationCapability `json:"capabilities"`
+}
+
+// registrationCapability declares exactly the capabilities this plugin uses.
+// It deliberately omits every executor, router, scheduler, response and stream
+// hook so the host can never route inference through the plugin.
+type registrationCapability struct {
+	FrontendAuthProvider          bool `json:"frontend_auth_provider"`
+	FrontendAuthProviderExclusive bool `json:"frontend_auth_provider_exclusive"`
+	RequestInterceptor            bool `json:"request_interceptor"`
+	RequestLifecyclePlugin        bool `json:"request_lifecycle_plugin"`
+	UsagePlugin                   bool `json:"usage_plugin"`
+	ManagementAPI                 bool `json:"management_api"`
+}
+
+// registrationResponse negotiates the schema conservatively: it never claims a
+// newer contract than this plugin implements, and it refuses a host whose RPC
+// schema predates the minimum supported CPA contract.
+func registrationResponse(hostSchema uint32) (registration, error) {
+	if hostSchema != 0 && hostSchema < minHostSchema {
+		return registration{}, &PluginError{
+			Code:       "unsupported_host",
+			Message:    "host RPC schema is older than the minimum supported contract",
+			HTTPStatus: 0,
+		}
+	}
+	schema := pluginabi.SchemaVersion
+	if hostSchema != 0 && hostSchema < schema {
+		schema = hostSchema
+	}
+	return registration{
+		SchemaVersion: schema,
+		Metadata:      Metadata(),
+		Capabilities: registrationCapability{
+			FrontendAuthProvider:          true,
+			FrontendAuthProviderExclusive: true,
+			RequestInterceptor:            true,
+			RequestLifecyclePlugin:        true,
+			UsagePlugin:                   true,
+			ManagementAPI:                 true,
+		},
+	}, nil
+}
