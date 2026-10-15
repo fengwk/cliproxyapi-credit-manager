@@ -37,7 +37,8 @@ test('结果筛选只提供契约枚举值', () => {
   const select = html.match(/<select id="usage-result">([\s\S]*?)<\/select>/);
   assert.ok(select, '缺少结果筛选下拉框');
   const values = [...select[1].matchAll(/<option value="([^"]*)"/g)].map((m) => m[1]);
-  assert.deepEqual(values, ['', 'succeeded', 'failed', 'rejected', 'canceled']);
+  // 后端 result 参数接受 4 个 outcome 值与 active/pending 两个 state 值（pending = active+pending）。
+  assert.deepEqual(values, ['', 'succeeded', 'failed', 'rejected', 'canceled', 'active', 'pending']);
 });
 
 test('脚本不写入存储、不使用 innerHTML/eval、始终携带 Authorization', () => {
@@ -71,7 +72,7 @@ test('脚本不保留已废弃的枚举别名', () => {
   for (const stale of ['inconsistent', 'unclassified', 'cancelled', "'success'", "'stopped'", "'charged'"]) {
     assert.ok(!js.includes(stale), `不应再出现旧取值 ${stale}`);
   }
-  for (const required of ['partial', 'unknown', 'active', 'pending', 'settled', 'succeeded', 'rejected', 'canceled']) {
+  for (const required of ['partial', 'unknown', 'active', 'pending', 'settled', 'succeeded', 'rejected', 'canceled', 'adjustment_micro_usd']) {
     assert.ok(js.includes(required), `缺少契约取值 ${required}`);
   }
 });

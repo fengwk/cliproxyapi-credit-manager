@@ -329,6 +329,7 @@ table.data tbody tr.row-main:hover { background: rgba(76, 141, 255, 0.06); }
 .badge-info { color: var(--accent); border-color: rgba(76, 141, 255, 0.5); }
 
 .pill-note { color: var(--text-faint); font-size: 11px; }
+.pill-note.is-warn { color: var(--warn); }
 
 /* ---------- 图表 ---------- */
 

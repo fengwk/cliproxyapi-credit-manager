@@ -347,18 +347,84 @@ test('结果/状态/质量标签与语气与契约枚举一致', () => {
   assert.deepEqual(CM.credentialStatus('weird'), { label: 'weird', tone: '' });
 });
 
-test('只有 pending 状态的请求才提示管理员处理', () => {
-  // state=pending 必须可处理；active（进行中）与 settled（已结算）不应出现处理入口。
+test('只有 pending 状态的请求才提供人工 Resolve 入口', () => {
+  // 后端 Resolve 只接受 state=pending：active 仍在执行并占用并发与持有金额，必须拒绝处理入口。
   assert.equal(CM.isPendingRequest({ state: 'pending', executions: [] }), true);
-  assert.equal(CM.isPendingRequest({ state: 'active', executions: [] }), false);
-  assert.equal(CM.isPendingRequest({ state: 'settled', executions: [] }), false);
   assert.equal(CM.isPendingRequest({ state: 'PENDING' }), true);
-  // 状态缺失时按保守规则判断：没有任何执行记录且未完成才视作待定。
-  assert.equal(CM.isPendingRequest({ executions: [] }), true);
-  assert.equal(CM.isPendingRequest({ executions: [], completed_at: '2026-01-01T00:00:00Z' }), false);
-  assert.equal(CM.isPendingRequest({ executions: [{ id: 'e1' }] }), false);
+  assert.equal(CM.isPendingRequest({ state: 'active', executions: [] }), false);
+  assert.equal(CM.isPendingRequest({ state: 'active', held_micro_usd: 1000000 }), false);
+  assert.equal(CM.isPendingRequest({ state: 'settled', executions: [] }), false);
+  assert.equal(CM.isPendingRequest({ executions: [] }), false, '状态缺失时不得猜测为可处理');
   assert.equal(CM.isPendingRequest(null), false);
   assert.equal(CM.isPendingRequest(undefined), false);
+});
+
+test('汇总卡片区分失败请求、未结算请求、执行成本与人工补记', () => {
+  const summary = CM.parseJSON(
+    JSON.stringify({
+      requests: 3,
+      executions: 5,
+      failed: 2,
+      pending: 1,
+      cost_micro_usd: 4200000,
+      adjustment_micro_usd: 2500000,
+      tokens: { input: 10, cache_read: 0, cache_write: 0, output: 20, reasoning: 0, total: 30 },
+      complete_executions: 3,
+      cache_read_ratio: 0.25,
+    })
+  );
+  const cards = CM.usageSummaryCards(summary, {});
+  const byLabel = {};
+  cards.forEach((card) => {
+    byLabel[card.label] = card;
+  });
+
+  // 契约：failed 是失败请求数，绝不能显示为「失败执行」。
+  assert.ok(byLabel['失败请求'], '必须存在失败请求卡片');
+  assert.equal(byLabel['失败请求'].value, '2');
+  assert.ok(byLabel['失败请求'].sub.includes('failed / canceled / rejected'));
+  assert.equal(cards.some((card) => card.label.indexOf('失败执行') >= 0), false);
+
+  // pending 是 active+pending 的未结算请求：已知用量照常入账。
+  assert.ok(byLabel['未结算请求'], '必须存在未结算请求卡片');
+  assert.ok(byLabel['未结算请求'].sub.includes('已知用量照常入账，未知部分待核账'));
+  assert.equal(byLabel['未结算请求'].sub.includes('不计入成本'), false);
+
+  // 执行成本与人工补记必须是两张独立卡片，金额互不混算。
+  assert.equal(byLabel['执行成本'].value, '4.2 USD');
+  assert.ok(byLabel['执行成本'].sub.includes('仅匹配范围内的执行计量'));
+  assert.equal(byLabel['人工补记'].value, '2.5 USD');
+  assert.ok(byLabel['人工补记'].sub.includes('不计入执行成本'));
+  assert.equal(byLabel['人工补记'].value === byLabel['执行成本'].value, false);
+
+  // 无 provider/auth 过滤时不得声称已按执行维度过滤。
+  assert.equal(byLabel['执行成本'].sub.includes('Provider/auth_id'), false);
+  assert.equal(byLabel['人工补记'].sub.includes('不受 Provider/auth_id 过滤'), false);
+});
+
+test('provider/auth 过滤只作用于执行维度并如实标注', () => {
+  const summary = CM.parseJSON(
+    '{"requests":1,"executions":1,"failed":0,"pending":0,"cost_micro_usd":1000000,"adjustment_micro_usd":2500000,"tokens":{},"complete_executions":1}'
+  );
+  assert.equal(CM.hasExecutionScope({}), false);
+  assert.equal(CM.hasExecutionScope({ provider: ' ' }), false);
+  assert.equal(CM.hasExecutionScope({ provider: 'opencode-go' }), true);
+  assert.equal(CM.hasExecutionScope({ auth: 'auth-1' }), true);
+
+  const scoped = CM.usageSummaryCards(summary, { provider: 'opencode-go', auth: 'auth-1' });
+  const cost = scoped.find((card) => card.label === '执行成本');
+  const adjustment = scoped.find((card) => card.label === '人工补记');
+  assert.ok(cost.sub.includes('已按 Provider/auth_id 过滤'));
+  assert.ok(adjustment.sub.includes('不受 Provider/auth_id 过滤'));
+
+  const note = CM.usageScopeNote(summary, { provider: 'opencode-go' });
+  assert.ok(note.includes('不等于全 Key 账本支出'));
+  assert.ok(note.includes('不能把该合计当作全 Key 台账'));
+  assert.ok(note.includes('完整执行占比 = 1 / 1 = 100.0%'));
+  // 没有执行维度过滤时不加这段强提示，但口径说明始终存在。
+  const plain = CM.usageScopeNote(summary, {});
+  assert.equal(plain.includes('不能把该合计当作全 Key 台账'), false);
+  assert.ok(plain.includes('不等于全 Key 账本支出'));
 });
 
 test('字节数、时长与时间格式化', () => {
