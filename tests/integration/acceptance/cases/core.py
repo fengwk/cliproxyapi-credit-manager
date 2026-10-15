@@ -16,7 +16,8 @@ def case(name, expects):
     return wrap
 
 
-@case("native.registration", "host loads the plugin: enabled, metadata present, management menu published")
+@case("native.registration",
+      "host loads the plugin: enabled, metadata present with the expected build version, management menu published")
 def registration(ctx):
     raw = ctx.host.plugin_registration()
     entries = {entry["id"]: entry for entry in raw.get("plugins", [])}
@@ -29,25 +30,34 @@ def registration(ctx):
     check_eq(meta.get("name"), "Credit Manager", "plugin metadata name")
     check_eq(meta.get("author"), "fengwk", "plugin metadata author")
     check(meta.get("github_repository"), "plugin metadata github_repository is required")
-    check(meta.get("version", "").startswith("0.1.0-review"), f"version {meta.get('version')}")
+    # The reported version must identify the expected build, not just any build.
+    ctx.assert_plugin_version(meta.get("version"), "plugin metadata version")
     # The published management menu proves the management_api resource route registered.
     menus = entry.get("menus", [])
     check(any(m.get("path") == f"/v0/resource/plugins/{ctx.plugin_id}/index.html" for m in menus),
           f"management menu not published: {menus}")
-    return {"registration": entry}
+    return {"registration": entry, "version": meta.get("version")}
 
 
-@case("native.health", "plugin health reports ok with retention and capture fields")
+@case("native.health",
+      "plugin health reports ok with the expected build version and retention and capture fields")
 def health(ctx):
     response = ctx.manager.health()
     check_eq(response.status, 200, "health status code")
     data = response.json()
     check_eq(data.get("status"), "ok", "health status")
-    check(data.get("version", "").startswith("0.1.0-review"), f"health version {data.get('version')}")
+    registered = ctx.host.plugin_registration()
+    entry = next((e for e in registered.get("plugins", []) if e.get("id") == ctx.plugin_id), {})
+    registered_version = (entry.get("metadata") or {}).get("version")
+    # The health version must be exactly the version the host registered, and
+    # both must identify the expected build.
+    ctx.assert_plugin_version(data.get("version"), "health version")
+    check_eq(data.get("version"), registered_version,
+             "health version must equal the registered plugin version")
     check("capture" in data and "retention_months" in data and "capture_enabled" in data,
           f"health fields missing: {sorted(data)}")
     check_eq(data.get("last_error"), "", "health last_error")
-    return {"health": data}
+    return {"health": data, "registered_version": registered_version}
 
 
 @case("management.auth_required", "management API without credentials is rejected with 401")

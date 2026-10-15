@@ -3,19 +3,33 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 from .api import Client, Manager
 from .host import Host, HostConfig
 from .mock import UpstreamMock, free_port
+from .report import CaseFailure
+
+#: A build commit is always injected by this project's Makefile, so a plugin
+#: version that carries no 40-hex commit is a misbuild, not a valid release.
+COMMIT_RE = re.compile(r"[0-9a-f]{40}")
 
 
 class Context:
-    def __init__(self, artifacts: Path, cpa: Path, plugin: Path, plugin_id="credit-manager"):
+    def __init__(self, artifacts: Path, cpa: Path, plugin: Path, plugin_id="credit-manager",
+                 expected_version="0.1.0", expected_commit=""):
         self.artifacts = Path(artifacts)
         self.cpa = Path(cpa)
         self.plugin = Path(plugin)
         self.plugin_id = plugin_id
+        self.expected_version = expected_version
+        self.expected_commit = (expected_commit or "").strip().lower()
+        # With an explicit commit the whole "<version>+<commit>" identity is
+        # asserted exactly; without one the base version must match exactly and
+        # the commit part must still be a real 40-hex build commit.
+        self.expected_metadata = (f"{self.expected_version}+{self.expected_commit}"
+                                  if self.expected_commit else None)
         self.management_secret = "synthetic-management-guard"
         self.original_client_key = "synthetic-original-cpa-client"
         self.openai_upstream_keys = ["synthetic-openai-upstream-a", "synthetic-openai-upstream-b"]
@@ -26,6 +40,38 @@ class Context:
         self.client = None
         self.host_root = None
         self._host_seq = 0
+
+    # -- expected build identity -------------------------------------------
+    def plugin_version_error(self, actual) -> str | None:
+        """Return why a plugin-reported version is not the expected build, or None."""
+        if not isinstance(actual, str) or not actual:
+            return f"missing plugin version: {actual!r}"
+        if self.expected_metadata is not None:
+            if actual != self.expected_metadata:
+                return f"version {actual!r} != expected {self.expected_metadata!r}"
+            return None
+        version, sep, commit = actual.partition("+")
+        if version != self.expected_version:
+            return (f"version {actual!r} base {version!r} != expected "
+                    f"{self.expected_version!r}")
+        if not sep:
+            return f"version {actual!r} carries no build commit"
+        if COMMIT_RE.fullmatch(commit) is None:
+            return f"version {actual!r} commit {commit!r} is not a 40-hex commit"
+        return None
+
+    def assert_plugin_version(self, actual, label="plugin version") -> str:
+        error = self.plugin_version_error(actual)
+        if error:
+            raise CaseFailure(f"{label}: {error}")
+        return actual
+
+    def version_metadata(self) -> dict:
+        return {
+            "expected_version": self.expected_version,
+            "expected_commit": self.expected_commit,
+            "expected_metadata": self.expected_metadata,
+        }
 
     # -- lifecycle ---------------------------------------------------------
     def build_host(self, *, root, enable_plugins=True, plugin_config=None, extra_plugin_yaml="", extra_top_yaml="", client_keys=None, request_retry=3):
