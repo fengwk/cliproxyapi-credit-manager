@@ -1,0 +1,8 @@
+/data/
+/dist/
+*.so
+*.dylib
+*.dll
+*.db
+*.db-*
+*.test
