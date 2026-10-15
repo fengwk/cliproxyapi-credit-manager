@@ -8,9 +8,11 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
@@ -28,17 +30,19 @@ type harness struct {
 	m     *Manager
 	key   credit.Key
 	plain string
+	dir   string
 }
 
 func newHarness(t *testing.T) *harness {
 	t.Helper()
 	t.Setenv("TZ", "UTC")
 	m := NewManager()
-	h := &harness{t: t, m: m}
+	dir := t.TempDir()
+	h := &harness{t: t, m: m, dir: dir}
 	t.Cleanup(func() {
 		_, _ = m.HandleCall(pluginabi.MethodPluginShutdown, nil)
 	})
-	h.configure(captureYAML(t.TempDir(), 16))
+	h.configure(h.yaml(16))
 	store := h.store()
 	ctx := context.Background()
 	key, plain, err := store.CreateKey(ctx, credit.KeySpec{Label: "test", Enabled: true})
@@ -79,6 +83,49 @@ func (h *harness) configure(yaml []byte) {
 	if !envelope.OK {
 		h.t.Fatalf("register failed: %s", raw)
 	}
+}
+
+// yaml renders a plugin configuration for the harness data directory. The
+// accounting directory is immutable while the plugin runs, so every
+// reconfigure in these tests reuses it.
+func (h *harness) yaml(maxPending int) []byte {
+	return captureYAML(h.dir, maxPending)
+}
+
+// reconfigure applies a new configuration and returns the raw envelope.
+func (h *harness) reconfigure(maxPending int) pluginabi.Envelope {
+	h.t.Helper()
+	payload, err := json.Marshal(lifecycleRequest{ConfigYAML: h.yaml(maxPending), SchemaVersion: pluginabi.SchemaVersion})
+	if err != nil {
+		h.t.Fatalf("marshal lifecycle request: %v", err)
+	}
+	out, err := h.m.HandleCall(pluginabi.MethodPluginReconfigure, payload)
+	if err != nil {
+		h.t.Fatalf("reconfigure returned error: %v", err)
+	}
+	var envelope pluginabi.Envelope
+	if err := json.Unmarshal(out, &envelope); err != nil {
+		h.t.Fatalf("decode reconfigure envelope: %v", err)
+	}
+	return envelope
+}
+
+// waitForState blocks until the manager reaches the given lifecycle state. It
+// spins on an observable condition rather than sleeping so tests synchronize on
+// a real barrier instead of on timing.
+func (h *harness) waitForState(state lifecycleState) {
+	h.t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		h.m.mu.Lock()
+		got := h.m.state
+		h.m.mu.Unlock()
+		if got == state {
+			return
+		}
+		runtime.Gosched()
+	}
+	h.t.Fatalf("manager never reached lifecycle state %d", state)
 }
 
 // store exposes the live credit backend for test assertions.
@@ -337,7 +384,7 @@ func TestInterceptReserveThenSettle(t *testing.T) {
 	}
 
 	h.usage(pluginapi.UsageRecord{
-		RequestID: "req-1", TraceID: "trace-1", Provider: "openai", ExecutorType: "openaiExecutor",
+		RequestID: "exec-1", TraceID: "trace-1", Provider: "openai", ExecutorType: "openaiExecutor",
 		Model: testModel, APIKey: h.key.Principal,
 		AccessProvider: "plugin:cliproxyapi-credit-manager:" + authProviderID,
 		Detail:         pluginapi.UsageDetail{InputTokens: 1000, OutputTokens: 500, TotalTokens: 1500},
@@ -496,13 +543,13 @@ func TestUsageIgnoresForeignAndInternalRecords(t *testing.T) {
 	}
 	// A foreign access provider must be ignored silently.
 	h.usage(pluginapi.UsageRecord{
-		RequestID: "req-usage", TraceID: "trace-usage", Provider: "openai", Model: testModel,
+		RequestID: "exec-usage-foreign", TraceID: "trace-usage", Provider: "openai", Model: testModel,
 		APIKey: h.key.Principal, AccessProvider: "config-inline",
 		Detail: pluginapi.UsageDetail{InputTokens: 10, OutputTokens: 5, TotalTokens: 15},
 	})
 	// An internal host source must be ignored and reported.
 	h.usage(pluginapi.UsageRecord{
-		RequestID: "req-usage", TraceID: "trace-usage", Provider: "openai", Model: testModel,
+		RequestID: "exec-usage-internal", TraceID: "trace-usage", Provider: "openai", Model: testModel,
 		APIKey: h.key.Principal, Source: "plugin_host_model_callback",
 		AccessProvider: "plugin:cliproxyapi-credit-manager:" + authProviderID,
 		Detail:         pluginapi.UsageDetail{InputTokens: 10, OutputTokens: 5, TotalTokens: 15},
@@ -524,24 +571,34 @@ func TestReconfigureRefusesWhileRequestsActive(t *testing.T) {
 	h.m.live.store = activeBackend{Backend: h.m.live.store, active: true}
 	h.m.mu.Unlock()
 
-	payload, err := json.Marshal(lifecycleRequest{ConfigYAML: captureYAML(t.TempDir(), 32), SchemaVersion: pluginabi.SchemaVersion})
-	if err != nil {
-		t.Fatalf("marshal: %v", err)
-	}
-	raw, err := h.m.HandleCall(pluginabi.MethodPluginReconfigure, payload)
-	if err != nil {
-		t.Fatalf("reconfigure: %v", err)
-	}
-	var envelope pluginabi.Envelope
-	if err := json.Unmarshal(raw, &envelope); err != nil {
-		t.Fatalf("decode envelope: %v", err)
-	}
+	envelope := h.reconfigure(32)
 	if envelope.OK || envelope.Error == nil || envelope.Error.HTTPStatus != http.StatusConflict {
-		t.Fatalf("active-request reconfigure must be refused with 409, got %s", raw)
+		t.Fatalf("active-request reconfigure must be refused with 409, got %+v", envelope)
 	}
 	// The previous store must still be live and serving.
 	if response := h.intercept(h.request("req-keep", "trace-keep")); response.Terminate {
 		t.Fatalf("previous store must stay live after a refused reconfigure: %+v", response)
+	}
+}
+
+// TestReconfigureRefusesWhenLivenessIsUnknown verifies that a backend which can
+// not answer the liveness question is treated as unsafe, so accounting is never
+// swapped on a guess.
+func TestReconfigureRefusesWhenLivenessIsUnknown(t *testing.T) {
+	h := newHarness(t)
+	h.m.mu.Lock()
+	h.m.live.store = activeBackend{Backend: h.m.live.store, err: errors.New("liveness probe failed")}
+	h.m.mu.Unlock()
+
+	envelope := h.reconfigure(32)
+	if envelope.OK || envelope.Error == nil || envelope.Error.HTTPStatus != http.StatusConflict {
+		t.Fatalf("an unknown liveness answer must refuse the swap, got %+v", envelope)
+	}
+	if h.m.LastError() == "" {
+		t.Fatal("the liveness failure must be observable through health")
+	}
+	if response := h.intercept(h.request("req-unknown", "trace-unknown")); response.Terminate {
+		t.Fatalf("the previous store must keep serving: %+v", response)
 	}
 }
 
@@ -556,7 +613,7 @@ func TestQuiesceThenReconfigureReopens(t *testing.T) {
 	if !response.Terminate || response.StatusCode != http.StatusServiceUnavailable {
 		t.Fatalf("quiesced plugin must refuse admission, got %+v", response)
 	}
-	h.configure(captureYAML(t.TempDir(), 16))
+	h.configure(h.yaml(16))
 	store := h.store()
 	ctx := context.Background()
 	key, _, err := store.CreateKey(ctx, credit.KeySpec{Label: "again", Enabled: true})
@@ -678,7 +735,7 @@ func TestQuiesceKeepsSettlingReservedRequests(t *testing.T) {
 	}
 	// The reserved request must still settle.
 	h.usage(pluginapi.UsageRecord{
-		RequestID: "req-late", TraceID: "trace-late", Provider: "openai", ExecutorType: "openaiExecutor",
+		RequestID: "exec-late", TraceID: "trace-late", Provider: "openai", ExecutorType: "openaiExecutor",
 		Model: testModel, APIKey: h.key.Principal,
 		AccessProvider: "plugin:cliproxyapi-credit-manager:" + authProviderID,
 		Detail:         pluginapi.UsageDetail{InputTokens: 1000, OutputTokens: 500, TotalTokens: 1500},
@@ -753,20 +810,8 @@ func TestReconfigureAllowsWhenNothingActive(t *testing.T) {
 	h.m.mu.Lock()
 	h.m.live.store = activeBackend{Backend: h.m.live.store, active: false}
 	h.m.mu.Unlock()
-	payload, err := json.Marshal(lifecycleRequest{ConfigYAML: captureYAML(t.TempDir(), 32), SchemaVersion: pluginabi.SchemaVersion})
-	if err != nil {
-		t.Fatalf("marshal: %v", err)
-	}
-	raw, err := h.m.HandleCall(pluginabi.MethodPluginReconfigure, payload)
-	if err != nil {
-		t.Fatalf("reconfigure: %v", err)
-	}
-	var envelope pluginabi.Envelope
-	if err := json.Unmarshal(raw, &envelope); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
-	if !envelope.OK {
-		t.Fatalf("idle reconfigure must succeed: %s", raw)
+	if envelope := h.reconfigure(32); !envelope.OK {
+		t.Fatalf("idle reconfigure must succeed: %+v", envelope)
 	}
 }
 
@@ -813,7 +858,7 @@ func TestConcurrentUsageAndCompletionSettleExactlyOnce(t *testing.T) {
 		t.Fatalf("reserve failed: %+v", response)
 	}
 	record := pluginapi.UsageRecord{
-		RequestID: "req-race", TraceID: "trace-race", Provider: "openai", ExecutorType: "openaiExecutor",
+		RequestID: "exec-race", TraceID: "trace-race", Provider: "openai", ExecutorType: "openaiExecutor",
 		Model: testModel, APIKey: h.key.Principal,
 		AccessProvider: "plugin:cliproxyapi-credit-manager:" + authProviderID,
 		Detail:         pluginapi.UsageDetail{InputTokens: 1000, OutputTokens: 500, TotalTokens: 1500},
@@ -890,6 +935,273 @@ func (h *harness) complete(id, trace string, outcome pluginapi.RequestCompletion
 	}
 }
 
+// TestUsageSettlesAcrossDistinctLifecycleAndExecutionIDs reproduces a real host
+// delivery: the usage event carries a per-execution id and the parent trace,
+// never the lifecycle id that reserved the money.
+func TestUsageSettlesAcrossDistinctLifecycleAndExecutionIDs(t *testing.T) {
+	h := newHarness(t)
+	if response := h.intercept(h.request("req-lifecycle", "trace-lifecycle")); response.Terminate {
+		t.Fatalf("reserve failed: %+v", response)
+	}
+	h.usage(pluginapi.UsageRecord{
+		RequestID: "9d1c0b7e-execution", TraceID: "trace-lifecycle", Provider: "openai", ExecutorType: "openaiExecutor",
+		Model: testModel, APIKey: h.key.Principal,
+		AccessProvider: "plugin:cliproxyapi-credit-manager:" + authProviderID,
+		Detail:         pluginapi.UsageDetail{InputTokens: 1000, OutputTokens: 500, TotalTokens: 1500},
+	})
+	if message := h.m.LastError(); message != "" {
+		t.Fatalf("an execution id distinct from the lifecycle id must attribute cleanly, health=%q", message)
+	}
+	h.complete("req-lifecycle", "trace-lifecycle", pluginapi.RequestCompletionSucceeded)
+	key, err := h.store().GetKey(context.Background(), h.key.ID)
+	if err != nil {
+		t.Fatalf("GetKey: %v", err)
+	}
+	if key.SpentMicroUSD != 2000 {
+		t.Fatalf("spent = %d, want the execution charge 2000", key.SpentMicroUSD)
+	}
+	if key.HeldMicroUSD != 0 {
+		t.Fatalf("held = %d, want the hold released on completion", key.HeldMicroUSD)
+	}
+}
+
+// TestUsageConflictIsHealthOnlyAndKeepsServing verifies that a conflicting
+// usage record is reported for review instead of silently freeing the request
+// or failing every other key closed.
+func TestUsageConflictIsHealthOnlyAndKeepsServing(t *testing.T) {
+	h := newHarness(t)
+	if response := h.intercept(h.request("req-conflict", "trace-conflict")); response.Terminate {
+		t.Fatalf("reserve failed: %+v", response)
+	}
+	record := pluginapi.UsageRecord{
+		RequestID: "exec-conflict", TraceID: "trace-conflict", Provider: "openai", Model: testModel,
+		APIKey: h.key.Principal, AccessProvider: "plugin:cliproxyapi-credit-manager:" + authProviderID,
+		Detail: pluginapi.UsageDetail{InputTokens: 1000, OutputTokens: 500, TotalTokens: 1500},
+	}
+	h.usage(record)
+	// The same execution id with different accounting is a conflict, not a replay.
+	record.Detail = pluginapi.UsageDetail{InputTokens: 9999, OutputTokens: 500, TotalTokens: 10499}
+	h.usage(record)
+
+	h.m.mu.Lock()
+	blocked, message := h.m.admissionBlocked, h.m.lastError
+	h.m.mu.Unlock()
+	if blocked {
+		t.Fatal("a conflicting usage record must not block admissions for every key")
+	}
+	if message == "" || !strings.Contains(message, h.key.ID) {
+		t.Fatalf("a conflicting usage record must be reported with the affected key, got %q", message)
+	}
+	key, err := h.store().GetKey(context.Background(), h.key.ID)
+	if err != nil {
+		t.Fatalf("GetKey: %v", err)
+	}
+	if key.SpentMicroUSD == 0 {
+		t.Fatal("a conflicting usage must not write off the already booked charge")
+	}
+	if response := h.intercept(h.request("req-after-conflict", "trace-after-conflict")); response.Terminate {
+		t.Fatalf("other requests must keep being admitted: %+v", response)
+	}
+}
+
+// TestUsageStorageFaultBlocksAdmissions verifies that a genuine accounting
+// write failure fails the plugin closed rather than being reported as a
+// per-request problem.
+func TestUsageStorageFaultBlocksAdmissions(t *testing.T) {
+	h := newHarness(t)
+	real := h.store()
+	h.m.mu.Lock()
+	h.m.live.store = faultBackend{Backend: real, usageErr: errors.New("database or disk is full")}
+	h.m.mu.Unlock()
+
+	if response := h.intercept(h.request("req-storage", "trace-storage")); response.Terminate {
+		t.Fatalf("reserve failed: %+v", response)
+	}
+	h.usage(pluginapi.UsageRecord{
+		RequestID: "exec-storage", TraceID: "trace-storage", Provider: "openai", Model: testModel,
+		APIKey: h.key.Principal, AccessProvider: "plugin:cliproxyapi-credit-manager:" + authProviderID,
+		Detail: pluginapi.UsageDetail{InputTokens: 10, OutputTokens: 5, TotalTokens: 15},
+	})
+
+	h.m.mu.Lock()
+	blocked, message := h.m.admissionBlocked, h.m.lastError
+	h.m.mu.Unlock()
+	if !blocked {
+		t.Fatal("a usage storage fault must block new admissions")
+	}
+	if message == "" {
+		t.Fatal("a usage storage fault must be observable through health")
+	}
+	response := h.intercept(h.request("req-blocked", "trace-blocked"))
+	if !response.Terminate || response.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("admissions must fail closed after a storage fault, got %+v", response)
+	}
+}
+
+// TestQuotaRejectionDoesNotDisableOtherKeys verifies that a business rejection
+// for one key leaves every other key working and does not degrade health.
+func TestQuotaRejectionDoesNotDisableOtherKeys(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	limited, _, err := h.store().CreateKey(ctx, credit.KeySpec{
+		Label: "limited", Enabled: true, QuotaMicroUSD: 1,
+	})
+	if err != nil {
+		t.Fatalf("CreateKey: %v", err)
+	}
+
+	blocked := h.request("req-quota", "trace-quota")
+	blocked.Metadata = map[string]any{"caller_scope": limited.Scope, "request_path": "/v1/messages"}
+	response := h.intercept(blocked)
+	if !response.Terminate || response.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("quota rejection must terminate with 429, got %+v", response)
+	}
+	h.m.mu.Lock()
+	fault, message := h.m.admissionBlocked, h.m.lastError
+	h.m.mu.Unlock()
+	if fault {
+		t.Fatal("a quota rejection must not block admissions globally")
+	}
+	if message != "" {
+		t.Fatalf("a quota rejection must not degrade health, got %q", message)
+	}
+
+	if response := h.intercept(h.request("req-other-key", "trace-other-key")); response.Terminate {
+		t.Fatalf("another key must still be admitted after a quota rejection: %+v", response)
+	}
+}
+
+// TestUnpricedModelRejectedThenPricedSucceeds verifies that a missing price is a
+// per-request rejection that disappears once the model is priced.
+func TestUnpricedModelRejectedThenPricedSucceeds(t *testing.T) {
+	h := newHarness(t)
+	probe := h.request("req-unpriced", "trace-unpriced")
+	probe.Model, probe.RequestedModel = "unpriced-model", "unpriced-model"
+	response := h.intercept(probe)
+	if !response.Terminate || response.StatusCode != http.StatusForbidden {
+		t.Fatalf("unpriced model must terminate with 403, got %+v", response)
+	}
+	h.m.mu.Lock()
+	fault, message := h.m.admissionBlocked, h.m.lastError
+	h.m.mu.Unlock()
+	if fault || message != "" {
+		t.Fatalf("an unpriced model must not fault the plugin: blocked=%v health=%q", fault, message)
+	}
+
+	if err := h.store().PutPrice(context.Background(), credit.Price{
+		Model: "unpriced-model", Rates: credit.Rates{Input: 1000000, Output: 1000000},
+	}); err != nil {
+		t.Fatalf("PutPrice: %v", err)
+	}
+	priced := h.request("req-priced", "trace-priced")
+	priced.Model, priced.RequestedModel = "unpriced-model", "unpriced-model"
+	if response := h.intercept(priced); response.Terminate {
+		t.Fatalf("a newly priced model must be admitted: %+v", response)
+	}
+}
+
+// TestReconfigureDrainsReserveBeforeLivenessCheck pins the interleaving that a
+// naive check order would get wrong: a reservation that is still inside Reserve
+// when the reconfigure starts must be drained and then observed by the
+// liveness check, so its database is retained instead of abandoned.
+func TestReconfigureDrainsReserveBeforeLivenessCheck(t *testing.T) {
+	h := newHarness(t)
+	blocking := blockingReserveBackend{
+		Backend: h.store(),
+		entered: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	h.m.mu.Lock()
+	h.m.live.store = blocking
+	h.m.mu.Unlock()
+
+	intercepted := make(chan pluginapi.RequestInterceptResponse, 1)
+	go func() { intercepted <- h.m.interceptBefore(h.request("req-drained", "trace-drained")) }()
+
+	// Barrier 1: the reservation is inside Reserve and holds the shared gate.
+	<-blocking.entered
+
+	reconfigured := make(chan pluginabi.Envelope, 1)
+	go func() {
+		payload, err := json.Marshal(lifecycleRequest{ConfigYAML: h.yaml(32), SchemaVersion: pluginabi.SchemaVersion})
+		if err != nil {
+			reconfigured <- pluginabi.Envelope{}
+			return
+		}
+		out, err := h.m.HandleCall(pluginabi.MethodPluginReconfigure, payload)
+		if err != nil {
+			reconfigured <- pluginabi.Envelope{}
+			return
+		}
+		var envelope pluginabi.Envelope
+		if err := json.Unmarshal(out, &envelope); err != nil {
+			reconfigured <- pluginabi.Envelope{}
+			return
+		}
+		reconfigured <- envelope
+	}()
+
+	// Barrier 2: the reconfigure stopped new admissions and is now waiting for
+	// the shared gate, so the reservation below commits after that point.
+	h.waitForState(stateReconfiguring)
+	close(blocking.release)
+
+	if response := <-intercepted; response.Terminate {
+		t.Fatalf("a reservation drained by the reconfigure must still be admitted: %+v", response)
+	}
+	envelope := <-reconfigured
+	if envelope.OK || envelope.Error == nil || envelope.Error.HTTPStatus != http.StatusConflict {
+		t.Fatalf("the drained reservation must make the swap unsafe (409), got %+v", envelope)
+	}
+	if _, ok := h.store().(blockingReserveBackend); !ok {
+		t.Fatal("the refused reconfigure must keep the previous store")
+	}
+	key, err := h.store().GetKey(context.Background(), h.key.ID)
+	if err != nil {
+		t.Fatalf("GetKey: %v", err)
+	}
+	if key.HeldMicroUSD == 0 {
+		t.Fatal("the drained reservation must be visible in the retained store")
+	}
+}
+
+// TestReconfigureRefusesDataDirChange verifies that relocating the accounting
+// database at runtime is refused: only a stop and start may move it.
+func TestReconfigureRefusesDataDirChange(t *testing.T) {
+	h := newHarness(t)
+	envelope := h.call(pluginabi.MethodPluginReconfigure, lifecycleRequest{
+		ConfigYAML: captureYAML(t.TempDir(), 16), SchemaVersion: pluginabi.SchemaVersion,
+	})
+	if envelope.OK || envelope.Error == nil || envelope.Error.HTTPStatus != http.StatusConflict {
+		t.Fatalf("a data_dir change must be refused with 409, got %+v", envelope)
+	}
+	if response := h.intercept(h.request("req-kept", "trace-kept")); response.Terminate {
+		t.Fatalf("the plugin must keep serving from the original database: %+v", response)
+	}
+}
+
+// TestCountTokensCompletionIsBenign verifies that a native token-count probe,
+// which never reserves money, may still be completed without degrading health or
+// blocking admissions.
+func TestCountTokensCompletionIsBenign(t *testing.T) {
+	h := newHarness(t)
+	probe := h.request("count-benign", "trace-count-benign")
+	probe.Metadata = map[string]any{"caller_scope": h.key.Scope, "request_path": "/v1/messages/count_tokens"}
+	if response := h.intercept(probe); response.Terminate {
+		t.Fatalf("count_tokens probe was terminated: %+v", response)
+	}
+	h.complete("count-benign", "trace-count-benign", pluginapi.RequestCompletionSucceeded)
+	h.m.mu.Lock()
+	blocked, message := h.m.admissionBlocked, h.m.lastError
+	h.m.mu.Unlock()
+	if blocked || message != "" {
+		t.Fatalf("a count_tokens completion must be benign: blocked=%v health=%q", blocked, message)
+	}
+	if response := h.intercept(h.request("req-after-count", "trace-after-count")); response.Terminate {
+		t.Fatalf("admission blocked after a benign count_tokens completion: %+v", response)
+	}
+}
+
 // panicBackend simulates an internal panic to prove fail-closed behavior.
 type panicBackend struct{ credit.Backend }
 
@@ -897,14 +1209,39 @@ func (panicBackend) KeyByScope(context.Context, string) (credit.Key, error) {
 	panic("injected panic")
 }
 
-// faultBackend injects a reservation failure to prove fail-closed behavior.
+// faultBackend injects store failures to prove fail-closed behavior.
 type faultBackend struct {
 	credit.Backend
 	reserveErr error
+	usageErr   error
 }
 
-func (f faultBackend) Reserve(context.Context, credit.ReserveInput) (credit.Request, error) {
-	return credit.Request{}, f.reserveErr
+func (f faultBackend) Reserve(ctx context.Context, in credit.ReserveInput) (credit.Request, error) {
+	if f.reserveErr != nil {
+		return credit.Request{}, f.reserveErr
+	}
+	return f.Backend.Reserve(ctx, in)
+}
+
+func (f faultBackend) RecordUsage(ctx context.Context, usage credit.Usage) error {
+	if f.usageErr != nil {
+		return f.usageErr
+	}
+	return f.Backend.RecordUsage(ctx, usage)
+}
+
+// blockingReserveBackend parks one reservation inside Reserve so a test can
+// interleave it with a lifecycle transition deterministically.
+type blockingReserveBackend struct {
+	credit.Backend
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (b blockingReserveBackend) Reserve(ctx context.Context, in credit.ReserveInput) (credit.Request, error) {
+	close(b.entered)
+	<-b.release
+	return b.Backend.Reserve(ctx, in)
 }
 
 // activeBackend advertises the optional HasActive capability.

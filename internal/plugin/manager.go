@@ -228,6 +228,7 @@ func (m *Manager) apply(raw []byte, hostSchema uint32) ([]byte, error) {
 	unchanged := m.live != nil && m.hasConfig && bytes.Equal(m.raw, raw)
 	previousHasConfig := m.hasConfig
 	previousRaw := m.raw
+	previous := m.live
 	m.mu.Unlock()
 	if closed {
 		return errorEnvelope(&PluginError{Code: "unavailable", Message: "plugin is shut down", HTTPStatus: http.StatusServiceUnavailable})
@@ -236,33 +237,44 @@ func (m *Manager) apply(raw []byte, hostSchema uint32) ([]byte, error) {
 		// A host-wide synchronization may resend identical configuration.
 		return okEnvelope(reg)
 	}
+	if previous != nil && previous.cfg.DataDir != cfg.DataDir {
+		// Moving the accounting database at runtime would strand the holds and
+		// unresolved debts recorded in the old file. The host must stop and start
+		// the plugin to relocate it.
+		return errorEnvelope(&PluginError{
+			Code:       "data_dir_immutable",
+			Message:    "data_dir can only be changed by restarting the plugin",
+			HTTPStatus: http.StatusConflict,
+		})
+	}
 
-	// Refuse new accounting before the exclusive gate blocks the swap.
+	// Refuse new accounting before the exclusive gate blocks the swap, then
+	// drain in-flight calls. Draining first is what makes the liveness check
+	// below sound: a reservation that started earlier must have committed
+	// before the old database is judged safe to release.
 	m.mu.Lock()
-	previous := m.live
 	if m.state != stateClosed {
 		m.state = stateReconfiguring
 	}
 	m.mu.Unlock()
 
+	m.enterExclusive()
+	defer m.exitExclusive()
+
 	// A store that can report unfinished requests must not be swapped while any
-	// are in flight: their rows live in the old database. Keep the old store
-	// and let the host retry once the requests settle. A backend that can not
-	// answer is treated as unsafe too: accounting is never swapped on a guess.
-	ctx := context.Background()
-	known, active, errActive := storeActive(ctx, previous)
+	// are unresolved. Keep the old store and let the host retry once they
+	// settle. A backend that can not answer is treated as unsafe too:
+	// accounting is never swapped on a guess.
+	active, errActive := storeActive(context.Background(), previous)
 	if errActive != nil {
 		m.recordError(errActive)
 	}
-	if errActive != nil || (known && active) {
+	if errActive != nil || active {
 		m.mu.Lock()
 		m.state = stateLive
 		m.mu.Unlock()
 		return errorEnvelope(&PluginError{Code: "busy", Message: "unfinished requests are still being settled", HTTPStatus: http.StatusConflict})
 	}
-
-	m.enterExclusive()
-	defer m.exitExclusive()
 
 	// Release the current store before opening the candidate so only one
 	// connection to the accounting database exists at any time.
@@ -352,25 +364,14 @@ func (m *Manager) newLiveState(store credit.Backend, captures *capture.Store, cf
 	return &liveState{store: store, captures: captures, handler: handler, cfg: cfg}
 }
 
-// activeChecker is optionally implemented by a credit backend that can report
-// whether any request is still awaiting settlement.
-type activeChecker interface {
-	HasActive(context.Context) (bool, error)
-}
-
-// storeActive reports whether the given snapshot has unfinished requests. known
-// is false when the backend does not implement the optional capability, so
-// callers never mistake "cannot tell" for "nothing outstanding".
-func storeActive(ctx context.Context, state *liveState) (known bool, active bool, err error) {
+// storeActive reports whether the given snapshot still holds executions that
+// were admitted but not yet resolved. A backend that can not answer is treated
+// as active by the callers: accounting is never released on a guess.
+func storeActive(ctx context.Context, state *liveState) (bool, error) {
 	if state == nil || state.store == nil {
-		return false, false, nil
+		return false, nil
 	}
-	checker, ok := state.store.(activeChecker)
-	if !ok {
-		return false, false, nil
-	}
-	active, err = checker.HasActive(ctx)
-	return true, active, err
+	return state.store.HasActive(ctx)
 }
 
 // enterExclusive takes the exclusive gate: it blocks every new handler call and
@@ -441,13 +442,13 @@ func (m *Manager) quiesce() {
 	defer m.exitExclusive()
 	m.stopMaintenance()
 
-	known, active, err := storeActive(context.Background(), current)
+	active, err := storeActive(context.Background(), current)
 	if err != nil {
 		m.recordError(err)
 		return
 	}
-	if !known || active {
-		// Cannot prove the database is settled: keep it open so pending
+	if active {
+		// Cannot prove the database is settled: keep it open so reserved
 		// requests can still be completed instead of losing accounting.
 		return
 	}

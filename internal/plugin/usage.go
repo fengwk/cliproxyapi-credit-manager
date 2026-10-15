@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
@@ -48,9 +49,13 @@ func (m *Manager) recordUsage(record pluginapi.UsageRecord) {
 		return
 	}
 	principal := strings.TrimSpace(record.APIKey)
-	requestID := strings.TrimSpace(record.RequestID)
+	// record.RequestID identifies one model execution, not the lifecycle request
+	// that reserved money; the lifecycle request is found through the trace. The
+	// two must never be conflated: the core rejects a usage whose request id does
+	// not belong to the resolved request.
+	executionID := strings.TrimSpace(record.RequestID)
 	traceID := strings.TrimSpace(record.TraceID)
-	if principal == "" || requestID == "" || traceID == "" {
+	if principal == "" || executionID == "" || traceID == "" {
 		m.recordError(errOrphanUsage)
 		return
 	}
@@ -67,11 +72,7 @@ func (m *Manager) recordUsage(record pluginapi.UsageRecord) {
 	ctx := context.Background()
 	key, err := deps.store.KeyByPrincipal(ctx, principal)
 	if err != nil {
-		if !errors.Is(err, credit.ErrNotFound) && !errors.Is(err, credit.ErrUnauthorized) {
-			m.recordError(err)
-			return
-		}
-		m.recordError(errOrphanUsage)
+		m.reportUsageFailure(err, "unknown usage principal")
 		return
 	}
 
@@ -81,8 +82,7 @@ func (m *Manager) recordUsage(record pluginapi.UsageRecord) {
 		at = m.now()
 	}
 	if errRecord := deps.store.RecordUsage(ctx, credit.Usage{
-		ID:            requestID,
-		RequestID:     requestID,
+		ID:            executionID,
 		TraceID:       traceID,
 		KeyID:         key.ID,
 		Provider:      strings.TrimSpace(record.Provider),
@@ -100,9 +100,28 @@ func (m *Manager) recordUsage(record pluginapi.UsageRecord) {
 		LatencyMS:     record.Latency.Milliseconds(),
 		TTFTMS:        record.TTFT.Milliseconds(),
 	}); errRecord != nil {
-		// Usage problems are observable but never block admissions: the request
-		// remains pending and must be resolved by an administrator.
-		m.recordError(errRecord)
+		m.reportUsageFailure(errRecord, "usage for key "+key.ID)
+	}
+}
+
+// reportUsageFailure decides how a usage attribution failure is surfaced.
+//
+// Only business level rejections are reported through health: they describe one
+// record (an orphan, a malformed payload, a duplicate that must be reviewed)
+// and must not stop other keys. A storage or transaction fault must fail closed
+// instead, because accounting can no longer be trusted for any key.
+func (m *Manager) reportUsageFailure(err error, detail string) {
+	switch {
+	case errors.Is(err, credit.ErrNotFound),
+		errors.Is(err, credit.ErrUnauthorized),
+		errors.Is(err, credit.ErrDenied),
+		errors.Is(err, credit.ErrInvalid),
+		errors.Is(err, credit.ErrConflict):
+		// Health only: the pending request stays pending for an administrator to
+		// review, and other keys keep working.
+		m.recordError(fmt.Errorf("%s: %w", detail, err))
+	default:
+		m.recordFinanceFault(err)
 	}
 }
 

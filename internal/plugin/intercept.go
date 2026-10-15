@@ -108,7 +108,11 @@ func (m *Manager) interceptBefore(req pluginapi.RequestInterceptRequest) plugina
 		OutputEstimate: outputEstimate(req.Body),
 		At:             m.now(),
 	}); errReserve != nil {
-		m.recordFinanceFault(errReserve)
+		if !isBusinessRejection(errReserve) {
+			// An unrecognized storage or transaction failure means admission can
+			// no longer be trusted, so it fails closed for every key.
+			m.recordFinanceFault(errReserve)
+		}
 		return terminate(reserveStatus(errReserve), reserveMessage(errReserve))
 	}
 
@@ -215,6 +219,25 @@ func outputEstimate(body []byte) int64 {
 		}
 	}
 	return defaultOutputEstimate
+}
+
+// isBusinessRejection reports whether a credit failure refuses one request
+// because of that request, its key or its model. Those are normal outcomes: the
+// caller gets an error response while every other key keeps working. Only an
+// unrecognized failure indicates that the accounting store itself is broken.
+func isBusinessRejection(err error) bool {
+	switch {
+	case errors.Is(err, credit.ErrQuota),
+		errors.Is(err, credit.ErrConcurrency),
+		errors.Is(err, credit.ErrPending),
+		errors.Is(err, credit.ErrUnauthorized),
+		errors.Is(err, credit.ErrDenied),
+		errors.Is(err, credit.ErrUnpriced),
+		errors.Is(err, credit.ErrInvalid):
+		return true
+	default:
+		return false
+	}
 }
 
 // reserveStatus maps a reservation failure to a downstream HTTP status.
