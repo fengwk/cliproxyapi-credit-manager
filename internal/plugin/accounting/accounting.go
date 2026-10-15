@@ -42,8 +42,8 @@ type Result struct {
 	// Tokens holds the canonical credit buckets. Input is uncached input and
 	// Output excludes reasoning, matching the credit pricing contract.
 	Tokens credit.Tokens
-	// Quality is the SDK accounting quality string: complete, inconsistent or
-	// unclassified. Only complete accounting may be billed as exact.
+	// Quality is the credit contract: complete or unknown. Unclassified SDK
+	// remainder is preserved in Raw on the usage row, never guessed into buckets.
 	Quality string
 	// Complete reports whether every raw counter was classified exactly.
 	Complete bool
@@ -85,8 +85,11 @@ func sdkDetail(detail pluginapi.UsageDetail) usage.Detail {
 // breakdown that does not satisfy the v2 invariants is reported as
 // unclassified with no tokens, so an invalid record is never billed as zero.
 func resultFromBreakdown(breakdown usage.TokenBreakdown) Result {
-	if !breakdown.Valid() {
-		return Result{Quality: string(usage.TokenAccountingQualityUnclassified)}
+	if !breakdown.Valid() || breakdown.Quality != usage.TokenAccountingQualityComplete ||
+		breakdown.TotalTokens == 0 {
+		// The SDK cannot distinguish omitted usage from explicitly reported zero.
+		// Neither a guessed remainder nor an empty record is a zero-dollar bill.
+		return Result{Quality: credit.QualityUnknown}
 	}
 	tokens := credit.Tokens{
 		Input:      breakdown.Input.UncachedTokens,

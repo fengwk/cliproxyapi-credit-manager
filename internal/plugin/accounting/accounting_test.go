@@ -3,6 +3,7 @@ package accounting
 import (
 	"testing"
 
+	"github.com/fengwk/cliproxyapi-credit-manager/internal/credit"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/usage"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 )
@@ -87,8 +88,8 @@ func TestAdapterCohortRejectsMalformedCounters(t *testing.T) {
 		if result.Complete {
 			t.Fatalf("%s: malformed counters were reported as complete: %+v", name, result.Tokens)
 		}
-		if result.Quality != string(usage.TokenAccountingQualityUnclassified) {
-			t.Fatalf("%s: quality = %q, want unclassified", name, result.Quality)
+		if result.Quality != credit.QualityUnknown {
+			t.Fatalf("%s: quality = %q, want unknown", name, result.Quality)
 		}
 	}
 }
@@ -105,8 +106,7 @@ func TestAdapterCohortRequiresNativeModelID(t *testing.T) {
 	}
 }
 
-// TestEmptyUsageIsNotAccountedButValid checks that a record with no counters is
-// still a valid complete zero and is never marked as accounted.
+// TestEmptyUsageIsNotAccountedButValid rejects missing usage as proof of zero cost.
 func TestEmptyUsageIsNotAccountedButValid(t *testing.T) {
 	result := Normalize(pluginapi.UsageRecord{
 		Provider: "gemini", ExecutorType: "geminiExecutor", Model: "gemini-2.0",
@@ -115,8 +115,8 @@ func TestEmptyUsageIsNotAccountedButValid(t *testing.T) {
 	if result.Accounted {
 		t.Fatal("a record with no counters must not be marked accounted")
 	}
-	if !result.Complete || result.Tokens.Total != 0 {
-		t.Fatalf("empty usage = %+v, want complete zero", result)
+	if result.Complete || result.Quality != credit.QualityUnknown || result.Tokens.Total != 0 {
+		t.Fatalf("empty usage = %+v, want unknown", result)
 	}
 }
 
@@ -130,7 +130,7 @@ func TestUnknownProviderStaysUnclassified(t *testing.T) {
 	if result.Complete {
 		t.Fatalf("unknown provider must not be complete: %+v", result.Tokens)
 	}
-	if result.Quality != string(usage.TokenAccountingQualityUnclassified) {
-		t.Fatalf("quality = %q, want unclassified", result.Quality)
+	if result.Quality != credit.QualityUnknown {
+		t.Fatalf("quality = %q, want unknown", result.Quality)
 	}
 }
