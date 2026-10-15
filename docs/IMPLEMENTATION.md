@@ -68,8 +68,11 @@ Execution-entry snapshot, NOT final upstream HTTP/network-raw bytes.
 Disabled default. Retention24h, uncompressed10MiB, physical1GiB incl WAL+indexes.
 Queue bounded in BYTES, skip oversize before copying; never mutate forwarded data.
 Redact Authorization/X-Api-Key/X-Goog-Api-Key/Cookie/Set-Cookie and obvious secret
-JSON fields recursively. Metadata small and bounded. Get missing returns status
-unavailable (do not claim definitely expired without evidence); disabled returns
+JSON fields recursively. Metadata small and bounded.
+JSON-shaped bodies that cannot be decoded as
+one complete document are dropped, never retained as unredacted text. Non-JSON
+bodies may be retained verbatim; redaction is not a general DLP guarantee.
+Get missing returns status unavailable (do not claim expired without evidence); disabled returns
 disabled. gzip size not TTL and not SQLite compaction. Storage-budget headroom,
 evict early or pause; no periodic full VACUUM. Enqueue failure never inference
 failure. Tests must check actual DB+WAL shrinking and pressure/busy cases.

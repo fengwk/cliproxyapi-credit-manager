@@ -54,15 +54,15 @@
 
 | 验证 | 结果 |
 | --- | --- |
-| Go 单元/集成测试 `go test ./...` | 全部 7 个包通过（13 个 `*_test.go`，静态计数 156 个顶层 Test 函数） |
-| 界面测试 `node --test`（`scripts/web-tests`） | 27 项通过，0 失败 |
+| Go 单元/集成测试、race 与 vet | 全部 7 个包通过 |
+| 界面测试 `node --test`（`scripts/web-tests`） | 29 项通过，0 失败 |
 | 交付链路 `make static` | 通过：5 项打包回归、26 项发布资产校验、3 项端到端打包→校验、脚本语法与工作流契约 |
-| 端到端宿主验收（`tests/integration`） | **39/39 通过**，两次连续干净运行（记录于 HEAD `2f028ca`）；真实 CPA 8.0.30 宿主 + 真实插件库 + 环回上游 mock，含浏览器模块 |
-| 独立浏览器验收（`tests/browser`） | 112 项检查 0 失败 |
+| 端到端宿主验收（`tests/integration`） | **41/41 通过**；真实 CPA 8.0.30 宿主 + 真实插件库 + 环回上游 mock，含显式/LCP 会话粘性、同凭据预热并行和真实浏览器模块 |
+| 独立浏览器验收（`tests/browser`） | 126 项检查 0 失败 |
 
-发布前，集成负责人会在完整环境（CPA v8.0.30 源码、Chromium、`sha256` 校验）**重跑
-39 项宿主验收套件**，并对三个平台归档逐一执行发布资产校验；本说明不把尚未重跑的用例
-当作已通过的证据。验收套件的环境要求与用例清单见
+宿主验收以 `--expected-version` 与完整 `--expected-commit` 精确核对加载的构建身份，
+不把旧库或仅 HTTP 200 当作计费通过。三个平台由各自原生 runner 构建，归档验证包括
+SHA256、扁平布局、元数据和 ELF/Mach-O 架构。验收套件的环境要求与用例清单见
 [`tests/integration/README.md`](../tests/integration/README.md)。
 
 ## 已知限制（明确不承诺）
