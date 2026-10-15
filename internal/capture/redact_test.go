@@ -3,8 +3,10 @@ package capture
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strconv"
+	"strings"
 	"testing"
 )
 
@@ -135,15 +137,17 @@ func TestRedactJSONBodyPreservesUnchangedAndIntegers(t *testing.T) {
 	}
 }
 
-// TestRedactJSONBodyNonJSON verifies that non-JSON bodies are returned untouched
-// so that plain text and binary diagnostics are preserved exactly.
+// TestRedactJSONBodyNonJSON verifies that bodies which are not JSON shaped are
+// returned untouched, so plain text and binary diagnostics are preserved
+// exactly and forwarded data is never altered.
 func TestRedactJSONBodyNonJSON(t *testing.T) {
 	for _, raw := range [][]byte{
 		nil,
 		[]byte(""),
 		[]byte("token=secret"),
-		[]byte("{\"api_key\":\"x\"} trailing"),
 		[]byte(`"just a string"`),
+		[]byte("12345"),
+		[]byte("--boundary\r\ncontent"),
 		[]byte{0x00, 0xff, 0x10},
 	} {
 		out, changed, err := redactJSONBody(raw)
@@ -159,6 +163,35 @@ func TestRedactJSONBodyNonJSON(t *testing.T) {
 	}
 }
 
+// TestRedactJSONBodyRefusesIncompleteDocuments verifies the privacy boundary: a
+// body that is JSON shaped but not one complete document is refused instead of
+// being stored unredacted, because redaction could miss secrets inside a prefix
+// or inside a document the decoder could not walk.
+func TestRedactJSONBodyRefusesIncompleteDocuments(t *testing.T) {
+	deep := func(depth int) []byte {
+		raw := bytes.Repeat([]byte("["), depth)
+		raw = append(raw, []byte(`{"secret":"leak"}`)...)
+		return append(raw, bytes.Repeat([]byte("]"), depth)...)
+	}
+	for name, raw := range map[string][]byte{
+		"truncated object":   []byte(`{"secret":"leak"`),
+		"truncated array":    []byte(`[{"secret":"leak"}`),
+		"trailing content":   []byte(`{"secret":"leak"} trailing`),
+		"second document":    []byte(`{"secret":"leak"}{"secret":"leak"}`),
+		"newline delimited":  []byte("{\"secret\":\"leak\"}\n{\"secret\":\"leak\"}"),
+		"opening brace only": []byte(`{`),
+		"deep nesting 10000": deep(10000),
+	} {
+		out, changed, err := redactJSONBody(raw)
+		if !errors.Is(err, errRedactionFailed) {
+			t.Fatalf("%s: error = %v, want %v", name, err, errRedactionFailed)
+		}
+		if changed || out != nil {
+			t.Fatalf("%s: got (%q, %v), want no output", name, out, changed)
+		}
+	}
+}
+
 // TestRedactJSONBodyExtendedSecretKeys verifies that obvious secret fields are
 // recognized in snake_case, kebab-case and camelCase spellings, recursively
 // through arrays and objects, without losing 64-bit integer text.
@@ -168,7 +201,8 @@ func TestRedactJSONBodyExtendedSecretKeys(t *testing.T) {
 		`"id_token":"i1","idToken":"i2",` +
 		`"private_key":"p1","privateKey":"p2","PRIVATE-KEY":"p3",` +
 		`"secret_key":"s1","secretKey":"s2","secret-key":"s3",` +
-		`"tools":[{"nested":{"id-token":"deep"}},{"plain":"keep"}],` +
+		`"secret":"s4","Secret":"s5","SECRET":"s6",` +
+		`"tools":[{"nested":{"id-token":"deep","secret":"deep-secret"}},{"plain":"keep"}],` +
 		`"mirror":["clientSecret","value"],` +
 		`"n":12345678901234567890,"model":"gpt"}`)
 	out, changed, err := redactJSONBody(raw)
@@ -190,6 +224,7 @@ func TestRedactJSONBodyExtendedSecretKeys(t *testing.T) {
 		"id_token", "idToken",
 		"private_key", "privateKey", "PRIVATE-KEY",
 		"secret_key", "secretKey", "secret-key",
+		"secret", "Secret", "SECRET",
 	} {
 		if got := decoded[key]; got != redactedValue {
 			t.Fatalf("key %q = %#v, want %q", key, got, redactedValue)
@@ -197,8 +232,8 @@ func TestRedactJSONBodyExtendedSecretKeys(t *testing.T) {
 	}
 	tools := decoded["tools"].([]any)
 	nested := tools[0].(map[string]any)["nested"].(map[string]any)
-	if nested["id-token"] != redactedValue {
-		t.Fatalf("nested id-token = %#v, want redacted", nested["id-token"])
+	if nested["id-token"] != redactedValue || nested["secret"] != redactedValue {
+		t.Fatalf("nested secrets not redacted: %#v", nested)
 	}
 	if tools[1].(map[string]any)["plain"] != "keep" {
 		t.Fatalf("non-secret array entry changed: %#v", tools[1])
@@ -232,6 +267,35 @@ func TestEncodeHeadersDropsOversizedSets(t *testing.T) {
 	big.Set("X-Big", string(value))
 	if got := encodeHeaders(big); got != nil {
 		t.Fatalf("oversized header set encoded to %d bytes, want dropped", len(got))
+	}
+}
+
+// TestRawHeaderSizeStopsAtTheLimit verifies that the estimate stops as soon as it
+// would exceed the limit instead of walking a whole value list: a header set
+// with more than a million empty values reports a bounded size, which the old
+// implementation (walking every value) would report as millions of bytes. It
+// must not allocate either.
+func TestRawHeaderSizeStopsAtTheLimit(t *testing.T) {
+	millions := http.Header{"X-Wide": make([]string, 1_000_001)}
+	trailing := make([]string, 100)
+	trailing = append(trailing, strings.Repeat("a", 1<<20))
+	gigantic := http.Header{"X-Wide": trailing}
+
+	for name, headers := range map[string]http.Header{
+		"more than a million empty values": millions,
+		"gigantic trailing value":          gigantic,
+	} {
+		size := rawHeaderSize(headers, rawHeaderLimit)
+		if size > rawHeaderLimit+1 {
+			t.Fatalf("%s: rawHeaderSize = %d, want at most %d (limit+1); the estimate walked past the limit",
+				name, size, rawHeaderLimit+1)
+		}
+		if size <= rawHeaderLimit {
+			t.Fatalf("%s: rawHeaderSize = %d, want a result above %d", name, size, rawHeaderLimit)
+		}
+		if allocs := testing.AllocsPerRun(1, func() { rawHeaderSize(headers, rawHeaderLimit) }); allocs != 0 {
+			t.Fatalf("%s: rawHeaderSize allocated %.0f objects, want none", name, allocs)
+		}
 	}
 }
 

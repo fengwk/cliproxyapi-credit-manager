@@ -12,10 +12,11 @@ import (
 // redactedValue replaces sensitive header values and obvious JSON secret fields.
 const redactedValue = "[redacted]"
 
-// errRedactionFailed is returned when a body that was detected as JSON cannot be
-// re-encoded after redaction. It is defensive: redaction of a value decoded with
-// json.Number cannot fail in practice.
-var errRedactionFailed = errors.New("json redaction failed")
+// errRedactionFailed is returned for a body that is JSON shaped but cannot be
+// decoded as one complete document (invalid JSON, excessive nesting or trailing
+// content). The snapshot is dropped instead of being stored unredacted, because
+// redaction cannot be guaranteed for it.
+var errRedactionFailed = errors.New("json body is not a complete single document; refused to store it unredacted")
 
 // sensitiveHeaders holds the header names whose values are always redacted.
 // Matching is case-insensitive on the trimmed name.
@@ -45,6 +46,7 @@ var sensitiveJSONKeys = map[string]bool{
 	"password":      true,
 	"authorization": true,
 	"cookie":        true,
+	"secret":        true,
 	"clientsecret":  true,
 	"privatekey":    true,
 	"secretkey":     true,
@@ -114,18 +116,23 @@ func redactHeaders(h http.Header) http.Header {
 // rawHeaderSize estimates how much memory a cloned header set would occupy,
 // including a fixed bookkeeping cost per header name and per value.
 //
-// It returns as soon as the estimate exceeds limit, so a header map with
-// millions of entries is never walked in full and never cloned. Callers treat
-// any result above limit as "too large to keep".
+// The estimate is checked after every name and after every value, and the
+// function returns limit+1 as soon as it would exceed limit. A header map with
+// millions of entries (or one entry with millions of tiny values) is therefore
+// never walked in full and never cloned, and the returned size never overflows.
+// Callers treat any result above limit as "too large to keep".
 func rawHeaderSize(h http.Header, limit int) int {
 	size := 0
 	for k, vs := range h {
+		if len(k) > limit-size-minHeaderStructureCost {
+			return limit + 1
+		}
 		size += minHeaderStructureCost + len(k)
 		for _, v := range vs {
+			if len(v) > limit-size-minHeaderStructureCost {
+				return limit + 1
+			}
 			size += minHeaderStructureCost + len(v)
-		}
-		if size > limit {
-			return size
 		}
 	}
 	return size
@@ -149,23 +156,31 @@ func looksLikeJSON(b []byte) bool {
 // redactJSONBody redacts obvious secret fields of a JSON body recursively.
 //
 // The returned body is the original byte slice (and changed is false) whenever
-// the body is not a single JSON document, contains no sensitive field, or
-// cannot be re-encoded. Bodies are therefore never reformatted unless a secret
-// was actually removed. Numbers are decoded with json.Number so that 64-bit
-// integer text survives redaction unchanged.
+// the body is not JSON shaped or contains no sensitive field, so non-JSON bodies
+// are preserved exactly and bodies are never reformatted unless a secret was
+// actually removed.
+//
+// A body that is JSON shaped but cannot be decoded as one complete document
+// (invalid JSON, nesting past the decoder limit, trailing content) reports
+// errRedactionFailed so the caller drops the snapshot: redaction cannot be
+// guaranteed for it, and storing it unredacted would leak secrets. Numbers are
+// decoded with json.Number so that 64-bit integer text survives redaction
+// unchanged.
 func redactJSONBody(raw []byte) (out []byte, changed bool, err error) {
 	if !looksLikeJSON(raw) {
+		// Not JSON shaped: plain text and binary diagnostics are kept as they are.
 		return raw, false, nil
 	}
 	dec := json.NewDecoder(bytes.NewReader(raw))
 	dec.UseNumber()
 	var value any
 	if err := dec.Decode(&value); err != nil {
-		return raw, false, nil
+		return nil, false, errRedactionFailed
 	}
-	// Trailing content means this is not a single JSON document; keep it as is.
+	// Trailing content means this is not a single JSON document, so the decoder
+	// saw only a prefix and redaction could miss secrets behind it.
 	if _, err := dec.Token(); err != io.EOF {
-		return raw, false, nil
+		return nil, false, errRedactionFailed
 	}
 	redacted, changed := redactJSONValue(value)
 	if !changed {
