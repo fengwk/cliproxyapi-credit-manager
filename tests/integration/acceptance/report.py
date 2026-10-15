@@ -50,9 +50,14 @@ class Recorder:
             }
         record["duration_s"] = round(time.time() - started, 3)
         if mock is not None:
-            after = mock.count()
+            calls = mock.calls
+            after = len(calls)
             record["upstream_calls_delta"] = after - before
             record["upstream_calls_total"] = after
+            record["upstream_calls"] = [
+                {"path": row["path"], "upstream_key": row["upstream_key"], "stream": row["stream"]}
+                for row in calls[before:]
+            ]
         self.cases.append(record)
         return record
 

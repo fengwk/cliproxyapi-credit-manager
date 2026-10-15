@@ -25,6 +25,7 @@ class Context:
         self.manager = None
         self.client = None
         self.host_root = None
+        self._host_seq = 0
 
     # -- lifecycle ---------------------------------------------------------
     def build_host(self, *, root, enable_plugins=True, plugin_config=None, extra_plugin_yaml="", client_keys=None, request_retry=3):
@@ -34,7 +35,9 @@ class Context:
             upstream_base_url=self.mock.base_url,
             management_secret=self.management_secret,
             client_keys=client_keys if client_keys is not None else [self.original_client_key],
-            openai_models=[{"name": "synthetic-chat", "alias": "synthetic-chat"}],
+            openai_models=[{"name": "synthetic-chat", "alias": "synthetic-chat"},
+                           {"name": "synthetic-free", "alias": "synthetic-free"},
+                           {"name": "synthetic-unpriced", "alias": "synthetic-unpriced"}],
             gemini_models=[{"name": "gemini-2.5-flash", "alias": "gemini-2.5-flash"}],
             plugin_id=self.plugin_id,
             plugin_config=plugin_config or {"data_dir": str(Path(root) / "data")},
@@ -52,6 +55,34 @@ class Context:
     def wire_clients(self):
         self.manager = Manager(self.host.config.base_url, self.management_secret, self.plugin_id)
         self.client = Client(self.host.config.base_url)
+
+    def recreate_host(self, name, *, root=None, enable_plugins=True, plugin_config=None, extra_plugin_yaml="", client_keys=None, request_retry=3):
+        """Stop any running host and boot a fresh isolated one.
+
+        Each case gets a clean credit database and configuration unless it passes
+        an explicit root/plugin_config (used by restart/persistence cases).
+        """
+        if self.host is not None:
+            self.host.stop()
+            self.host = None
+        self._host_seq += 1
+        if root is None:
+            safe = "".join(ch if ch.isalnum() or ch in "-." else "-" for ch in name)
+            root = self.artifacts / f"host-{self._host_seq:02d}-{safe}"
+        if plugin_config is None:
+            plugin_config = {"data_dir": str(Path(root) / "data")}
+        self.build_host(
+            root=root,
+            enable_plugins=enable_plugins,
+            plugin_config=plugin_config,
+            extra_plugin_yaml=extra_plugin_yaml,
+            client_keys=client_keys,
+            request_retry=request_retry,
+        )
+        self.host.start()
+        self.wire_clients()
+        self.host.plugin_registration()
+        return self.host
 
     # -- helpers -----------------------------------------------------------
     def new_key(self, **spec):
@@ -91,6 +122,33 @@ class Context:
         if response.status != 200:
             raise RuntimeError(f"usage query failed: {response}")
         return response.json()
+
+    def find_request(self, key_id=None, model=None, search=None):
+        """Return the newest matching request item from the usage report."""
+        query = {"page": 1, "page_size": 50}
+        if key_id:
+            query["key_id"] = key_id
+        if model:
+            query["model"] = model
+        if search:
+            query["search"] = search
+        report = self.usage_rows(**query)
+        items = report.get("items") or []
+        return items[0] if items else None
+
+    @staticmethod
+    def wait_until(fn, timeout=15, interval=0.1):
+        """Poll fn until it returns something truthy or the timeout elapses."""
+        import time as _time
+
+        deadline = _time.monotonic() + timeout
+        result = None
+        while _time.monotonic() < deadline:
+            result = fn()
+            if result:
+                return result
+            _time.sleep(interval)
+        return result
 
 
 def load_specs(module_names, only=""):

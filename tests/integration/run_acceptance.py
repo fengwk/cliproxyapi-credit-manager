@@ -63,6 +63,8 @@ def main(argv=None):
     host_started = False
     try:
         ctx.mock.start()
+        # A default host is booted so every case starts from an isolated state;
+        # cases may recreate it (restart/persistence scenarios).
         ctx.build_host(root=artifacts / "host")
         ctx.host.start()
         host_started = True
@@ -75,6 +77,9 @@ def main(argv=None):
             (artifacts / "host-plugins.error.txt").write_text(str(error))
 
         for spec in specs:
+            # Cases run against the shared isolated host; a case that needs a
+            # fresh database or different configuration calls ctx.recreate_host.
+            ctx.mock.reset()
             record = recorder.run(spec["name"], lambda fn=spec["fn"]: fn(ctx), spec["expects"], mock=ctx.mock)
             status = "PASS" if record["pass"] else "FAIL"
             print(f"[{status}] {spec['name']}", file=sys.stderr)
@@ -82,7 +87,7 @@ def main(argv=None):
         build["boot_error"] = f"{type(error).__name__}: {error}"
         print(f"[BOOT-FAIL] {error}", file=sys.stderr)
     finally:
-        if host_started:
+        if ctx.host is not None:
             ctx.host.stop()
         ctx.mock.stop()
 
