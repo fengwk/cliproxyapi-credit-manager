@@ -183,9 +183,19 @@ func (d *db) fetch(id string) (storedRow, error) {
 // persist writes one accepted snapshot, evicting older snapshots when the
 // physical storage budget is exhausted.
 func (s *Store) persist(item pending) {
-	body, err := encodeBody(item.body)
+	body, plainBytes, err := encodeBody(item.body)
 	if err != nil {
 		s.dropAccepted(item, "capture: encode "+item.id+": "+err.Error())
+		return
+	}
+	// Redaction replaces secrets with a marker that can be longer than the
+	// secret itself, so a body within the raw limit can still grow past it. Such
+	// a snapshot is dropped with an explicit status instead of being stored as a
+	// row that Get could never decode within the body limit.
+	if plainBytes > s.cfg.MaxBodyBytes {
+		s.dropAcceptedAs(item, StatusOversize,
+			"capture: redacted body grew to "+strconv.FormatInt(plainBytes, 10)+
+				" bytes, above the "+strconv.FormatInt(s.cfg.MaxBodyBytes, 10)+" byte body limit; snapshot dropped")
 		return
 	}
 	estimated := int64(len(body)+len(item.headersJSON)) + rowOverhead
@@ -202,7 +212,7 @@ func (s *Store) persist(item pending) {
 		return
 	}
 	if _, err := s.db.Exec(insertCapture, item.id, item.at.UnixNano(), item.expiresAt.UnixNano(),
-		string(item.headersJSON), body, len(body), len(item.body)); err != nil {
+		string(item.headersJSON), body, len(body), plainBytes); err != nil {
 		s.dropAccepted(item, "capture: store "+item.id+": "+err.Error())
 		return
 	}
@@ -211,20 +221,28 @@ func (s *Store) persist(item pending) {
 
 // dropAccepted counts an accepted snapshot that could not be stored.
 func (s *Store) dropAccepted(item pending, message string) {
-	s.setLastError(message)
-	s.recordDrop(item.id, StatusDropped, item.at, item.expiresAt)
+	s.dropAcceptedAs(item, StatusDropped, message)
 }
 
-// encodeBody redacts obvious JSON secrets and gzip compresses a body. Bodies are
-// never stored uncompressed, and identical input always yields identical bytes.
-func encodeBody(raw []byte) ([]byte, error) {
+// dropAcceptedAs counts an accepted snapshot that could not be stored and
+// remembers why, so that Get explains the outcome instead of reporting a raw
+// failure.
+func (s *Store) dropAcceptedAs(item pending, status, message string) {
+	s.setLastError(message)
+	s.recordDrop(item.id, status, item.at, item.expiresAt)
+}
+
+// encodeBody redacts obvious JSON secrets and gzip compresses a body, reporting
+// how many plaintext bytes the stored form represents. Bodies are never stored
+// uncompressed, and identical input always yields identical bytes.
+func encodeBody(raw []byte) (compressed []byte, plainBytes int64, err error) {
 	if len(raw) == 0 {
-		return nil, nil
+		return nil, 0, nil
 	}
 	body := raw
 	redacted, changed, err := redactJSONBody(raw)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	if changed {
 		body = redacted
@@ -232,15 +250,15 @@ func encodeBody(raw []byte) ([]byte, error) {
 	var buffer bytes.Buffer
 	writer, err := gzip.NewWriterLevel(&buffer, gzip.DefaultCompression)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	if _, err := writer.Write(body); err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	if err := writer.Close(); err != nil {
-		return nil, err
+		return nil, 0, err
 	}
-	return buffer.Bytes(), nil
+	return buffer.Bytes(), int64(len(body)), nil
 }
 
 // decodeBody inflates a stored body, bounding the result so a corrupted or
@@ -580,7 +598,7 @@ func unmarshalHeaders(encoded string) (http.Header, error) {
 // independently of the body; an oversized header set is dropped while the body
 // is still captured.
 func encodeHeaders(headers http.Header) []byte {
-	if len(headers) == 0 || rawHeaderSize(headers) > rawHeaderLimit {
+	if len(headers) == 0 || rawHeaderSize(headers, rawHeaderLimit) > rawHeaderLimit {
 		return nil
 	}
 	encoded, err := json.Marshal(redactHeaders(headers))
@@ -588,4 +606,22 @@ func encodeHeaders(headers http.Header) []byte {
 		return nil
 	}
 	return encoded
+}
+
+// headerReserve returns the queue bytes to reserve for a header set without
+// serializing or copying it.
+//
+// The reservation is an upper bound of the encoded form: JSON escaping can
+// inflate content up to sixfold, and an encoded set is never kept above
+// headerLimit. A set that is too large to keep reserves nothing because it will
+// be dropped.
+func headerReserve(headers http.Header) int64 {
+	size := int64(rawHeaderSize(headers, rawHeaderLimit))
+	if size > rawHeaderLimit {
+		return 0
+	}
+	if bound := size * 6; bound < headerLimit {
+		return bound
+	}
+	return headerLimit
 }

@@ -50,6 +50,10 @@ const (
 	headerLimit = 64 << 10
 	// rawHeaderLimit rejects oversized header sets before they are copied.
 	rawHeaderLimit = 4 * headerLimit
+	// minHeaderStructureCost is the bookkeeping the queue charges for every
+	// header name and value, so header sets with huge numbers of tiny values
+	// are bounded before they are copied.
+	minHeaderStructureCost = 8
 	// rowOverhead is the per-row bookkeeping (index entries, row header, page
 	// slack) charged to the storage budget in addition to stored bytes.
 	rowOverhead = 512
@@ -206,9 +210,12 @@ func (s *Store) start() {
 
 // Enqueue accepts a snapshot for asynchronous capture.
 //
-// It never blocks and never mutates caller memory: the snapshot is rejected
-// before copying when it is oversized, and the accepted parts are cloned.
-// Bodies are redacted and compressed by the writer, headers are redacted here.
+// It never blocks on I/O and never mutates caller memory. Nothing is copied
+// until the snapshot is admitted into the byte bounded queue: rejected
+// snapshots (oversized body, oversized headers, full queue, closed store) cost
+// the caller no allocation at all, so a queue under pressure cannot make every
+// concurrent request copy its body. Bodies are redacted and compressed by the
+// writer, headers are redacted here.
 func (s *Store) Enqueue(snapshot Snapshot) {
 	if s == nil || s.disabled {
 		return
@@ -228,6 +235,21 @@ func (s *Store) Enqueue(snapshot Snapshot) {
 		s.recordDrop(snapshot.RequestID, StatusOversize, at, expiresAt)
 		return
 	}
+	reserve := headerReserve(snapshot.Headers) + int64(len(snapshot.Body)) + rowOverhead
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		s.dropped++
+		return
+	}
+	if s.queueBytes+reserve > s.queueLimit {
+		s.recordLocked(statusEntry{id: snapshot.RequestID, status: StatusDropped, at: at, expiresAt: expiresAt})
+		return
+	}
+	// The snapshot is admitted: only now is caller memory copied. The copy stays
+	// inside this critical section so that the reservation cannot be overtaken,
+	// and it is bounded by the body and header limits.
 	item := pending{
 		id:          snapshot.RequestID,
 		at:          at,
@@ -238,17 +260,6 @@ func (s *Store) Enqueue(snapshot Snapshot) {
 		item.body = append([]byte(nil), snapshot.Body...)
 	}
 	item.cost = int64(len(item.body)+len(item.headersJSON)) + rowOverhead
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.closed {
-		s.dropped++
-		return
-	}
-	if s.queueBytes+item.cost > s.queueLimit {
-		s.recordLocked(statusEntry{id: item.id, status: StatusDropped, at: at, expiresAt: expiresAt})
-		return
-	}
 	s.queue.PushBack(item)
 	s.queueBytes += item.cost
 	s.enqueued++

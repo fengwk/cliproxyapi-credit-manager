@@ -31,18 +31,23 @@ var sensitiveHeaders = map[string]bool{
 	"x-access-token":      true,
 }
 
-// sensitiveJSONKeys holds the JSON object keys whose values are always redacted.
-// Matching is case-insensitive on the trimmed key and applies recursively.
+// sensitiveJSONKeys holds the normalized JSON object keys whose values are
+// always redacted. Keys are normalized with normalizeJSONKey, so snake_case,
+// kebab-case and camelCase spellings of the same secret share one entry.
 var sensitiveJSONKeys = map[string]bool{
 	"key":           true,
-	"api_key":       true,
 	"apikey":        true,
 	"token":         true,
-	"access_token":  true,
-	"refresh_token": true,
+	"accesstoken":   true,
+	"refreshtoken":  true,
+	"authtoken":     true,
+	"idtoken":       true,
 	"password":      true,
 	"authorization": true,
 	"cookie":        true,
+	"clientsecret":  true,
+	"privatekey":    true,
+	"secretkey":     true,
 }
 
 // isSensitiveHeader reports whether a header value must be redacted.
@@ -52,7 +57,37 @@ func isSensitiveHeader(name string) bool {
 
 // isSensitiveJSONKey reports whether an object value must be redacted.
 func isSensitiveJSONKey(key string) bool {
-	return sensitiveJSONKeys[strings.ToLower(strings.TrimSpace(key))]
+	return sensitiveJSONKeys[normalizeJSONKey(key)]
+}
+
+// normalizeJSONKey lowercases a key and drops separators so that "clientSecret",
+// "client_secret" and "client-secret" are recognized as the same secret field.
+func normalizeJSONKey(key string) string {
+	simple := true
+	for i := 0; i < len(key); i++ {
+		c := key[i]
+		if c == '-' || c == '_' || c == ' ' || (c >= 'A' && c <= 'Z') {
+			simple = false
+			break
+		}
+	}
+	if simple {
+		return key
+	}
+	var builder strings.Builder
+	builder.Grow(len(key))
+	for i := 0; i < len(key); i++ {
+		c := key[i]
+		switch {
+		case c == '-' || c == '_' || c == ' ':
+			continue
+		case c >= 'A' && c <= 'Z':
+			builder.WriteByte(c + ('a' - 'A'))
+		default:
+			builder.WriteByte(c)
+		}
+	}
+	return builder.String()
 }
 
 // redactHeaders returns a deep copy of h with sensitive values replaced. The
@@ -76,17 +111,24 @@ func redactHeaders(h http.Header) http.Header {
 	return out
 }
 
-// rawHeaderSize returns the approximate in-memory size of a header set. It is
-// used to reject oversized header sets before copying or serializing them.
-func rawHeaderSize(h http.Header) int {
-	n := 0
+// rawHeaderSize estimates how much memory a cloned header set would occupy,
+// including a fixed bookkeeping cost per header name and per value.
+//
+// It returns as soon as the estimate exceeds limit, so a header map with
+// millions of entries is never walked in full and never cloned. Callers treat
+// any result above limit as "too large to keep".
+func rawHeaderSize(h http.Header, limit int) int {
+	size := 0
 	for k, vs := range h {
-		n += len(k)
+		size += minHeaderStructureCost + len(k)
 		for _, v := range vs {
-			n += len(v)
+			size += minHeaderStructureCost + len(v)
+		}
+		if size > limit {
+			return size
 		}
 	}
-	return n
+	return size
 }
 
 // looksLikeJSON reports whether b starts with a JSON object or array.

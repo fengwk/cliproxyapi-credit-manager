@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"net/http"
+	"strconv"
 	"testing"
 )
 
@@ -158,6 +159,64 @@ func TestRedactJSONBodyNonJSON(t *testing.T) {
 	}
 }
 
+// TestRedactJSONBodyExtendedSecretKeys verifies that obvious secret fields are
+// recognized in snake_case, kebab-case and camelCase spellings, recursively
+// through arrays and objects, without losing 64-bit integer text.
+func TestRedactJSONBodyExtendedSecretKeys(t *testing.T) {
+	raw := []byte(`{"client_secret":"c1","clientSecret":"c2","client-secret":"c3","CLIENT-SECRET":"c4",` +
+		`"auth_token":"a1","authToken":"a2","AUTH-TOKEN":"a3",` +
+		`"id_token":"i1","idToken":"i2",` +
+		`"private_key":"p1","privateKey":"p2","PRIVATE-KEY":"p3",` +
+		`"secret_key":"s1","secretKey":"s2","secret-key":"s3",` +
+		`"tools":[{"nested":{"id-token":"deep"}},{"plain":"keep"}],` +
+		`"mirror":["clientSecret","value"],` +
+		`"n":12345678901234567890,"model":"gpt"}`)
+	out, changed, err := redactJSONBody(raw)
+	if err != nil {
+		t.Fatalf("redactJSONBody error: %v", err)
+	}
+	if !changed {
+		t.Fatal("changed = false, want true")
+	}
+	decoder := json.NewDecoder(bytes.NewReader(out))
+	decoder.UseNumber()
+	var decoded map[string]any
+	if err := decoder.Decode(&decoded); err != nil {
+		t.Fatalf("redacted body is not JSON: %v", err)
+	}
+	for _, key := range []string{
+		"client_secret", "clientSecret", "client-secret", "CLIENT-SECRET",
+		"auth_token", "authToken", "AUTH-TOKEN",
+		"id_token", "idToken",
+		"private_key", "privateKey", "PRIVATE-KEY",
+		"secret_key", "secretKey", "secret-key",
+	} {
+		if got := decoded[key]; got != redactedValue {
+			t.Fatalf("key %q = %#v, want %q", key, got, redactedValue)
+		}
+	}
+	tools := decoded["tools"].([]any)
+	nested := tools[0].(map[string]any)["nested"].(map[string]any)
+	if nested["id-token"] != redactedValue {
+		t.Fatalf("nested id-token = %#v, want redacted", nested["id-token"])
+	}
+	if tools[1].(map[string]any)["plain"] != "keep" {
+		t.Fatalf("non-secret array entry changed: %#v", tools[1])
+	}
+	// A secret *value* is not a secret key: it is data, not a leaked credential.
+	mirror := decoded["mirror"].([]any)
+	if mirror[0] != "clientSecret" || mirror[1] != "value" {
+		t.Fatalf("array values changed: %#v", mirror)
+	}
+	number, ok := decoded["n"].(json.Number)
+	if !ok || number.String() != "12345678901234567890" {
+		t.Fatalf("64-bit integer text lost: %#v", decoded["n"])
+	}
+	if decoded["model"] != "gpt" {
+		t.Fatalf("model = %#v, want gpt", decoded["model"])
+	}
+}
+
 // TestEncodeHeadersDropsOversizedSets verifies that the header limit is applied
 // before serializing so that one huge header cannot consume the body budget.
 func TestEncodeHeadersDropsOversizedSets(t *testing.T) {
@@ -173,5 +232,53 @@ func TestEncodeHeadersDropsOversizedSets(t *testing.T) {
 	big.Set("X-Big", string(value))
 	if got := encodeHeaders(big); got != nil {
 		t.Fatalf("oversized header set encoded to %d bytes, want dropped", len(got))
+	}
+}
+
+// TestRawHeaderSizeBoundsHighCardinalityHeaders verifies that header sets with
+// huge numbers of tiny values are rejected without walking or cloning them,
+// while ordinary header sets keep working.
+func TestRawHeaderSizeBoundsHighCardinalityHeaders(t *testing.T) {
+	// A single header with a million empty values has almost no content, so an
+	// estimate that only counts content would clone a million strings.
+	oneMillionValues := http.Header{"X-Wide": make([]string, 1_000_000)}
+	manyKeys := make(http.Header, 100000)
+	for i := 0; i < 100000; i++ {
+		manyKeys["X-"+strconv.Itoa(i)] = []string{""}
+	}
+	for name, headers := range map[string]http.Header{
+		"one key with a million values": oneMillionValues,
+		"many keys with tiny values":    manyKeys,
+	} {
+		if got := rawHeaderSize(headers, rawHeaderLimit); got <= rawHeaderLimit {
+			t.Fatalf("%s: rawHeaderSize = %d, want an early result above %d", name, got, rawHeaderLimit)
+		}
+		allocs := testing.AllocsPerRun(1, func() {
+			if encoded := encodeHeaders(headers); encoded != nil {
+				t.Fatalf("%s: high cardinality header set encoded to %d bytes, want dropped", name, len(encoded))
+			}
+		})
+		if allocs > 64 {
+			t.Fatalf("%s: rejecting the header set allocated %.0f objects; it must not be cloned", name, allocs)
+		}
+	}
+
+	normal := http.Header{
+		"Authorization": {"Bearer secret"},
+		"X-Request-Id":  {"req-1"},
+	}
+	size := rawHeaderSize(normal, rawHeaderLimit)
+	if size <= 0 || size > rawHeaderLimit {
+		t.Fatalf("rawHeaderSize(normal) = %d, want a small positive size", size)
+	}
+	if encoded := encodeHeaders(normal); len(encoded) == 0 {
+		t.Fatal("ordinary header set was dropped")
+	}
+	wide := http.Header{}
+	for i := 0; i < 200; i++ {
+		wide["X-"+strconv.Itoa(i)] = []string{"value", "value"}
+	}
+	if encoded := encodeHeaders(wide); len(encoded) == 0 {
+		t.Fatal("wide but small header set was dropped")
 	}
 }

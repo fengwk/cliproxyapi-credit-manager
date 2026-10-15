@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -70,12 +71,13 @@ func openTestStore(t *testing.T, cfg Config, clock *testClock, hook func()) (*St
 }
 
 // parkWriter returns a writer hook that parks the writer before its first
-// dequeue, a channel that reports the rendezvous and a function that releases
-// the writer. The rendezvous notification never blocks the writer, so a released
-// writer always drains.
+// dequeue, a channel that reports the rendezvous and an idempotent function that
+// releases the writer. The rendezvous notification never blocks the writer, so a
+// released writer always drains.
 func parkWriter() (hook func(), entered <-chan struct{}, release func()) {
 	enteredCh := make(chan struct{}, 1)
 	releaseCh := make(chan struct{})
+	var once sync.Once
 	hook = func() {
 		select {
 		case enteredCh <- struct{}{}:
@@ -83,7 +85,19 @@ func parkWriter() (hook func(), entered <-chan struct{}, release func()) {
 		}
 		<-releaseCh
 	}
-	return hook, enteredCh, func() { close(releaseCh) }
+	return hook, enteredCh, func() { once.Do(func() { close(releaseCh) }) }
+}
+
+// openParkedStore opens a store whose writer is parked before its first dequeue.
+// The writer is released by a cleanup registered after the store cleanup, so it
+// runs first and a failing test can never leave the writer parked while Close
+// waits for it.
+func openParkedStore(t *testing.T, cfg Config, clock *testClock) (store *Store, dir string, entered <-chan struct{}, release func()) {
+	t.Helper()
+	hook, entered, release := parkWriter()
+	store, dir = openTestStore(t, cfg, clock, hook)
+	t.Cleanup(release)
+	return store, dir, entered, release
 }
 
 // flush waits for the writer to finish every accepted snapshot. It is the only
@@ -367,8 +381,7 @@ func TestHeaderLimitDropsHeadersKeepsBody(t *testing.T) {
 // the drop is visible through Get and Stats.
 func TestQueueIsByteBoundedAndDropsSafely(t *testing.T) {
 	clock := newTestClock()
-	hook, entered, release := parkWriter()
-	store, _ := openTestStore(t, testConfig(3000, 1<<30), clock, hook)
+	store, _, entered, release := openParkedStore(t, testConfig(3000, 1<<30), clock)
 	<-entered // the writer is parked before its first dequeue
 
 	// Fill the queue until the byte bound rejects a snapshot. The writer cannot
@@ -420,9 +433,8 @@ func TestQueueIsByteBoundedAndDropsSafely(t *testing.T) {
 // accepted snapshot and that stored snapshots survive a restart.
 func TestCloseDrainsQueueAndSurvivesRestart(t *testing.T) {
 	clock := newTestClock()
-	hook, entered, release := parkWriter()
 	cfg := testConfig(1<<20, 1<<30)
-	store, dir := openTestStore(t, cfg, clock, hook)
+	store, dir, entered, release := openParkedStore(t, cfg, clock)
 	<-entered
 	enqueue(store, "p1", []byte("first"))
 	enqueue(store, "p2", []byte(`{"api_key":"secret","keep":"me"}`))
@@ -595,5 +607,272 @@ func TestCorruptAndBombBodiesAreRejected(t *testing.T) {
 	}
 	if stats := store.Stats(); stats.LastError == "" {
 		t.Fatal("decode failure is not observable in Stats")
+	}
+}
+
+// TestFullQueueDoesNotCopyBodies verifies the allocation behaviour of a queue
+// under pressure: a snapshot the queue cannot accept must not copy the caller's
+// body, so a burst of concurrent requests against a full queue does not make
+// every request allocate a full body.
+func TestFullQueueDoesNotCopyBodies(t *testing.T) {
+	clock := newTestClock()
+	const bodySize = 1 << 20
+	store, _, entered, release := openParkedStore(t, testConfig(bodySize, 1<<30), clock)
+	<-entered // the writer is parked, so nothing leaves the queue
+
+	body := bytes.Repeat([]byte("a"), bodySize)
+	enqueue(store, "accepted", body)
+	if stats := store.Stats(); stats.Dropped != 0 {
+		t.Fatalf("Dropped = %d after the first snapshot, want 0", stats.Dropped)
+	}
+
+	// The queue now holds one maximum size snapshot, so every further snapshot of
+	// the same size is rejected.
+	rejected := make([]string, 16)
+	for i := range rejected {
+		rejected[i] = fmt.Sprintf("rejected-%02d", i)
+	}
+	runtime.GC()
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	for _, id := range rejected {
+		store.Enqueue(Snapshot{RequestID: id, Body: body})
+	}
+	runtime.ReadMemStats(&after)
+	dropped := store.Stats().Dropped
+	if dropped < int64(len(rejected)) {
+		t.Fatalf("Dropped = %d, want at least %d: the queue was not full", dropped, len(rejected))
+	}
+	if grown, limit := after.TotalAlloc-before.TotalAlloc, uint64(256<<10); grown > limit {
+		t.Fatalf("rejecting %d snapshots allocated %d bytes, want at most %d: rejected bodies must not be copied",
+			len(rejected), grown, limit)
+	}
+	for _, id := range rejected {
+		if got := statusOf(t, store, id); got != StatusDropped {
+			t.Fatalf("rejected status for %s = %q, want %q", id, got, StatusDropped)
+		}
+	}
+
+	release()
+	flush(t, store)
+	if got := statusOf(t, store, "accepted"); got != StatusCaptured {
+		t.Fatalf("accepted status = %q, want %q", got, StatusCaptured)
+	}
+	if !bytes.Equal(body, bytes.Repeat([]byte("a"), bodySize)) {
+		t.Fatal("caller body was mutated")
+	}
+}
+
+// BenchmarkEnqueueFullQueue records the cost of rejecting snapshots while the
+// queue is full. Allocations per operation must stay far below the body size.
+func BenchmarkEnqueueFullQueue(b *testing.B) {
+	hook, entered, release := parkWriter()
+	const bodySize = 1 << 20
+	store, err := newStore(b.TempDir(), testConfig(bodySize, 1<<30), storeOptions{
+		now:           newTestClock().Now,
+		beforeDequeue: hook,
+	})
+	if err != nil {
+		b.Fatalf("newStore: %v", err)
+	}
+	store.start()
+	defer func() {
+		release()
+		if err := store.Close(); err != nil {
+			b.Errorf("Close: %v", err)
+		}
+	}()
+	<-entered
+
+	body := make([]byte, bodySize)
+	store.Enqueue(Snapshot{RequestID: "filler", Body: body})
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		store.Enqueue(Snapshot{RequestID: "rejected", Body: body})
+	}
+	b.StopTimer()
+	if dropped := store.Stats().Dropped; dropped < int64(b.N) {
+		b.Fatalf("benchmark did not exercise a full queue: %d drops for %d calls", dropped, b.N)
+	}
+}
+
+// TestRedactionGrowthIsBoundedByTheBodyLimit verifies that a body inside the raw
+// limit which grows past it during redaction is dropped with an explicit status,
+// so no stored row can fail to decode within the body limit.
+func TestRedactionGrowthIsBoundedByTheBodyLimit(t *testing.T) {
+	clock := newTestClock()
+	const maxBody = 12
+	store, _ := openTestStore(t, testConfig(maxBody, 1<<30), clock, nil)
+
+	grown := []byte(`{"token":""}`) // inside the limit, longer after redaction
+	if len(grown) > maxBody {
+		t.Fatalf("test body is %d bytes, want it inside the %d byte limit", len(grown), maxBody)
+	}
+	enqueue(store, "grown", grown)
+	flush(t, store)
+
+	detail, err := store.Get("grown")
+	if err != nil {
+		t.Fatalf("Get must explain a dropped snapshot instead of failing: %v", err)
+	}
+	if detail.Status != StatusOversize {
+		t.Fatalf("status = %q, want %q", detail.Status, StatusOversize)
+	}
+	if rows := countRows(t, store); rows != 0 {
+		t.Fatalf("%d rows stored, want none", rows)
+	}
+	stats := store.Stats()
+	if stats.Dropped != 1 {
+		t.Fatalf("Dropped = %d, want 1", stats.Dropped)
+	}
+	if !strings.Contains(stats.LastError, "body limit") {
+		t.Fatalf("LastError = %q, want the body limit reported", stats.LastError)
+	}
+
+	// Bodies that stay inside the limit after redaction are still captured, and
+	// the raw body limit keeps its meaning.
+	enqueue(store, "small", []byte(`{"a":1}`))
+	enqueue(store, "raw", bytes.Repeat([]byte("x"), maxBody+1))
+	flush(t, store)
+	if got := statusOf(t, store, "small"); got != StatusCaptured {
+		t.Fatalf("small status = %q, want %q", got, StatusCaptured)
+	}
+	if got := statusOf(t, store, "raw"); got != StatusOversize {
+		t.Fatalf("raw status = %q, want %q", got, StatusOversize)
+	}
+}
+
+// TestCaptureRedactsExtendedSecretKeys verifies end to end that the extended
+// secret key set never reaches stored diagnostics and that the caller's body is
+// left untouched.
+func TestCaptureRedactsExtendedSecretKeys(t *testing.T) {
+	clock := newTestClock()
+	store, _ := openTestStore(t, testConfig(1<<20, 1<<30), clock, nil)
+	body := []byte(`{"client_secret":"cs-value","auth_token":"at-value","idToken":"it-value",` +
+		`"private_key":"pk-value","secretKey":"sk-value","tools":[{"client-secret":"cs2-value"}]}`)
+	original := append([]byte(nil), body...)
+	enqueue(store, "secrets", body)
+	flush(t, store)
+
+	detail, err := store.Get("secrets")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if detail.Status != StatusCaptured {
+		t.Fatalf("status = %q, want %q", detail.Status, StatusCaptured)
+	}
+	for _, secret := range []string{"cs-value", "at-value", "it-value", "pk-value", "sk-value", "cs2-value"} {
+		if strings.Contains(detail.Body, secret) {
+			t.Fatalf("stored body leaked %q: %s", secret, detail.Body)
+		}
+	}
+	if !strings.Contains(detail.Body, redactedValue) {
+		t.Fatalf("stored body has no redaction marker: %s", detail.Body)
+	}
+	if !bytes.Equal(body, original) {
+		t.Fatalf("caller body mutated: %s", body)
+	}
+}
+
+// TestHeaderReserveBoundsEncodedHeaders verifies that the queue reservation is
+// an upper bound of the encoded header set for every shape that matters,
+// including values that grow while being JSON escaped.
+func TestHeaderReserveBoundsEncodedHeaders(t *testing.T) {
+	cases := map[string]http.Header{
+		"ordinary":               {"X-Request-Id": {"req-1"}, "Authorization": {"Bearer secret"}},
+		"several values":         {"X-Multi": {"one", "two", "three"}, "Content-Type": {"application/json"}},
+		"control characters":     {"X-Notes": {strings.Repeat("\x01", 256)}},
+		"quotes and markup":      {"X-Notes": {strings.Repeat(`"<&>`, 128)}},
+		"half the encoded limit": {"X-Big": {strings.Repeat("a", headerLimit/2)}},
+	}
+	for name, headers := range cases {
+		encoded := encodeHeaders(headers)
+		if encoded == nil {
+			t.Fatalf("%s: header set was dropped; the case needs a kept set", name)
+		}
+		reserve := headerReserve(headers)
+		if reserve < int64(len(encoded)) {
+			t.Fatalf("%s: headerReserve = %d below the encoded %d bytes", name, reserve, len(encoded))
+		}
+	}
+	// A set that is too large to keep reserves the encoded limit, which still
+	// bounds the nothing that is stored.
+	dropped := http.Header{"X-Huge": {strings.Repeat("a", 2*headerLimit)}}
+	if encoded := encodeHeaders(dropped); encoded != nil {
+		t.Fatalf("oversized header set encoded to %d bytes, want dropped", len(encoded))
+	}
+	if reserve := headerReserve(dropped); reserve != headerLimit {
+		t.Fatalf("headerReserve(oversized) = %d, want %d", reserve, headerLimit)
+	}
+}
+
+// TestQueueReservationCoversEncodedHeaders verifies that the pending queue
+// reservation is an upper bound of the encoded header set at an exact boundary:
+// a reservation that counted only raw header content would admit one snapshot
+// more and push the pending bytes above the queue limit.
+func TestQueueReservationCoversEncodedHeaders(t *testing.T) {
+	clock := newTestClock()
+	store, _, entered, release := openParkedStore(t, testConfig(4096, 1<<30), clock)
+	<-entered // the writer is parked, so the queue only fills
+
+	headers := http.Header{
+		"X-Notes":      {strings.Repeat("\x01", 512)},
+		"X-Request-Id": {"req"},
+	}
+	body := []byte(strings.Repeat("b", 1024))
+	encoded := encodeHeaders(headers)
+	if encoded == nil {
+		t.Fatal("test header set was dropped; it must be kept to bound the reservation")
+	}
+	reserve := headerReserve(headers)
+	stored := int64(len(body)) + int64(len(encoded)) + rowOverhead
+	rawReserve := int64(len(body)) + int64(rawHeaderSize(headers, rawHeaderLimit)) + rowOverhead
+	if reserve < int64(len(encoded)) {
+		t.Fatalf("headerReserve = %d below the encoded %d bytes", reserve, len(encoded))
+	}
+	if reserve <= rawReserve {
+		t.Fatalf("headerReserve = %d, raw content reservation = %d; the case must exercise escaping", reserve, rawReserve)
+	}
+
+	// Exact boundary: one snapshot fits by the reservation bound, while a
+	// reservation that ignored the escapes would accept a second one and its
+	// stored bytes would exceed the limit.
+	store.queueLimit = stored + rawReserve
+	if store.queueLimit >= 2*stored {
+		t.Fatalf("queue limit %d is not below two stored snapshots (%d)", store.queueLimit, 2*stored)
+	}
+	for i := 0; i < 4; i++ {
+		store.Enqueue(Snapshot{RequestID: fmt.Sprintf("esc-%02d", i), Headers: headers, Body: body})
+	}
+
+	stats := store.Stats()
+	if stats.QueueBytes > store.queueLimit {
+		t.Fatalf("QueueBytes = %d above the %d byte queue limit", stats.QueueBytes, store.queueLimit)
+	}
+	if stats.QueueBytes != stored {
+		t.Fatalf("QueueBytes = %d, want the single accepted snapshot's %d bytes", stats.QueueBytes, stored)
+	}
+	if stats.Dropped != 3 {
+		t.Fatalf("Dropped = %d, want 3: only one snapshot fits at the boundary", stats.Dropped)
+	}
+
+	release()
+	flush(t, store)
+	detail, err := store.Get("esc-00")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if detail.Status != StatusCaptured {
+		t.Fatalf("status = %q, want %q", detail.Status, StatusCaptured)
+	}
+	if got := detail.Headers.Get("X-Notes"); got != strings.Repeat("\x01", 512) {
+		t.Fatalf("header round trip lost bytes: %d bytes", len(got))
+	}
+	if detail.Body != string(body) {
+		t.Fatalf("body round trip changed: %q", detail.Body)
+	}
+	if got := statusOf(t, store, "esc-03"); got != StatusDropped {
+		t.Fatalf("rejected status = %q, want %q", got, StatusDropped)
 	}
 }
