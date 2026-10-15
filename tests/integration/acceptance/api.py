@@ -30,13 +30,30 @@ class Response:
 
 
 class Manager:
-    """Client for the plugin's management API through the host."""
+    """Client for the plugin's management API through the host.
+
+    Two identifiers are involved and they are NOT the same string:
+
+    * The plugin's *declared* management route prefix, which the plugin fixes at
+      ``/v0/management/plugins/credit-manager`` and which serves the financial
+      ``/api/*`` routes.
+    * The host's plugin *instance* id (the loaded library id, i.e. the
+      acceptance ``--plugin-id``), which names the instance in the host config
+      and therefore names the host's generic ``/v0/management/plugins/<id>/config``
+      route.
+
+    With the default ``--plugin-id credit-manager`` they coincide, which hides
+    the distinction; with any other library name they diverge, so the config
+    route must use the instance id.
+    """
 
     def __init__(self, base_url, secret, plugin_id="credit-manager", base=MANAGER_BASE):
         self.base_url = base_url
         self.secret = secret
-        self.plugin_id = plugin_id
-        self.base = base
+        self.plugin_id = plugin_id          # host plugin instance id (library id)
+        self.instance_id = plugin_id
+        self.base = base                    # plugin-declared route prefix for /api/*
+        self.config_base = f"/v0/management/plugins/{plugin_id}"
 
     def _hdr(self, extra=None, with_auth=True):
         headers = {}
@@ -45,8 +62,8 @@ class Manager:
         headers.update(extra or {})
         return headers
 
-    def call(self, method, suffix, body=None, query=None, headers=None, with_auth=True, timeout=20):
-        path = self.base + suffix
+    def call(self, method, suffix, body=None, query=None, headers=None, with_auth=True, timeout=20, base=None):
+        path = (base or self.base) + suffix
         if query:
             path += "?" + urlencode(query)
         return Response(
@@ -54,6 +71,14 @@ class Manager:
         )
 
     # Convenience wrappers -------------------------------------------------
+    def config_call(self, method, body=None, timeout=20):
+        """Call the host's generic plugin config route for this instance.
+
+        This is a host route keyed by the plugin instance id, not by the
+        plugin's declared management route prefix.
+        """
+        return self.call(method, "/config", body=body, timeout=timeout, base=self.config_base)
+
     def health(self):
         return self.call("GET", "/api/health")
 

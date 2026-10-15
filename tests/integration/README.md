@@ -53,10 +53,19 @@ Options:
 
 - `--only <substr>` run only cases whose name contains the substring.
 - `--modules core,retry` restrict to specific case modules (default: all).
-- `--plugin-id credit-manager` override the plugin route/library id.
+- `--plugin-id credit-manager` override the plugin library/instance id.
 
-Exit code: `0` all cases pass, `1` at least one case failed, `2` the host failed
-to boot. Build/run status is reported separately from case status.
+Exit code: `0` all cases pass, `1` at least one case failed, `2` fail-closed: the
+host failed to boot, a requested module does not exist, or the filter matched no
+case. A zero-case or unresolvable run is never reported as green. Build/run
+status is reported separately from case status.
+
+The plugin involves two distinct ids: the plugin's *declared* management route
+prefix (fixed at `/v0/management/plugins/credit-manager`, serving `/api/*`) and
+the host plugin *instance* id (the loaded library id, e.g.
+`--plugin-id cliproxyapi-credit-manager`, naming the host's generic
+`/v0/management/plugins/<id>/config` route and the public resource base). With
+the default `--plugin-id credit-manager` they coincide.
 
 ## Output
 
@@ -83,6 +92,7 @@ Each case's host lives at `<artifacts>/host-<n>-<case>/` with `config.yaml`,
 | `namespace` | Request model vs execution/response model are kept distinct for an aliased model; billing uses the requested model's price. |
 | `lifecycle` | Unknown usage stays pending (never free); client cancel does not hang and keeps the hold; restart retains the settled balance and keeps unfinished work pending. |
 | `retry` | A 429 on the first upstream credential fails over, one client request, two independent per-attempt usage rows (failed-unknown not written off), hold retained; all-failures never bill as free. |
+| `warmup` | Background warmup: default-off issues no background activity; enabled issues a *real* pinned host model execution (upstream 1, host log shows credential selection with no client scope) that creates no customer ledger row/hold/charge; an unknown `AuthID` fails with no host-side fallback; a customer request runs alongside the worker and is billed; a forged warmup session header is still billed in full; reconfiguring to disabled leaves no residual worker. |
 | `gemini` | Native `generateContent` and `streamGenerateContent` (`alt=sse`) authenticate, forward the upstream Google key and bill. |
 | `browser` | Real isolated-context Chromium: in-memory login, usage render, no localStorage/sessionStorage/cookie/URL credential persistence, lazy capture-body modal with redaction and 64-bit fidelity. |
 

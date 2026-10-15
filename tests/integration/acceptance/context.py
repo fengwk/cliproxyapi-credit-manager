@@ -28,7 +28,7 @@ class Context:
         self._host_seq = 0
 
     # -- lifecycle ---------------------------------------------------------
-    def build_host(self, *, root, enable_plugins=True, plugin_config=None, extra_plugin_yaml="", client_keys=None, request_retry=3):
+    def build_host(self, *, root, enable_plugins=True, plugin_config=None, extra_plugin_yaml="", extra_top_yaml="", client_keys=None, request_retry=3):
         config = HostConfig(
             root=Path(root),
             plugin_library=self.plugin,
@@ -44,6 +44,7 @@ class Context:
             plugin_config=plugin_config or {"data_dir": str(Path(root) / "data")},
             plugins_dir=self.artifacts / "plugins",
             extra_plugin_yaml=extra_plugin_yaml,
+            extra_top_yaml=extra_top_yaml,
             enable_plugins=enable_plugins,
             request_retry=request_retry,
             openai_upstream_keys=self.openai_upstream_keys,
@@ -58,7 +59,7 @@ class Context:
         self.manager = Manager(self.host.config.base_url, self.management_secret, self.plugin_id)
         self.client = Client(self.host.config.base_url)
 
-    def recreate_host(self, name, *, root=None, enable_plugins=True, plugin_config=None, extra_plugin_yaml="", client_keys=None, request_retry=3):
+    def recreate_host(self, name, *, root=None, enable_plugins=True, plugin_config=None, extra_plugin_yaml="", extra_top_yaml="", client_keys=None, request_retry=3):
         """Stop any running host and boot a fresh isolated one.
 
         Each case gets a clean credit database and configuration unless it passes
@@ -78,6 +79,7 @@ class Context:
             enable_plugins=enable_plugins,
             plugin_config=plugin_config,
             extra_plugin_yaml=extra_plugin_yaml,
+            extra_top_yaml=extra_top_yaml,
             client_keys=client_keys,
             request_retry=request_retry,
         )

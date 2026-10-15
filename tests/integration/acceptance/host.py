@@ -57,6 +57,7 @@ class HostConfig:
         plugin_config: dict | None = None,
         plugins_dir=None,
         extra_plugin_yaml: str = "",
+        extra_top_yaml: str = "",
         enable_plugins: bool = True,
         request_retry: int = 3,
         openai_upstream_keys=None,
@@ -73,6 +74,7 @@ class HostConfig:
         self.plugin_config = dict(plugin_config or {})
         self.plugins_dir = Path(plugins_dir) if plugins_dir else None
         self.extra_plugin_yaml = extra_plugin_yaml
+        self.extra_top_yaml = extra_top_yaml
         self.enable_plugins = enable_plugins
         self.request_retry = request_retry
         self.openai_upstream_keys = list(openai_upstream_keys or [])
@@ -146,6 +148,8 @@ class HostConfig:
         _emit_mapping(lines, 6, self.plugin_config)
         if self.extra_plugin_yaml:
             lines.append(self.extra_plugin_yaml.rstrip("\n"))
+        if self.extra_top_yaml:
+            lines.append(self.extra_top_yaml.rstrip("\n"))
         return "\n".join(lines) + "\n"
 
     def write(self) -> Path:
@@ -266,7 +270,23 @@ def _emit_mapping(lines, indent, mapping):
             _emit_mapping(lines, indent + 2, value)
         elif isinstance(value, (list, tuple)):
             lines.append(f'{pad}{key}:')
-            for entry in value:
-                lines.append(f'{pad}  - {_yaml_scalar(entry)}')
+            _emit_list(lines, indent + 2, value)
         else:
             lines.append(f'{pad}{key}: {_yaml_scalar(value)}')
+
+
+def _emit_list(lines, indent, items):
+    """Emit a YAML sequence, including sequences of mappings (e.g. warmup targets)."""
+    pad = " " * indent
+    for entry in items:
+        if isinstance(entry, dict):
+            block = []
+            _emit_mapping(block, indent + 2, entry)
+            if block:
+                block[0] = f'{pad}- ' + block[0].lstrip()
+            lines.extend(block)
+        elif isinstance(entry, (list, tuple)):
+            lines.append(f'{pad}-')
+            _emit_list(lines, indent + 2, entry)
+        else:
+            lines.append(f'{pad}- {_yaml_scalar(entry)}')

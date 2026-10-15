@@ -29,7 +29,7 @@ from acceptance.mock import Script  # noqa: E402
 from acceptance.report import Recorder  # noqa: E402
 
 DEFAULT_MODULES = ["abi", "core", "accounting", "auth", "capture", "report", "resources",
-                   "namespace", "lifecycle", "retry", "gemini", "browser"]
+                   "namespace", "lifecycle", "retry", "warmup", "gemini", "browser"]
 
 
 def parse_args(argv):
@@ -56,6 +56,34 @@ def reset_artifacts(artifacts: Path) -> None:
             shutil.rmtree(child, ignore_errors=True)
 
 
+def resolve_specs(recorder, args, artifacts):
+    """Resolve case specs, failing closed on unknown modules or an empty match.
+
+    A requested module that does not exist, or a filter that matches no case,
+    must never be silently reported as a green run.
+    """
+    requested = [m for m in (args.modules.split(",") if args.modules else DEFAULT_MODULES) if m]
+    unknown = [m for m in requested if not (HERE / "acceptance" / "cases" / f"{m}.py").exists()]
+    if unknown:
+        recorder.write(artifacts / "result.json",
+                       extra={"build": {"error": f"unknown case modules: {', '.join(unknown)}"}})
+        print(f"[ERROR] unknown case modules: {', '.join(unknown)}", file=sys.stderr)
+        return None, requested
+    try:
+        specs = load_specs(requested, only=args.only)
+    except Exception as error:  # noqa: BLE001
+        recorder.write(artifacts / "result.json", extra={"build": {"error": f"case import failed: {error}"}})
+        print(f"[ERROR] case import failed: {error}", file=sys.stderr)
+        return None, requested
+    if not specs:
+        recorder.write(artifacts / "result.json",
+                       extra={"build": {"error": "no cases matched --only/modules filter",
+                                        "modules": requested, "only": args.only}})
+        print("[ERROR] no cases matched; refusing to report success", file=sys.stderr)
+        return None, requested
+    return specs, requested
+
+
 def main(argv=None):
     args = parse_args(argv)
     artifacts = Path(args.artifacts)
@@ -63,13 +91,13 @@ def main(argv=None):
     reset_artifacts(artifacts)
     recorder = Recorder(artifacts)
 
-    modules = [m for m in (args.modules.split(",") if args.modules else DEFAULT_MODULES) if m]
-    modules = [m for m in modules if (HERE / "acceptance" / "cases" / f"{m}.py").exists()]
-    specs = load_specs(modules, only=args.only)
+    specs, modules = resolve_specs(recorder, args, artifacts)
+    if specs is None:
+        return 2
 
     ctx = Context(artifacts, Path(args.cpa), Path(args.plugin), plugin_id=args.plugin_id)
     build = {"cpa": str(Path(args.cpa).resolve()), "plugin": str(Path(args.plugin).resolve()),
-             "modules": modules, "cases_planned": len(specs)}
+             "plugin_id": args.plugin_id, "modules": modules, "cases_planned": len(specs)}
 
     started = time.time()
     try:
@@ -118,9 +146,12 @@ def main(argv=None):
     }
     payload = recorder.write(artifacts / "result.json", extra=extra)
     print(json.dumps(payload["summary"]), file=sys.stderr)
-    # Exit non-zero only when cases ran and failed, so build/run status is separable.
+    # Fail closed: a boot failure or a zero-case run is never a green result.
     if build.get("boot_error"):
         return 2
+    if payload["summary"]["total"] == 0:
+        return 2
+    # Exit non-zero when any case failed, so build/run status stays separable.
     return 0 if payload["summary"]["failed"] == 0 else 1
 
 
