@@ -210,8 +210,13 @@ func (m *Manager) stopWarmupForSwap() bool {
 	if worker == nil {
 		return true
 	}
+	worker.mu.Lock()
+	wasPaused := worker.paused
+	worker.mu.Unlock()
 	if !worker.pauseAndWaitIdle(warmupSwapGrace) {
-		worker.resume()
+		if !wasPaused {
+			worker.resume()
+		}
 		return false
 	}
 	worker.cancel()

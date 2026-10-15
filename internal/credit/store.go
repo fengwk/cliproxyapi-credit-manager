@@ -236,12 +236,34 @@ func Open(opts Options) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
-	pepper, err := loadPepper(filepath.Join(dir, pepperFileName))
+	dbPath := filepath.Join(dir, dbFileName)
+	pepperPath := filepath.Join(dir, pepperFileName)
+	if info, err := os.Stat(dbPath); err == nil && info.Size() > 0 {
+		if _, err := os.Stat(pepperPath); errors.Is(err, os.ErrNotExist) {
+			_ = lock.release()
+			return nil, fmt.Errorf("%w: existing ledger has no pepper; restore the matching backup", ErrInvalid)
+		}
+	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
+		_ = lock.release()
+		return nil, fmt.Errorf("inspect ledger: %w", err)
+	}
+	pepper, err := loadPepper(pepperPath)
 	if err != nil {
 		_ = lock.release()
 		return nil, err
 	}
-	dbPath := filepath.Join(dir, dbFileName)
+	// SQLite sidecars inherit the main file's permissions.
+	file, err := os.OpenFile(dbPath, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		_ = lock.release()
+		return nil, fmt.Errorf("create ledger: %w", err)
+	}
+	secureErr := file.Chmod(0o600)
+	closeErr := file.Close()
+	if err := errors.Join(secureErr, closeErr); err != nil {
+		_ = lock.release()
+		return nil, fmt.Errorf("secure ledger: %w", err)
+	}
 	dsn := dsnFor(dbPath)
 	db, err := sql.Open(driverName, dsn)
 	if err != nil {

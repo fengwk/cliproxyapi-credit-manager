@@ -4,6 +4,7 @@ package config
 import (
 	"bytes"
 	"fmt"
+	"io"
 	"path/filepath"
 	"strings"
 	"time"
@@ -76,6 +77,9 @@ func Parse(raw []byte) (Config, error) {
 		d.KnownFields(true)
 		if err := d.Decode(&c); err != nil {
 			return Config{}, fmt.Errorf("invalid plugin configuration: %w", err)
+		}
+		if err := d.Decode(new(any)); err != io.EOF {
+			return Config{}, fmt.Errorf("plugin configuration must contain one YAML document")
 		}
 	}
 	if c.DataDir == "" || c.History.RetentionMonths < 1 || c.History.RetentionMonths > 1200 ||

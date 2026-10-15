@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"mime"
 	"net/http"
 	"path"
 	"strconv"
@@ -118,7 +119,8 @@ func (h *Handler) Handle(req pluginapi.ManagementRequest) pluginapi.ManagementRe
 		if req.Headers.Get("Sec-Fetch-Site") == "cross-site" {
 			return response(403, map[string]string{"error": "cross-site request rejected"})
 		}
-		if !strings.HasPrefix(strings.ToLower(req.Headers.Get("Content-Type")), "application/json") {
+		contentType, _, err := mime.ParseMediaType(req.Headers.Get("Content-Type"))
+		if err != nil || contentType != "application/json" {
 			return response(415, map[string]string{"error": "application/json required"})
 		}
 	}
