@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from urllib.parse import urlencode
 
 from ..report import check, check_eq
@@ -24,6 +25,18 @@ def _spent(ctx, key_id):
 
 def _body(model="synthetic-chat"):
     return {"model": model, "messages": [{"role": "user", "content": "synthetic"}]}
+
+
+def _probe_locations(ctx, key):
+    """Issue one request per native credential location, returning its status."""
+    body = _body()
+    return {
+        "bearer": ctx.client.post("/v1/chat/completions", body, {"Authorization": f"Bearer {key}"}).status,
+        "x-goog-api-key": ctx.client.post("/v1/chat/completions", body, {"x-goog-api-key": key}).status,
+        "x-api-key": ctx.client.post("/v1/chat/completions", body, {"x-api-key": key}).status,
+        "query-key": ctx.client.post(f"/v1/chat/completions?{urlencode({'key': key})}", body, {}).status,
+        "query-auth-token": ctx.client.post(f"/v1/chat/completions?{urlencode({'auth_token': key})}", body, {}).status,
+    }
 
 
 def _expect_denied(ctx, status, message):
@@ -125,3 +138,52 @@ def custom_prefix(ctx):
     check_eq(response.status, 200, "custom-prefix key accepted")
     check(ctx.wait_until(lambda: _spent(ctx, item["id"]) == 14), "custom key billed")
     return {"status": response.status, "key_prefix": key[:12]}
+
+
+@case("auth.plugin_absent_denies_plugin_keys",
+      "a plugin-managed key is only valid while the plugin is loaded: with plugins disabled every credential location is denied with no upstream call")
+def plugin_absent_denies(ctx):
+    ctx.set_price("synthetic-chat")
+    item, key = ctx.new_key(label="deploy-guard")
+
+    # 1. While the plugin is loaded its auth hook injects this key, so it is
+    #    accepted at every native credential location and billed normally.
+    loaded = _probe_locations(ctx, key)
+    for location, status in loaded.items():
+        check_eq(status, 200, f"with the plugin loaded, {location} accepts a plugin key")
+    check_eq(ctx.mock.count("/chat/completions"), 5, "each accepted location reached upstream once")
+    check(ctx.wait_until(lambda: _spent(ctx, item["id"]) == 70),
+          f"the plugin key was billed while loaded: {_spent(ctx, item['id'])}")
+
+    # 2. Rebuild the same deployment with the plugin disabled (plugins.enabled
+    #    false, library not loaded) while the original CPA access.api-keys guard
+    #    stays configured. The plugin key is no longer injected and must be
+    #    denied everywhere. The native guard key is deliberately never used here:
+    #    this case asserts the denial of a *plugin* key.
+    root = ctx.host.config.root
+    ctx.mock.reset()
+    ctx.recreate_host("deploy-plugin-absent", root=root, enable_plugins=False)
+
+    absent = _probe_locations(ctx, key)
+    for location, status in absent.items():
+        check(status in (401, 403),
+              f"with the plugin absent, {location} must deny the plugin key, got {status}")
+    check_eq(ctx.mock.count(), 0, "denied requests must not reach upstream")
+
+    # The plugin really is gone from this deployment: the host reports plugins
+    # disabled and the instance neither registered nor effective, and the
+    # plugin's own management API is not served at all.
+    status, raw = ctx.host.management("GET", "/v0/management/plugins")
+    payload = json.loads(raw) if status == 200 else {}
+    entry = next((e for e in payload.get("plugins") or [] if e.get("id") == ctx.plugin_id), None)
+    check_eq(payload.get("plugins_enabled"), False, "plugins are disabled in this deployment")
+    if entry is not None:
+        check_eq(entry.get("registered"), False, "the plugin must not be registered when disabled")
+        check_eq(entry.get("effective_enabled"), False, "the plugin must not be effective when disabled")
+    check_eq(ctx.host.management("GET", "/v0/management/plugins/credit-manager/api/health")[0], 404,
+             "the plugin management API is not served when the plugin is disabled")
+    return {"plugin_loaded": loaded, "plugin_absent": absent,
+            "plugins_enabled": payload.get("plugins_enabled"),
+            "registered": (entry or {}).get("registered"),
+            "effective_enabled": (entry or {}).get("effective_enabled"),
+            "upstream_calls_when_disabled": ctx.mock.count()}

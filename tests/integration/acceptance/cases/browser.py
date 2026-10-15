@@ -16,7 +16,9 @@ from ..report import check, check_eq
 
 CASES = []
 
-RESOURCE = "/v0/resource/plugins/credit-manager/index.html"
+def _resource(ctx):
+    # The public resource base follows the plugin library id (--plugin-id).
+    return f"/v0/resource/plugins/{ctx.plugin_id}/index.html"
 
 
 def case(name, expects):
@@ -45,7 +47,7 @@ def _local_window(started_at):
 
 
 def _login(page, ctx, started_at):
-    response = page.goto(ctx.host.config.base_url + RESOURCE, wait_until="domcontentloaded")
+    response = page.goto(ctx.host.config.base_url + _resource(ctx), wait_until="domcontentloaded")
     check(response is not None and response.status == 200, f"resource shell status {response and response.status}")
     check("信用管理" in page.title(), f"page title {page.title()}")
     page.fill("#management-key", ctx.management_secret)

@@ -10,7 +10,10 @@ from ..report import check, check_eq
 
 CASES = []
 
-BASE = "/v0/resource/plugins/credit-manager"
+# The public resource base is derived by the host from the plugin library id,
+# so it must follow --plugin-id rather than the plugin's fixed route name.
+def _base(ctx):
+    return f"/v0/resource/plugins/{ctx.plugin_id}"
 
 
 def case(name, expects):
@@ -23,15 +26,16 @@ def case(name, expects):
 @case("resource.static_shell_only",
       "the public resource base serves only the embedded static shell, unauthenticated and leak-free")
 def static_shell(ctx):
+    base = _base(ctx)
     results = {}
     for asset in ("index.html", "app.js", "style.css"):
-        status, raw = _get(ctx, f"{BASE}/{asset}")
+        status, raw = _get(ctx, f"{base}/{asset}")
         results[asset] = status
         check_eq(status, 200, f"static asset {asset} is publicly served")
         check(len(raw) > 0, f"static asset {asset} is non-empty")
         check(ctx.management_secret.encode() not in raw, f"management secret leaked into {asset}")
     # The shell must not embed any key material or the management secret.
-    _, index = _get(ctx, f"{BASE}/index.html")
+    _, index = _get(ctx, f"{base}/index.html")
     text = index.decode(errors="replace")
     for marker in ("Bearer ", "secret-key", "api_key", ctx.management_secret):
         check(marker not in text, f"static shell must not embed {marker!r}")
@@ -41,10 +45,11 @@ def static_shell(ctx):
 @case("resource.cannot_reach_api",
       "resource paths cannot reach the financial API and unknown resources are not served")
 def cannot_reach_api(ctx):
+    base = _base(ctx)
     attempts = {
-        "api-keys-under-resource": f"{BASE}/api/keys",
-        "traversal": f"{BASE}/../plugins/credit-manager/api/keys",
-        "unknown": f"{BASE}/does-not-exist",
+        "api-keys-under-resource": f"{base}/api/keys",
+        "traversal": f"{base}/../plugins/credit-manager/api/keys",
+        "unknown": f"{base}/does-not-exist",
     }
     statuses = {}
     for name, path in attempts.items():
