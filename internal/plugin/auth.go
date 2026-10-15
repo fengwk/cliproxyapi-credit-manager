@@ -2,7 +2,7 @@ package plugin
 
 import (
 	"context"
-	"net/http"
+	"encoding/json"
 	"strings"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
@@ -11,12 +11,38 @@ import (
 )
 
 // authProviderID is the plugin-local frontend auth provider name. The host
-// prefixes it with "plugin:<library-id>:" when it reports AccessProvider, so
-// identification must never assume the library id is known locally.
-const authProviderID = "credit-manager-key"
+// prefixes it with "plugin:<library-id>:", so identification must check both the
+// library id and this provider id exactly instead of matching any plugin that
+// happens to expose a provider with the same name.
+const authProviderID = "credit-manager"
 
 // accessProviderPrefix marks a frontend auth provider owned by a native plugin.
 const accessProviderPrefix = "plugin:"
+
+// releasedPluginID is the host-local library id derived from the released
+// shared library name (cliproxyapi-credit-manager.so).
+const releasedPluginID = "cliproxyapi-credit-manager"
+
+// legacyPluginID is the short library id used when the library is loaded under
+// the bare plugin name (credit-manager.so).
+const legacyPluginID = "credit-manager"
+
+// handleFrontendAuth resolves one inbound frontend authentication request. An
+// unauthenticated result is returned as an empty response so the exclusive
+// provider rejects the request instead of admitting it.
+func (m *Manager) handleFrontendAuth(request []byte) ([]byte, error) {
+	var req pluginapi.FrontendAuthRequest
+	if len(request) > 0 {
+		if err := json.Unmarshal(request, &req); err != nil {
+			return errorEnvelope(&PluginError{Code: "invalid_request", Message: "malformed frontend auth request"})
+		}
+	}
+	response, ok := m.authenticate(req)
+	if !ok {
+		return okEnvelope(pluginapi.FrontendAuthResponse{Authenticated: false})
+	}
+	return okEnvelope(response)
+}
 
 // authCandidate is one credential location in the CPA candidate order.
 type authCandidate struct {
@@ -125,14 +151,21 @@ func extractBearerToken(header string) string {
 }
 
 // isOwnAccessProvider reports whether a usage record's AccessProvider was
-// resolved by this plugin's frontend auth provider, without assuming the
-// host-derived library id.
+// resolved by this plugin's frontend auth provider. Both the host-derived
+// library id and the provider id must match exactly, so a different plugin that
+// exposes a provider with the same name is never accepted.
 func isOwnAccessProvider(provider string) bool {
 	provider = strings.TrimSpace(provider)
-	if !strings.HasPrefix(provider, accessProviderPrefix) {
+	rest, ok := strings.CutPrefix(provider, accessProviderPrefix)
+	if !ok {
 		return false
 	}
-	return strings.HasSuffix(provider, ":"+authProviderID)
+	libraryID, providerID, ok := strings.Cut(rest, ":")
+	if !ok {
+		return false
+	}
+	if libraryID != releasedPluginID && libraryID != legacyPluginID {
+		return false
+	}
+	return providerID == authProviderID
 }
-
-var _ = http.MethodGet

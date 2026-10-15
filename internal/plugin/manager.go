@@ -77,9 +77,6 @@ type Manager struct {
 
 	maintenanceCancel context.CancelFunc
 	maintenanceDone   chan struct{}
-
-	// routes caches the routes declared to the host.
-	routes *managementRoutes
 }
 
 // NewManager returns a dispatcher that opens nothing until configured.
@@ -119,10 +116,11 @@ func (m *Manager) HandleCall(method string, request []byte) (resp []byte, err er
 	case pluginabi.MethodFrontendAuthAuthenticate:
 		return m.handleFrontendAuth(request)
 	case pluginabi.MethodRequestInterceptBefore:
+		// Fail closed: the interceptor converts every failure and panic into a
+		// Terminate response instead of a host error envelope.
 		return m.handleInterceptBefore(request)
 	case pluginabi.MethodRequestInterceptAfter:
-		// The plugin never rewrites an after-auth request.
-		return okEnvelope(pluginapi.RequestInterceptResponse{})
+		return m.handleInterceptAfter(request)
 	case pluginabi.MethodRequestComplete:
 		return m.handleRequestComplete(request)
 	case pluginabi.MethodUsageHandle:
@@ -157,13 +155,6 @@ func (m *Manager) begin(admission bool) (*liveState, bool) {
 // end releases the shared gate taken by begin.
 func (m *Manager) end() {
 	m.gate.RUnlock()
-}
-
-// stateName reports the current lifecycle state for diagnostics.
-func (m *Manager) stateName() lifecycleState {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.state
 }
 
 // LastError returns the sticky health message, empty when healthy.
@@ -248,30 +239,35 @@ func (m *Manager) apply(raw []byte, hostSchema uint32) ([]byte, error) {
 
 	// Refuse new accounting before the exclusive gate blocks the swap.
 	m.mu.Lock()
+	previous := m.live
 	if m.state != stateClosed {
 		m.state = stateReconfiguring
 	}
 	m.mu.Unlock()
 
-	if err := m.enterExclusive(); err != nil {
-		m.mu.Lock()
-		if m.live != nil {
-			m.state = stateLive
-		} else {
-			m.state = stateQuiesced
-		}
-		m.mu.Unlock()
-		return errorEnvelope(err)
+	// A store that can report unfinished requests must not be swapped while any
+	// are in flight: their rows live in the old database. Keep the old store
+	// and let the host retry once the requests settle. A backend that can not
+	// answer is treated as unsafe too: accounting is never swapped on a guess.
+	ctx := context.Background()
+	known, active, errActive := storeActive(ctx, previous)
+	if errActive != nil {
+		m.recordError(errActive)
 	}
+	if errActive != nil || (known && active) {
+		m.mu.Lock()
+		m.state = stateLive
+		m.mu.Unlock()
+		return errorEnvelope(&PluginError{Code: "busy", Message: "unfinished requests are still being settled", HTTPStatus: http.StatusConflict})
+	}
+
+	m.enterExclusive()
 	defer m.exitExclusive()
 
 	// Release the current store before opening the candidate so only one
 	// connection to the accounting database exists at any time.
 	m.stopMaintenance()
-	previous := m.detach()
-	if previous != nil {
-		closeLive(previous)
-	}
+	m.closeLive(m.detach())
 
 	store, err := credit.Open(credit.Options{
 		DataDir:            cfg.DataDir,
@@ -282,28 +278,32 @@ func (m *Manager) apply(raw []byte, hostSchema uint32) ([]byte, error) {
 		m.restore(previousRaw, previousHasConfig)
 		return errorEnvelope(&PluginError{Code: "storage_unavailable", Message: "credit storage unavailable", HTTPStatus: http.StatusServiceUnavailable})
 	}
+	// Capture is disposable: a capture failure degrades diagnostics only and
+	// must never affect the credit store or inference. Fall back to a disabled
+	// store and surface the failure through health instead.
+	var captureFault error
 	captures, err := capture.Open(cfg.DataDir, cfg.Capture)
 	if err != nil {
-		_ = store.Close()
-		m.restore(previousRaw, previousHasConfig)
-		return errorEnvelope(&PluginError{Code: "storage_unavailable", Message: "capture storage unavailable", HTTPStatus: http.StatusServiceUnavailable})
+		captureFault = err
+		captures, err = capture.Open("", capture.Config{Enabled: false})
+		if err != nil {
+			m.closeStore(store)
+			m.restore(previousRaw, previousHasConfig)
+			return errorEnvelope(&PluginError{Code: "storage_unavailable", Message: "capture storage unavailable", HTTPStatus: http.StatusServiceUnavailable})
+		}
 	}
 
-	current := &liveState{
-		store:    store,
-		captures: captures,
-		handler:  web.New(store, captures, cfg),
-		cfg:      cfg,
-	}
 	m.mu.Lock()
-	m.live = current
+	m.live = m.newLiveState(store, captures, cfg)
 	m.raw = append([]byte(nil), raw...)
 	m.hasConfig = true
 	m.state = stateLive
 	m.lastError = ""
 	m.admissionBlocked = false
 	m.mu.Unlock()
-
+	if captureFault != nil {
+		m.recordError(captureFault)
+	}
 	m.startMaintenance(store, captures)
 	return okEnvelope(reg)
 }
@@ -332,28 +332,53 @@ func (m *Manager) restore(raw []byte, hasConfig bool) {
 	}
 	captures, err := capture.Open(cfg.DataDir, cfg.Capture)
 	if err != nil {
-		_ = store.Close()
-		return
+		captures, err = capture.Open("", capture.Config{Enabled: false})
+		if err != nil {
+			m.closeStore(store)
+			return
+		}
 	}
 	m.mu.Lock()
-	m.live = &liveState{
-		store:    store,
-		captures: captures,
-		handler:  web.New(store, captures, cfg),
-		cfg:      cfg,
-	}
+	m.live = m.newLiveState(store, captures, cfg)
 	m.state = stateLive
 	m.mu.Unlock()
 	m.startMaintenance(store, captures)
+}
+
+// newLiveState builds the serving snapshot and connects runtime diagnostics.
+func (m *Manager) newLiveState(store credit.Backend, captures *capture.Store, cfg config.Config) *liveState {
+	handler := web.New(store, captures, cfg)
+	handler.SetStatus(metadataVersion(), m.LastError)
+	return &liveState{store: store, captures: captures, handler: handler, cfg: cfg}
+}
+
+// activeChecker is optionally implemented by a credit backend that can report
+// whether any request is still awaiting settlement.
+type activeChecker interface {
+	HasActive(context.Context) (bool, error)
+}
+
+// storeActive reports whether the given snapshot has unfinished requests. known
+// is false when the backend does not implement the optional capability, so
+// callers never mistake "cannot tell" for "nothing outstanding".
+func storeActive(ctx context.Context, state *liveState) (known bool, active bool, err error) {
+	if state == nil || state.store == nil {
+		return false, false, nil
+	}
+	checker, ok := state.store.(activeChecker)
+	if !ok {
+		return false, false, nil
+	}
+	active, err = checker.HasActive(ctx)
+	return true, active, err
 }
 
 // enterExclusive takes the exclusive gate: it blocks every new handler call and
 // waits until the in-flight calls finish. Handlers are bounded local store
 // calls, so the wait terminates; a lifecycle transition therefore never swaps
 // or closes a store under an in-flight call.
-func (m *Manager) enterExclusive() error {
+func (m *Manager) enterExclusive() {
 	m.gate.Lock()
-	return nil
 }
 
 // exitExclusive releases the exclusive gate taken by enterExclusive.
@@ -370,21 +395,36 @@ func (m *Manager) detach() *liveState {
 	return previous
 }
 
-// closeLive releases the stores of a detached generation.
-func closeLive(state *liveState) {
-	if state == nil {
+// closeStore closes one credit backend and surfaces any error: a close failure
+// must never be silently discarded.
+func (m *Manager) closeStore(store credit.Backend) {
+	if store == nil {
 		return
 	}
-	if state.store != nil {
-		_ = state.store.Close()
-	}
-	if state.captures != nil {
-		_ = state.captures.Close()
+	if err := store.Close(); err != nil {
+		m.recordError(err)
 	}
 }
 
-// quiesce releases the database and drains in-flight calls. It is reversible: a
-// later reconfigure reopens the stores from the same configuration.
+// closeLive releases the stores of a detached snapshot, reporting close failures.
+func (m *Manager) closeLive(state *liveState) {
+	if state == nil {
+		return
+	}
+	m.closeStore(state.store)
+	if state.captures != nil {
+		if err := state.captures.Close(); err != nil {
+			m.recordError(err)
+		}
+	}
+}
+
+// quiesce refuses new admissions and prepares the plugin to be replaced.
+//
+// Settling a reserved request is never dropped: in-flight handler calls are
+// drained first, and the accounting database is released only when the backend
+// can prove it holds no unfinished request. Otherwise the stores stay open so
+// late usage and completion events still settle. Shutdown always releases them.
 func (m *Manager) quiesce() {
 	m.lifeMu.Lock()
 	defer m.lifeMu.Unlock()
@@ -394,17 +434,24 @@ func (m *Manager) quiesce() {
 		return
 	}
 	m.state = stateQuiesced
+	current := m.live
 	m.mu.Unlock()
 
-	if err := m.enterExclusive(); err != nil {
-		m.mu.Lock()
-		m.lastError = err.Error()
-		m.mu.Unlock()
-		return
-	}
+	m.enterExclusive()
 	defer m.exitExclusive()
 	m.stopMaintenance()
-	closeLive(m.detach())
+
+	known, active, err := storeActive(context.Background(), current)
+	if err != nil {
+		m.recordError(err)
+		return
+	}
+	if !known || active {
+		// Cannot prove the database is settled: keep it open so pending
+		// requests can still be completed instead of losing accounting.
+		return
+	}
+	m.closeLive(m.detach())
 }
 
 // shutdown releases the stores and makes the manager terminal. It is
@@ -420,20 +467,10 @@ func (m *Manager) shutdown() {
 	m.state = stateClosed
 	m.mu.Unlock()
 
-	if err := m.enterExclusive(); err != nil {
-		// A stuck handler must not leak the database: close it anyway once the
-		// exclusive gate eventually becomes available.
-		go func() {
-			m.gate.Lock()
-			m.stopMaintenance()
-			closeLive(m.detach())
-			m.gate.Unlock()
-		}()
-		return
-	}
+	m.enterExclusive()
 	defer m.exitExclusive()
 	m.stopMaintenance()
-	closeLive(m.detach())
+	m.closeLive(m.detach())
 }
 
 // startMaintenance launches the periodic credit and capture maintenance pass.

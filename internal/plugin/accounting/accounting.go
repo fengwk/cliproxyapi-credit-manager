@@ -97,9 +97,9 @@ func resultFromBreakdown(breakdown usage.TokenBreakdown) Result {
 		Total:      breakdown.TotalTokens,
 	}
 	return Result{
-		Tokens:    tokens,
-		Quality:   string(breakdown.Quality),
-		Complete:  breakdown.Quality == usage.TokenAccountingQualityComplete,
+		Tokens:   tokens,
+		Quality:  string(breakdown.Quality),
+		Complete: breakdown.Quality == usage.TokenAccountingQualityComplete,
 		Accounted: tokens.Total > 0 || tokens.Input > 0 || tokens.CacheRead > 0 ||
 			tokens.CacheWrite > 0 || tokens.Output > 0 || tokens.Reasoning > 0,
 	}
