@@ -230,6 +230,7 @@ func (m *Manager) apply(raw []byte, hostSchema uint32) ([]byte, error) {
 	}
 
 	m.mu.Lock()
+	previousState := m.state
 	closed := m.state == stateClosed
 	unchanged := m.live != nil && m.hasConfig && bytes.Equal(m.raw, raw)
 	previousHasConfig := m.hasConfig
@@ -240,8 +241,15 @@ func (m *Manager) apply(raw []byte, hostSchema uint32) ([]byte, error) {
 		return errorEnvelope(&PluginError{Code: "unavailable", Message: "plugin is shut down", HTTPStatus: http.StatusServiceUnavailable})
 	}
 	if unchanged {
-		// A host-wide synchronization may resend identical configuration.
-		return okEnvelope(reg)
+		// The host re-sends a configuration it already applied, both as a
+		// host-wide synchronization and as the rollback target of a failed
+		// reconfigure. Only a live plugin can confirm that: a quiesced plugin
+		// must actually resume its attached store, never report success while
+		// it still refuses every request.
+		if previousState == stateLive {
+			return okEnvelope(reg)
+		}
+		return m.resumeAttached(reg)
 	}
 	if previous != nil && previous.cfg.DataDir != cfg.DataDir {
 		// Moving the accounting database at runtime would strand the holds and
@@ -254,7 +262,7 @@ func (m *Manager) apply(raw []byte, hostSchema uint32) ([]byte, error) {
 		})
 	}
 
-	// Drain the warmup probe before anything else changes, and before the
+	// Pause the probe loop and retire it once its pass is idle, before the
 	// exclusive gate is taken.
 	//
 	// Two reasons: a customer request must not be refused (or the gate held)
@@ -263,11 +271,11 @@ func (m *Manager) apply(raw []byte, hostSchema uint32) ([]byte, error) {
 	// callbacks into this plugin, which must never be blocked behind a gate
 	// held by the transition that is waiting for that same probe.
 	//
-	// A probe that does not drain inside the grace is never abandoned: the swap
-	// is refused, the previous configuration and its worker keep running, and
-	// no second worker is ever started. This is a recoverable operator conflict
+	// A probe that does not go idle inside the grace is never abandoned: the
+	// swap is refused, the paused worker is resumed and the previous
+	// configuration keeps probing. This is a recoverable operator conflict
 	// rather than a warmup fault, so it does not degrade health.
-	if !m.drainWarmupForSwap() {
+	if !m.stopWarmupForSwap() {
 		return errorEnvelope(&PluginError{Code: "busy", Message: "a warmup probe is still in flight", HTTPStatus: http.StatusConflict})
 	}
 
@@ -276,9 +284,7 @@ func (m *Manager) apply(raw []byte, hostSchema uint32) ([]byte, error) {
 	// below sound: a reservation that started earlier must have committed
 	// before the old database is judged safe to release.
 	m.mu.Lock()
-	if m.state != stateClosed {
-		m.state = stateReconfiguring
-	}
+	m.state = stateReconfiguring
 	m.mu.Unlock()
 
 	m.enterExclusive()
@@ -293,9 +299,15 @@ func (m *Manager) apply(raw []byte, hostSchema uint32) ([]byte, error) {
 		m.recordError(errActive)
 	}
 	if errActive != nil || active {
+		// The refused swap must undo its own state change: a quiesced plugin
+		// stays quiesced, and only a plugin that goes back to live restarts the
+		// previous periodic warmup with exactly one replacement worker.
 		m.mu.Lock()
-		m.state = stateLive
+		m.state = previousState
 		m.mu.Unlock()
+		if previousState == stateLive && previous != nil {
+			m.startWarmup(previous.cfg.Warmup)
+		}
 		return errorEnvelope(&PluginError{Code: "busy", Message: "unfinished requests are still being settled", HTTPStatus: http.StatusConflict})
 	}
 
@@ -310,7 +322,7 @@ func (m *Manager) apply(raw []byte, hostSchema uint32) ([]byte, error) {
 		MaxPendingRequests: cfg.MaxPendingRequests,
 	})
 	if err != nil {
-		m.restore(previousRaw, previousHasConfig)
+		m.restore(previousRaw, previousHasConfig, previousState)
 		return errorEnvelope(&PluginError{Code: "storage_unavailable", Message: "credit storage unavailable", HTTPStatus: http.StatusServiceUnavailable})
 	}
 	// Capture is disposable: a capture failure degrades diagnostics only and
@@ -323,7 +335,7 @@ func (m *Manager) apply(raw []byte, hostSchema uint32) ([]byte, error) {
 		captures, err = capture.Open("", capture.Config{Enabled: false})
 		if err != nil {
 			m.closeStore(store)
-			m.restore(previousRaw, previousHasConfig)
+			m.restore(previousRaw, previousHasConfig, previousState)
 			return errorEnvelope(&PluginError{Code: "storage_unavailable", Message: "capture storage unavailable", HTTPStatus: http.StatusServiceUnavailable})
 		}
 	}
@@ -345,9 +357,14 @@ func (m *Manager) apply(raw []byte, hostSchema uint32) ([]byte, error) {
 }
 
 // restore best-effort reopens the configuration that was live before a failed
-// reconfigure. When it can not be reopened the plugin stays degraded and
+// reconfigure. When it can not be reopened the plugin stays quiesced and
 // refuses new accounting rather than serving unmetered requests.
-func (m *Manager) restore(raw []byte, hasConfig bool) {
+//
+// A successful reopen restores the state the plugin had before the swap, so a
+// refused reconfigure can never turn a quiesced plugin back into a live one.
+// Periodic maintenance and warmup restart only for a plugin that really serves
+// requests again.
+func (m *Manager) restore(raw []byte, hasConfig bool, previousState lifecycleState) {
 	m.mu.Lock()
 	m.state = stateQuiesced
 	m.mu.Unlock()
@@ -376,10 +393,40 @@ func (m *Manager) restore(raw []byte, hasConfig bool) {
 	}
 	m.mu.Lock()
 	m.live = m.newLiveState(store, captures, cfg)
-	m.state = stateLive
+	m.state = previousState
 	m.mu.Unlock()
+	if previousState != stateLive {
+		return
+	}
 	m.startMaintenance(store, captures)
 	m.startWarmup(cfg.Warmup)
+}
+
+// resumeAttached re-activates the configuration that is still attached after a
+// quiesce.
+//
+// The host brings a quiesced plugin back by re-sending the configuration it
+// already applied, so the attached store is reused instead of reopened:
+// requests that reserved money before the quiesce keep their association and
+// can still be settled, and periodic maintenance and warmup restart only
+// because the plugin is really serving again. It never reports success while
+// the plugin stays quiesced.
+func (m *Manager) resumeAttached(reg registration) ([]byte, error) {
+	m.mu.Lock()
+	if m.state != stateQuiesced || m.live == nil {
+		m.mu.Unlock()
+		return errorEnvelope(&PluginError{
+			Code:       "unavailable",
+			Message:    "plugin can not resume its previous configuration",
+			HTTPStatus: http.StatusServiceUnavailable,
+		})
+	}
+	current := m.live
+	m.state = stateLive
+	m.mu.Unlock()
+	m.startMaintenance(current.store, current.captures)
+	m.startWarmup(current.cfg.Warmup)
+	return okEnvelope(reg)
 }
 
 // newLiveState builds the serving snapshot and connects runtime diagnostics.
@@ -463,12 +510,13 @@ func (m *Manager) quiesce() {
 	current := m.live
 	m.mu.Unlock()
 
-	// Stop new probes before waiting on anything. A probe already inside the
-	// host is not awaited here: quiesce must not block on a synchronous host
-	// call it can not cancel, and the worker leaves on its own once that call
-	// returns. The worker reference stays installed so shutdown can wait for it
-	// before this library is unloaded.
-	m.cancelWarmup()
+	// Stop new probes, including the rest of a running pass, before waiting on
+	// anything. A probe already inside the host is not awaited here: quiesce
+	// must not block on a synchronous host call it can not cancel. The worker
+	// is paused, not retired, so a refused or resumed transition keeps exactly
+	// one probe loop and shutdown can still wait for it before this library is
+	// unloaded.
+	m.pauseWarmup()
 
 	m.enterExclusive()
 	defer m.exitExclusive()

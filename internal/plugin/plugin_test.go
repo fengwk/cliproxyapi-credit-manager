@@ -1252,3 +1252,84 @@ type activeBackend struct {
 }
 
 func (a activeBackend) HasActive(context.Context) (bool, error) { return a.active, a.err }
+
+// oneShotReserveFault fails only the first reservation it sees, so a test can
+// prove that one rejected request leaves the plugin admitting the next.
+type oneShotReserveFault struct {
+	credit.Backend
+	mu  sync.Mutex
+	err error
+}
+
+func (b *oneShotReserveFault) Reserve(ctx context.Context, in credit.ReserveInput) (credit.Request, error) {
+	b.mu.Lock()
+	err := b.err
+	b.err = nil
+	b.mu.Unlock()
+	if err != nil {
+		return credit.Request{}, err
+	}
+	return b.Backend.Reserve(ctx, in)
+}
+
+// TestConflictRejectionDoesNotBlockOtherKeys is the F02 regression: a
+// conflicting request id is a request-level outcome that refuses only that
+// request, while an unrecognized storage failure still fails closed for every
+// key.
+func TestConflictRejectionDoesNotBlockOtherKeys(t *testing.T) {
+	h := newHarness(t)
+	h.m.mu.Lock()
+	real := h.m.live.store
+	h.m.live.store = &oneShotReserveFault{Backend: real, err: credit.ErrConflict}
+	h.m.mu.Unlock()
+
+	// A: the conflicting request id is refused as 409, exactly like reserveStatus
+	// reports it.
+	response := h.intercept(h.request("req-conflict", "trace-conflict"))
+	if !response.Terminate || response.StatusCode != http.StatusConflict {
+		t.Fatalf("a conflicting request must be refused with 409, got %+v", response)
+	}
+	h.m.mu.Lock()
+	blocked := h.m.admissionBlocked
+	h.m.mu.Unlock()
+	if blocked {
+		t.Fatal("a conflicting request id must not block admissions for every key")
+	}
+	if message := h.m.LastError(); message != "" {
+		t.Fatalf("a conflicting request id must not degrade health: %q", message)
+	}
+
+	// B: the very next request is admitted and billed, so a conflict for one
+	// request never becomes a global block.
+	if response := h.intercept(h.request("req-next", "trace-next")); response.Terminate {
+		t.Fatalf("another request must still be admitted: %+v", response)
+	}
+	h.usage(pluginapi.UsageRecord{
+		RequestID: "exec-next", TraceID: "trace-next", Provider: "openai", Model: testModel,
+		APIKey: h.key.Principal, AccessProvider: "plugin:cliproxyapi-credit-manager:" + authProviderID,
+		Detail: pluginapi.UsageDetail{InputTokens: 1000, OutputTokens: 500, TotalTokens: 1500},
+	})
+	h.complete("req-next", "trace-next", pluginapi.RequestCompletionSucceeded)
+
+	// An unrecognized storage failure is a different class: it must fail closed
+	// for every key until the plugin is reconfigured.
+	h.m.mu.Lock()
+	h.m.live.store = faultBackend{Backend: real, reserveErr: errors.New("storage exploded")}
+	h.m.mu.Unlock()
+	response = h.intercept(h.request("req-fault", "trace-fault"))
+	if !response.Terminate || response.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("an unrecognized storage failure must be refused with 503, got %+v", response)
+	}
+	h.m.mu.Lock()
+	blocked = h.m.admissionBlocked
+	h.m.mu.Unlock()
+	if !blocked {
+		t.Fatal("an unrecognized storage failure must block admissions for every key")
+	}
+	if h.m.LastError() == "" {
+		t.Fatal("an unrecognized storage failure must be observable through health")
+	}
+	if response := h.intercept(h.request("req-after-fault", "trace-after-fault")); !response.Terminate {
+		t.Fatalf("admissions must stay fail-closed after an unrecognized storage failure: %+v", response)
+	}
+}

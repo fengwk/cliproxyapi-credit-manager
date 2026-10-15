@@ -100,19 +100,25 @@ billing gate): a background execution has no client AccessProvider, so
 `isOwnAccessProvider` rejects its usage before any ledger row is considered, and
 a customer request that forges the marker is still billed in full.
 
-Lifecycle limits, stated accurately: the worker is cancelled on quiesce,
-shutdown and any reconfigure, so no new probe starts; a probe already inside the
-synchronous, non-cancellable host callback can not be aborted. Reconfigure waits
-`warmupSwapGrace` (5s) for it and then refuses with 409 while keeping the old
-configuration and worker, so a stuck probe delays config reload instead of being
-abandoned or duplicated. `plugin.shutdown` waits for that callback without a
-bound before returning, because the host frees the callback context and
-dlclose()s the library immediately afterwards; with warmup enabled and an
-upstream that hangs, plugin shutdown and the hot reload behind it can therefore
-take as long as that request. Neither wait is held across the call gate, so
-customer requests are never blocked behind a probe. Enabling warmup is a real
-request against a real credential: it can observe upstream failures, which is
-the point, and it never excludes or reserves an account on its own.
+Lifecycle limits, stated accurately: quiesce, a disabled configuration and
+shutdown stop new probes, including the rest of a running pass. A probe already
+inside the synchronous, non-cancellable host callback can not be aborted, so a
+reconfigure waits `warmupSwapGrace` (5s) for the pass to go idle and otherwise
+refuses with 409 while the previous configuration and worker keep running: a
+refused reload never leaves the previous periodic warmup dead, never abandons a
+probe and never starts a second loop. A reload refused because requests are
+still settling restores the state it started from - a quiesced plugin stays
+quiesced, and only a plugin that goes back to live restarts the previous
+periodic warmup, with exactly one worker. Re-sending the configuration already
+applied resumes the attached store instead of reopening it, so requests that
+reserved money before a quiesce can still be settled. `plugin.shutdown` waits for
+that callback without a bound before returning, because the host frees the
+callback context and dlclose()s the library immediately afterwards; with warmup
+enabled and an upstream that hangs, plugin shutdown and the hot reload behind it
+can therefore take as long as that request. Neither wait is held across the call
+gate, so customer requests are never blocked behind a probe. Enabling warmup is
+a real request against a real credential: it can observe upstream failures,
+which is the point, and it never excludes or reserves an account on its own.
 
 ## Management HTTP contract
 

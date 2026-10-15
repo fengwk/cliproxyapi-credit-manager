@@ -212,6 +212,23 @@ func awaitDrained(t *testing.T, worker *warmupWorker) {
 	}
 }
 
+// awaitPassComplete waits until the worker has no probe pass in flight, so a
+// test can assert what a paused worker did or did not do afterwards.
+func awaitPassComplete(t *testing.T, worker *warmupWorker) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		worker.mu.Lock()
+		idle := worker.passDone == nil
+		worker.mu.Unlock()
+		if idle {
+			return
+		}
+		runtime.Gosched()
+	}
+	t.Fatal("the warmup pass never completed")
+}
+
 // awaitHealth waits until the sticky health message reports a warmup failure.
 func awaitHealth(t *testing.T, m *Manager) {
 	t.Helper()
@@ -238,7 +255,7 @@ func TestWarmupPassPinsTargetAndMarksSession(t *testing.T) {
 		{AuthID: "auth-claude", Provider: "anthropic", Model: "model-claude", Protocol: "claude"},
 		{AuthID: "auth-gemini", Provider: "google", Model: "model-gemini", Protocol: "gemini"},
 	}
-	if attempted := m.warmupPass(context.Background(), targets); attempted != len(targets) {
+	if attempted := m.warmupPass(context.Background(), fake.call, targets); attempted != len(targets) {
 		t.Fatalf("attempted = %d, want %d", attempted, len(targets))
 	}
 	probes := fake.recorded()
@@ -366,7 +383,8 @@ func TestWarmupWorkerStopsWhenReconfiguredOff(t *testing.T) {
 	fake := newFakeHost()
 	h := newWarmupHarness(t, fake, warmupEnabledOne)
 	awaitProbe(t, fake)
-	if h.m.warmupRunning() == nil {
+	worker := h.m.warmupRunning()
+	if worker == nil {
 		t.Fatal("an enabled warmup must install a worker")
 	}
 
@@ -374,9 +392,10 @@ func TestWarmupWorkerStopsWhenReconfiguredOff(t *testing.T) {
 	if !envelope.OK {
 		t.Fatalf("reconfigure with warmup disabled failed: %+v", envelope)
 	}
-	if worker := h.m.warmupRunning(); worker != nil {
+	if released := h.m.warmupRunning(); released != nil {
 		t.Fatal("the warmup worker must be released once warmup is disabled")
 	}
+	awaitDrained(t, worker)
 
 	frozen := len(fake.recorded())
 	if response := h.intercept(h.request("req-1", "trace-1")); response.Terminate {
@@ -454,13 +473,26 @@ func TestReconfigureRefusedWhileProbeInFlight(t *testing.T) {
 		t.Fatalf("customer request during a probe was not billed, spent = %d", key.SpentMicroUSD)
 	}
 
-	// Once the probe returns the worker drains, and the same reconfigure succeeds.
+	// A refused swap must not leave the previous periodic warmup dead: the
+	// same worker is resumed and probes again on its own.
 	fake.release()
-	awaitDrained(t, worker)
+	awaitPassComplete(t, worker)
+	awaitProbe(t, fake)
+	if h.m.warmupRunning() != worker {
+		t.Fatal("the resumed worker must stay the only probe loop")
+	}
+
+	// With no probe in flight the same reconfigure drains the worker and
+	// succeeds under the production grace.
+	warmupSwapGrace = previousGrace
 	envelope = reconfigureRaw(t, h.m, pluginabi.MethodPluginReconfigure, warmupYAML(h.dir, warmupDisabledBlock))
 	if !envelope.OK {
 		t.Fatalf("reconfigure after the probe drained failed: %+v", envelope)
 	}
+	if worker := h.m.warmupRunning(); worker != nil {
+		t.Fatal("a successful reconfigure must retire the worker")
+	}
+	awaitDrained(t, worker)
 }
 
 // TestShutdownWaitsForInFlightProbe proves plugin.shutdown never returns while
@@ -528,16 +560,24 @@ func TestQuiesceStopsProbesWithoutBlocking(t *testing.T) {
 	if envelope, err := h.m.HandleCall(pluginabi.MethodPluginQuiesce, nil); err != nil || len(envelope) == 0 {
 		t.Fatalf("quiesce failed: %s %v", envelope, err)
 	}
-	// The worker reference is kept so shutdown can still wait for it, and no
-	// second probe may be started.
+	// The worker is paused, not retired: it is kept so a later resume reuses it
+	// and shutdown can still wait for it before the library is unloaded.
 	if h.m.warmupRunning() != worker {
 		t.Fatal("quiesce must keep the worker reference for shutdown to drain")
 	}
 
 	fake.release()
-	awaitDrained(t, worker)
+	awaitPassComplete(t, worker)
+	// The paused worker aborts the rest of the running pass and issues nothing
+	// further, so the two-target configuration issues exactly one probe.
 	if probes := fake.recorded(); len(probes) != 1 {
 		t.Fatalf("quiesce must stop further probes, host calls = %d", len(probes))
+	}
+	worker.mu.Lock()
+	paused := worker.paused
+	worker.mu.Unlock()
+	if !paused {
+		t.Fatal("quiesce must leave the worker paused")
 	}
 }
 
@@ -613,5 +653,204 @@ func TestWarmupAttributionIsNotClientForgeable(t *testing.T) {
 	}
 	if after.SpentMicroUSD != charged.SpentMicroUSD || after.HeldMicroUSD != charged.HeldMicroUSD {
 		t.Fatalf("a background usage record changed the customer ledger: %+v -> %+v", charged, after)
+	}
+}
+
+// stateOf reads the lifecycle state without taking the exclusive gate.
+func stateOf(m *Manager) lifecycleState {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.state
+}
+
+// markStoreActive makes the attached store report unfinished requests, the way
+// a quiesce or a swap learns that the database may still hold reservations.
+func markStoreActive(t *testing.T, m *Manager) {
+	t.Helper()
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.live == nil {
+		t.Fatal("the plugin has no attached store")
+	}
+	m.live.store = activeBackend{Backend: m.live.store, active: true}
+}
+
+// TestReconfigureRefusedWhileQuiescedKeepsQuiesced is the F01 regression: a
+// reconfiguration refused because requests are still settling must not
+// un-quiesce the plugin, while re-sending the configuration already applied
+// must resume the attached store and restore service.
+func TestReconfigureRefusedWhileQuiescedKeepsQuiesced(t *testing.T) {
+	fake := newFakeHost()
+	fake.hold()
+	h := newWarmupHarness(t, fake, warmupEnabledOne)
+	awaitProbe(t, fake)
+	worker := h.m.warmupRunning()
+	if worker == nil {
+		t.Fatal("an enabled warmup must install a worker")
+	}
+	markStoreActive(t, h.m)
+	h.m.mu.Lock()
+	attached := h.m.live
+	h.m.mu.Unlock()
+
+	if _, err := h.m.HandleCall(pluginabi.MethodPluginQuiesce, nil); err != nil {
+		t.Fatalf("quiesce: %v", err)
+	}
+	if state := stateOf(h.m); state != stateQuiesced {
+		t.Fatalf("state after quiesce = %d, want quiesced", state)
+	}
+	fake.release()
+	awaitPassComplete(t, worker)
+	probes := len(fake.recorded())
+
+	envelope := reconfigureRaw(t, h.m, pluginabi.MethodPluginReconfigure, warmupYAML(h.dir, warmupDisabledBlock))
+	if envelope.OK || envelope.Error == nil || envelope.Error.HTTPStatus != http.StatusConflict {
+		t.Fatalf("an active-request reconfigure must be refused with 409, got %+v", envelope)
+	}
+	if state := stateOf(h.m); state != stateQuiesced {
+		t.Fatalf("a refused reconfiguration un-quiesced the plugin, state = %d", state)
+	}
+	response := h.intercept(h.request("req-quiesced", "trace-quiesced"))
+	if !response.Terminate || response.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("a quiesced plugin must keep refusing admission, got %+v", response)
+	}
+	if after := len(fake.recorded()); after != probes {
+		t.Fatalf("a refused swap of a quiesced plugin started warmup: %d -> %d", probes, after)
+	}
+	if h.m.warmupRunning() != nil {
+		t.Fatal("a refused swap of a quiesced plugin must not keep a probe loop")
+	}
+
+	// The host brings a quiesced plugin back by re-sending the configuration it
+	// already applied. The attached store must resume instead of being reopened,
+	// so requests that reserved money can still be settled, and the reported
+	// state must really be live again.
+	envelope = reconfigureRaw(t, h.m, pluginabi.MethodPluginReconfigure, warmupYAML(h.dir, warmupEnabledOne))
+	if !envelope.OK {
+		t.Fatalf("the rollback reconfiguration was refused: %+v", envelope)
+	}
+	if state := stateOf(h.m); state != stateLive {
+		t.Fatalf("state after the rollback reconfiguration = %d, want live", state)
+	}
+	h.m.mu.Lock()
+	resumed := h.m.live
+	h.m.mu.Unlock()
+	if resumed != attached {
+		t.Fatal("the rollback reconfiguration must resume the attached store, not reopen it")
+	}
+	if response := h.intercept(h.request("req-live", "trace-live")); response.Terminate {
+		t.Fatalf("a resumed plugin must accept admission: %+v", response)
+	}
+	if h.m.warmupRunning() == nil {
+		t.Fatal("a resumed plugin must restart its periodic warmup")
+	}
+	awaitProbe(t, fake)
+}
+
+// TestReconfigureRefusedByActiveRequestsKeepsWarmup is the F04 regression: a
+// reconfiguration refused after the probe loop was already retired must restore
+// the previous periodic warmup, with exactly one probe per pass.
+func TestReconfigureRefusedByActiveRequestsKeepsWarmup(t *testing.T) {
+	fake := newFakeHost()
+	h := newWarmupHarness(t, fake, warmupEnabledOne)
+	awaitProbe(t, fake)
+	markStoreActive(t, h.m)
+
+	envelope := reconfigureRaw(t, h.m, pluginabi.MethodPluginReconfigure, warmupYAML(h.dir, warmupDisabledBlock))
+	if envelope.OK || envelope.Error == nil || envelope.Error.HTTPStatus != http.StatusConflict {
+		t.Fatalf("an active-request reconfigure must be refused with 409, got %+v", envelope)
+	}
+	if state := stateOf(h.m); state != stateLive {
+		t.Fatalf("a refused swap of a live plugin must stay live, state = %d", state)
+	}
+	if h.m.warmupRunning() == nil {
+		t.Fatal("a refused swap must keep the previous periodic warmup running")
+	}
+	// The previous configuration is still enabled, so it probes again.
+	awaitProbe(t, fake)
+	if probes := len(fake.recorded()); probes != 2 {
+		t.Fatalf("the restored warmup issued %d probes, want exactly 1 per pass", probes)
+	}
+
+	// A repeated refusal must not multiply the probe loop either.
+	envelope = reconfigureRaw(t, h.m, pluginabi.MethodPluginReconfigure, warmupYAML(h.dir, warmupDisabledBlock))
+	if envelope.OK || envelope.Error == nil || envelope.Error.HTTPStatus != http.StatusConflict {
+		t.Fatalf("the repeated reconfiguration must be refused with 409, got %+v", envelope)
+	}
+	if h.m.warmupRunning() == nil {
+		t.Fatal("a repeated refusal must keep a probe loop")
+	}
+	awaitProbe(t, fake)
+	if probes := len(fake.recorded()); probes != 3 {
+		t.Fatalf("a repeated refusal multiplied the probe loop, probes = %d", probes)
+	}
+	if got := fake.inFlightCount(); got > 1 {
+		t.Fatalf("warmup ran %d probes at once", got)
+	}
+}
+
+// TestReconfigureWhileQuiescedReplacesTheProbeLoopOnce proves a successful
+// reconfiguration retires the paused worker and installs exactly one loop for
+// the new configuration.
+func TestReconfigureWhileQuiescedReplacesTheProbeLoopOnce(t *testing.T) {
+	fake := newFakeHost()
+	fake.hold()
+	h := newWarmupHarness(t, fake, warmupEnabledOne)
+	awaitProbe(t, fake)
+	old := h.m.warmupRunning()
+	if old == nil {
+		t.Fatal("an enabled warmup must install a worker")
+	}
+
+	if _, err := h.m.HandleCall(pluginabi.MethodPluginQuiesce, nil); err != nil {
+		t.Fatalf("quiesce: %v", err)
+	}
+	fake.release()
+	awaitPassComplete(t, old)
+
+	envelope := reconfigureRaw(t, h.m, pluginabi.MethodPluginReconfigure, warmupYAML(h.dir, warmupEnabledTwo))
+	if !envelope.OK {
+		t.Fatalf("reconfigure while quiesced failed: %+v", envelope)
+	}
+	if state := stateOf(h.m); state != stateLive {
+		t.Fatalf("state after a successful reconfigure = %d, want live", state)
+	}
+	next := h.m.warmupRunning()
+	if next == nil || next == old {
+		t.Fatal("a successful reconfigure must replace the retired probe loop exactly once")
+	}
+	awaitDrained(t, old)
+	// The new two-target configuration probes both targets in one pass.
+	awaitProbe(t, fake)
+	awaitProbe(t, fake)
+	if probes := len(fake.recorded()); probes != 3 {
+		t.Fatalf("probes = %d, want the held probe plus the two new targets", probes)
+	}
+}
+
+// TestUnchangedReconfigureKeepsTheSameWorker proves a host-wide
+// synchronization, or a rollback that re-sends the current configuration, does
+// not restart or multiply the probe loop.
+func TestUnchangedReconfigureKeepsTheSameWorker(t *testing.T) {
+	fake := newFakeHost()
+	h := newWarmupHarness(t, fake, warmupEnabledOne)
+	awaitProbe(t, fake)
+	worker := h.m.warmupRunning()
+	if worker == nil {
+		t.Fatal("an enabled warmup must install a worker")
+	}
+
+	registered := warmupYAML(h.dir, warmupEnabledOne)
+	for attempt := 0; attempt < 3; attempt++ {
+		envelope := reconfigureRaw(t, h.m, pluginabi.MethodPluginReconfigure, registered)
+		if !envelope.OK {
+			t.Fatalf("unchanged reconfiguration %d failed: %+v", attempt, envelope)
+		}
+		if h.m.warmupRunning() != worker {
+			t.Fatalf("unchanged reconfiguration %d restarted the probe loop", attempt)
+		}
+	}
+	if probes := len(fake.recorded()); probes != 1 {
+		t.Fatalf("unchanged reconfigurations issued extra probes: %d", probes)
 	}
 }
