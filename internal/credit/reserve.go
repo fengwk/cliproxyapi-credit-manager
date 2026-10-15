@@ -1,0 +1,239 @@
+package credit
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"strings"
+	"time"
+)
+
+// Reserve admits one execution. It is idempotent by lifecycle ID and persists
+// the trace/key binding before any execution starts.
+func (s *Store) Reserve(ctx context.Context, in ReserveInput) (Request, error) {
+	if strings.TrimSpace(in.ID) == "" || strings.TrimSpace(in.TraceID) == "" ||
+		strings.TrimSpace(in.KeyID) == "" || strings.TrimSpace(in.RequestedModel) == "" {
+		return Request{}, fmt.Errorf("%w: id, trace id, key id and requested model are required", ErrInvalid)
+	}
+	if in.InputEstimate < 0 || in.OutputEstimate < 0 {
+		return Request{}, fmt.Errorf("%w: token estimates must not be negative", ErrInvalid)
+	}
+	estimate, err := checkedAdd(in.InputEstimate, in.OutputEstimate)
+	if err != nil {
+		return Request{}, err
+	}
+	at := s.resolveAt(in.At)
+	var out Request
+	err = s.inTx(ctx, func(tx *sql.Tx) error {
+		existing, err := loadRequestByID(ctx, tx, in.ID)
+		switch {
+		case err == nil:
+			if existing.traceID != in.TraceID || existing.keyID != in.KeyID || existing.model != in.RequestedModel {
+				return fmt.Errorf("%w: lifecycle id already bound to another request", ErrConflict)
+			}
+			out = existing.toRequest(nil)
+			return nil
+		case errors.Is(err, ErrNotFound):
+		default:
+			return err
+		}
+		if _, err := loadRequestByTrace(ctx, tx, in.TraceID); err == nil {
+			return fmt.Errorf("%w: trace id already bound to another request", ErrConflict)
+		} else if !errors.Is(err, ErrNotFound) {
+			return err
+		}
+		key, err := loadKey(ctx, tx, "id = ?", in.KeyID)
+		if err != nil {
+			return err
+		}
+		if err := hydrateLimits(ctx, tx, key); err != nil {
+			return err
+		}
+		if !key.spec.Enabled {
+			return ErrUnauthorized
+		}
+		if key.spec.ExpiresAt != nil && !at.Before(*key.spec.ExpiresAt) {
+			return ErrUnauthorized
+		}
+		if !modelAllowed(key.spec.AllowedModels, in.RequestedModel) {
+			return fmt.Errorf("%w: model %s is not allowed for this key", ErrDenied, in.RequestedModel)
+		}
+		price, err := lookupPrice(ctx, tx, in.RequestedModel)
+		if err != nil {
+			return err
+		}
+		hold, err := computeCost(price, Tokens{
+			Input:  in.InputEstimate,
+			Output: in.OutputEstimate,
+			Total:  estimate,
+		})
+		if err != nil {
+			return err
+		}
+		if err := s.checkMoneyLimits(ctx, tx, key, at, hold); err != nil {
+			return err
+		}
+		if err := s.checkConcurrency(ctx, tx, key); err != nil {
+			return err
+		}
+		if err := s.checkBacklog(ctx, tx, key); err != nil {
+			return err
+		}
+		if err := s.checkTokenLimits(ctx, tx, key, in.RequestedModel, estimate, at); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO requests
+			(id, trace_id, key_id, model, state, outcome, status_code, started_at, completed_at,
+			 held_micro_usd, price_input, price_output, price_reasoning, price_cache_read,
+			 price_cache_write, price_version, token_estimate, charge_micro_usd, resolved)
+			VALUES(?,?,?,?,?,'',0,?,NULL,?,?,?,?,?,?,?,?,0,'')`,
+			in.ID, in.TraceID, in.KeyID, in.RequestedModel, stateActive, unixNano(at), hold,
+			price.Rates.Input, price.Rates.Output, price.Rates.Reasoning, price.Rates.CacheRead,
+			price.Rates.CacheWrite, price.Version, estimate); err != nil {
+			return fmt.Errorf("insert request: %w", err)
+		}
+		if hold != 0 {
+			if _, err := tx.ExecContext(ctx, `UPDATE keys SET held_micro_usd = held_micro_usd + ? WHERE id = ?`,
+				hold, key.id); err != nil {
+				return fmt.Errorf("update key hold: %w", err)
+			}
+		}
+		out = Request{
+			ID:           in.ID,
+			TraceID:      in.TraceID,
+			KeyID:        in.KeyID,
+			Model:        in.RequestedModel,
+			State:        stateActive,
+			StartedAt:    at,
+			HeldMicroUSD: hold,
+			Price:        price,
+			Executions:   []Usage{},
+		}
+		return nil
+	})
+	if err != nil {
+		return Request{}, err
+	}
+	return out, nil
+}
+
+func (s *Store) checkMoneyLimits(ctx context.Context, tx *sql.Tx, key *keyRow, at time.Time, hold int64) error {
+	if quota := key.spec.QuotaMicroUSD; quota > 0 {
+		committed, err := checkedAdd(key.spent, key.held)
+		if err != nil {
+			return err
+		}
+		total, err := checkedAdd(committed, hold)
+		if err != nil {
+			return err
+		}
+		if total > quota {
+			return fmt.Errorf("%w: lifetime monetary limit reached", ErrQuota)
+		}
+	}
+	limits := []struct {
+		win   string
+		limit int64
+	}{
+		{windowDay, key.spec.DailyMicroUSD},
+		{windowWeek, key.spec.WeeklyMicroUSD},
+		{windowMonth, key.spec.MonthlyMicroUSD},
+	}
+	for _, l := range limits {
+		if l.limit <= 0 {
+			continue
+		}
+		spent, err := moneyCounter(ctx, tx, key.id, l.win, periodOf(l.win, at))
+		if err != nil {
+			return err
+		}
+		total, err := checkedAdd(spent, hold)
+		if err != nil {
+			return err
+		}
+		if total > l.limit {
+			return fmt.Errorf("%w: %s monetary limit reached", ErrQuota, l.win)
+		}
+	}
+	return nil
+}
+
+func (s *Store) checkConcurrency(ctx context.Context, tx *sql.Tx, key *keyRow) error {
+	if key.spec.MaxConcurrent <= 0 {
+		return nil
+	}
+	active, err := counterValue(ctx, tx,
+		`SELECT COUNT(*) FROM requests WHERE key_id = ? AND state = ?`, key.id, stateActive)
+	if err != nil {
+		return err
+	}
+	if active >= key.spec.MaxConcurrent {
+		return fmt.Errorf("%w: %d active executions", ErrConcurrency, active)
+	}
+	return nil
+}
+
+// checkBacklog bounds unresolved requests per key (active + pending), which is
+// what must be reconciled before more work is admitted.
+func (s *Store) checkBacklog(ctx context.Context, tx *sql.Tx, key *keyRow) error {
+	unresolved, err := counterValue(ctx, tx,
+		`SELECT COUNT(*) FROM requests WHERE key_id = ? AND state IN (?,?)`,
+		key.id, stateActive, statePending)
+	if err != nil {
+		return err
+	}
+	if unresolved >= int64(s.maxPending) {
+		return fmt.Errorf("%w: %d unresolved requests for key", ErrPending, unresolved)
+	}
+	return nil
+}
+
+// checkTokenLimits enforces durable model token budgets using consumed tokens
+// plus the admission estimates of unresolved requests.
+func (s *Store) checkTokenLimits(ctx context.Context, tx *sql.Tx, key *keyRow, model string, estimate int64, at time.Time) error {
+	var limit *ModelTokenLimit
+	for i := range key.spec.ModelTokenLimits {
+		if key.spec.ModelTokenLimits[i].Model == model {
+			limit = &key.spec.ModelTokenLimits[i]
+			break
+		}
+	}
+	if limit == nil {
+		return nil
+	}
+	reserved, err := reservedTokens(ctx, tx, key.id, model)
+	if err != nil {
+		return err
+	}
+	admit, err := checkedAdd(reserved, estimate)
+	if err != nil {
+		return err
+	}
+	windows := []struct {
+		win   string
+		limit int64
+	}{
+		{windowTotal, limit.Total},
+		{windowDay, limit.Daily},
+		{windowWeek, limit.Weekly},
+		{windowMonth, limit.Monthly},
+	}
+	for _, w := range windows {
+		if w.limit <= 0 {
+			continue
+		}
+		used, err := tokenCounter(ctx, tx, key.id, model, w.win, periodOf(w.win, at))
+		if err != nil {
+			return err
+		}
+		total, err := checkedAdd(used, admit)
+		if err != nil {
+			return err
+		}
+		if total > w.limit {
+			return fmt.Errorf("%w: %s token limit reached for model %s", ErrQuota, w.win, model)
+		}
+	}
+	return nil
+}
