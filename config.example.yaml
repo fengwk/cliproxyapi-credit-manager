@@ -13,15 +13,15 @@ server:
   host: "127.0.0.1"
   port: 8317
 
-# 管理接口。保持关闭远程访问、关闭自带控制面板：财务界面由插件资源路由提供。
+# 管理接口。默认只允许本机管理；插件界面独立于 CPA 自带控制面板。
 management:
   allow-remote: false
   secret-key: "replace-with-management-password"
-  disable-control-panel: true
+  disable-control-panel: false
 
 # CPA 原生客户端 Key。本插件是独占式前端鉴权提供方，真正对外分发的只有插件
-# 内的客户端 Key；这里保留一项是为了满足宿主对原生鉴权的既有结构，属于“部署
-# 守卫”，必须保密，绝不能分发给任何调用方。详见 docs/operations.md 的“安全边界”。
+# 内的客户端 Key；这里保留一把未分发的“部署守卫”，确保插件缺失时仍拒绝客户 Key。
+# 原生 Key 列表为空可能放行匿名请求；分发原生 Key 则能绕过插件计费，两者都不安全。
 access:
   api-keys:
     - "replace-with-undistributed-cpa-native-key"

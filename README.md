@@ -5,8 +5,9 @@ CLIProxyAPI v8 的**原生插件**：用插件自建的客户端 Key 做前端�
 
 - **它做什么**：独占式客户端鉴权、按模型单价记账、Key/额度/价格管理、用量报表、
   可选的一次性请求快照（诊断用）。
-- **它不做什么**：不执行、不路由、不调度任何模型请求；不修改转发给上游的报文、请求头
+- **它不做什么**：不接管普通模型请求的执行、路由或调度；不修改转发给上游的报文、请求头
   或账号选择；不管理上游凭据；不改动任何其它 provider 的页面或表单。
+  可选后台预热默认关闭，启用后会通过宿主执行真实探测请求。
 
 ## 环境要求
 
@@ -40,6 +41,9 @@ cp cliproxyapi-credit-manager.so  "$CPA_DIR/plugins/linux/amd64/"
 [`config.example.yaml`](config.example.yaml)）：
 
 ```yaml
+access:
+  api-keys:
+    - "REPLACE-WITH-STRONG-UNDISTRIBUTED-GUARD-KEY"
 plugins:
   enabled: true
   dir: "./plugins"
@@ -48,6 +52,10 @@ plugins:
       enabled: true
       data_dir: "./data/cliproxyapi-credit-manager"
 ```
+
+**必须保留一把从未分发的 CPA 原生守卫 Key。** 不要把插件 Key 写入
+`access.api-keys`；原生 Key 列表为空时，插件缺失可能导致 CPA 放行匿名请求。
+客户端只能使用插件签发的 Key。首次部署要验证“插件禁用 → 客户 Key 被拒绝”。
 
 **4. 重启 CPA**：宿主加载库并调用插件的注册流程（`plugin.register`）。
 
@@ -132,13 +140,17 @@ curl -sS 'http://127.0.0.1:8317/v0/management/plugins/credit-manager/api/usage?f
   `output`（**不含** reasoning）、`reasoning`（未配置费率时按 `output`）。
 - 各桶分别按单价相乘后用大整数精确求和，**只在最后向上取整一次**。
 - 未知或不可信的用量**不会按 0 结算**：请求保持 `pending` 并保留金额占用，等管理员裁决。
+- 预授权使用请求字节数和输出上限做估算，**不是最终账单的硬上限**。真实用量超过估算
+  仍会扣费并阻止后续超额准入；终身/当前周期计数独立保存，清理历史不会恢复额度。
+- CPA 的用量投递队列仅在内存中。本插件保证已接收账务事务的原子性与保留期内幂等，
+  **不承诺宿主崩溃时事件不丢失，也不承诺端到端 exactly-once 计费**。
 
 ## 安全边界（务必阅读）
 
-- **插件是安全控制，不是可选项**：插件没加载（`plugins.enabled: false` 或库缺失）时，
-  所有插件 Key 在全部五个鉴权位置都会被拒绝——也就是 **fail closed**，不会回退到 CPA
-  原生的 `access.api-keys`。因此 **CPA 原生 Key 必须保密、不得分发给调用方**，它只是
-  部署守卫。
+- **守卫部署是 fail-closed 的前提**：保留至少一把从未分发的 CPA 原生 Key，且客户
+  Key 仅存在于本插件时，插件没加载（`plugins.enabled: false` 或库缺失）仍会拒绝客户
+  Key。这不是插件在缺席时仍能执行鉴权；是 CPA 原生守卫拒绝未知 Key。原生 Key 列表
+  为空可能放行匿名请求；分发原生 Key 则允许绕过插件计费，二者都不安全。
 - **客户端 Key 只存在于插件内**：数据库里保存的是 HMAC 校验值，明文不落库；校验依赖
   数据目录中的 `pepper`（权限 0600，首次启动自动生成）。
 - **管理密钥只存在于内存**：界面不写 `localStorage`/`sessionStorage`/Cookie，也不放进

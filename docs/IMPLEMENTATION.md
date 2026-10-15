@@ -26,6 +26,8 @@ No compatibility with the prior implementation. No CPA/provider edits.
 Key material HMAC verified, private pepper persisted mode0600. Internal Principal
 `cmk:<UUID>` and SDK session.CallerScope stable. Material omitted from all
 stored/returned KeySpec objects. Generate sk- plus 48 unbiased alphanumerics.
+Custom material is opaque, 8..4096 UTF-8 bytes, with no control characters or
+leading/trailing whitespace. Creation and rotation share the same validation.
 0 monetary limit/concurrency means unlimited. Enabled explicit true/false.
 AllowedModels empty=all, otherwise exact IDs (no fuzzy/slash-prefix inference).
 ModelTokenLimits exact requested IDs, 0=unlimited. Durable lifetime/UTC period
@@ -49,8 +51,13 @@ stopped/pending, not free. Administrator Resolve accepts release or charge with 
 mandatory reason; ledger adjustments append, no silent reprice, and the report
 shows execution cost and administrator adjustments as separate figures (an
 adjustment is never merged into an execution's cost).
+Resolve only accepts pending requests, never active executions. A manually closed
+request stays closed after late completion. An automatically closed request that
+receives late unknown usage reopens pending and restores its original hold.
 Only associated requests may accept usage; after retention purge, unknown old
 events cannot resurrect requests. Unresolved requests retain necessary rows.
+Deduplication is limited to retained history; replaying an entire expired
+Reserve/Usage/Complete lifecycle is unsupported. No permanent event journal is kept.
 Cleanup default 3 calendar months UTC (clamp day at month end), batch deletes
 closed history, keeps durable counters. incremental_vacuum + WAL TRUNCATE; busy
 must be observable. One DB connection, bounded transactions and no external MQ.
