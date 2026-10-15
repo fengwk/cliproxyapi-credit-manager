@@ -1,0 +1,104 @@
+#!/usr/bin/env python3
+"""Real-native CPA acceptance harness for the credit-manager plugin.
+
+Usage:
+  python3 run_acceptance.py --cpa <cpa-binary> --plugin <plugin-library> \
+      --artifacts <tmpdir> [--only <substring>] [--modules core,accounting,...]
+
+The harness launches an isolated CLIProxyAPI host (random loopback port,
+synthetic management secret, synthetic client keys) with the plugin library and
+a loopback upstream mock. It never reads real profiles, credentials or
+databases, and never contacts an external account. Every child process is
+stopped in a finally block and a result.json is always written.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+import time
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+
+from acceptance.context import Context, load_specs  # noqa: E402
+from acceptance.report import Recorder  # noqa: E402
+
+DEFAULT_MODULES = ["abi", "core", "accounting", "auth", "capture", "report", "lifecycle", "retry", "gemini", "browser"]
+
+
+def parse_args(argv):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--cpa", required=True)
+    parser.add_argument("--plugin", required=True)
+    parser.add_argument("--artifacts", required=True)
+    parser.add_argument("--plugin-id", default="credit-manager")
+    parser.add_argument("--only", default="", help="run only cases whose name contains this substring")
+    parser.add_argument("--modules", default="", help="comma separated case module names (default: all present)")
+    return parser.parse_args(argv)
+
+
+def available_modules():
+    directory = HERE / "acceptance" / "cases"
+    return sorted(path.stem for path in directory.glob("*.py") if path.stem != "__init__")
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    artifacts = Path(args.artifacts)
+    artifacts.mkdir(parents=True, exist_ok=True)
+    recorder = Recorder(artifacts)
+
+    modules = [m for m in (args.modules.split(",") if args.modules else DEFAULT_MODULES) if m]
+    modules = [m for m in modules if (HERE / "acceptance" / "cases" / f"{m}.py").exists()]
+    specs = load_specs(modules, only=args.only)
+
+    ctx = Context(artifacts, Path(args.cpa), Path(args.plugin), plugin_id=args.plugin_id)
+    build = {"cpa": str(Path(args.cpa).resolve()), "plugin": str(Path(args.plugin).resolve()),
+             "modules": modules, "cases_planned": len(specs)}
+
+    started = time.time()
+    host_started = False
+    try:
+        ctx.mock.start()
+        ctx.build_host(root=artifacts / "host")
+        ctx.host.start()
+        host_started = True
+        ctx.wire_clients()
+        # Persist the raw host registration for evidence.
+        try:
+            raw = ctx.host.plugin_registration()
+            (artifacts / "host-plugins.json").write_text(json.dumps(raw, indent=2))
+        except Exception as error:  # noqa: BLE001
+            (artifacts / "host-plugins.error.txt").write_text(str(error))
+
+        for spec in specs:
+            record = recorder.run(spec["name"], lambda fn=spec["fn"]: fn(ctx), spec["expects"], mock=ctx.mock)
+            status = "PASS" if record["pass"] else "FAIL"
+            print(f"[{status}] {spec['name']}", file=sys.stderr)
+    except Exception as error:  # noqa: BLE001 - boot failure is itself a result
+        build["boot_error"] = f"{type(error).__name__}: {error}"
+        print(f"[BOOT-FAIL] {error}", file=sys.stderr)
+    finally:
+        if host_started:
+            ctx.host.stop()
+        ctx.mock.stop()
+
+    extra = {
+        "build": build,
+        "elapsed_s": round(time.time() - started, 3),
+        "host_root": str(artifacts / "host"),
+        "host_log": str(artifacts / "host" / "host.log"),
+    }
+    payload = recorder.write(artifacts / "result.json", extra=extra)
+    print(json.dumps(payload["summary"]), file=sys.stderr)
+    # Exit non-zero only when cases ran and failed, so build/run status is separable.
+    if build.get("boot_error"):
+        return 2
+    return 0 if payload["summary"]["failed"] == 0 else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
