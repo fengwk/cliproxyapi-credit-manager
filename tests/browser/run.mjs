@@ -15,7 +15,7 @@ import { fileURLToPath } from 'node:url';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ARTIFACTS = process.env.CM_ARTIFACTS_DIR
   ? path.resolve(process.env.CM_ARTIFACTS_DIR)
-  : path.resolve(__dirname, '..', '..', '..', 'artifacts');
+  : path.resolve(__dirname, '..', '..', '..', 'artifacts-final');
 const SHOTS = path.join(ARTIFACTS, 'screenshots');
 const CHROME = process.env.CHROME_BIN || '/usr/bin/google-chrome-stable';
 const MANAGEMENT_KEY = 'cm-mock-key';
@@ -283,9 +283,41 @@ async function main() {
 
     const summaryText = await cdp.text('#usage-summary');
     check('汇总卡片区分请求数与执行数', summaryText.includes('请求数') && summaryText.includes('执行数'));
-    check('成本按微美元精确渲染大整数', summaryText.includes('123456789012.345678 USD'), summaryText.replace(/\n/g, ' ').slice(0, 160));
+    check('执行成本按微美元精确渲染大整数', summaryText.includes('123456789012.345678 USD'), summaryText.replace(/\n/g, ' ').slice(0, 200));
+    const summaryLabels = await cdp.evaluate("[...document.querySelectorAll('#usage-summary .metric-label')].map((n) => n.textContent.trim())");
+    check(
+      '汇总卡片标签准确（失败请求/未结算请求/执行成本/人工补记）',
+      JSON.stringify(summaryLabels.slice(0, 6)) ===
+        JSON.stringify(['请求数（Request 行）', '执行数（实际执行）', '失败请求', '未结算请求', '执行成本', '人工补记']) &&
+        summaryLabels.indexOf('失败执行') < 0 &&
+        summaryLabels.indexOf('待定请求') < 0 &&
+        summaryLabels.indexOf('成本合计') < 0,
+      JSON.stringify(summaryLabels)
+    );
+    check(
+      '失败请求说明按请求结果统计',
+      summaryText.includes('按请求结果统计（failed / canceled / rejected）'),
+      summaryText.replace(/\n/g, ' ').slice(0, 240)
+    );
+    check(
+      '未结算请求说明已知用量照常入账',
+      summaryText.includes('未结算请求') && summaryText.includes('已知用量照常入账，未知部分待核账') && !summaryText.includes('不计入成本'),
+      summaryText.replace(/\n/g, ' ').slice(0, 240)
+    );
+    check(
+      '执行成本与人工补记分成两张卡片',
+      summaryText.includes('执行成本') && summaryText.includes('人工补记') && summaryText.includes('不计入执行成本'),
+      summaryText.replace(/\n/g, ' ').slice(0, 240)
+    );
+    check('人工补记按微美元精确渲染', summaryText.includes('2.5 USD') && summaryText.includes('2,500,000 µUSD'), summaryText.replace(/\n/g, ' ').slice(0, 240));
     check('汇总包含 token 分桶与缓存占比', summaryText.includes('缓存读占比') && summaryText.includes('tokens 合计'));
-    check('质量覆盖说明基于 complete 执行', (await cdp.text('#usage-quality-note')).includes('complete'));
+    const scopeNote = await cdp.text('#usage-quality-note');
+    check('质量覆盖说明基于 complete 执行', scopeNote.includes('complete'));
+    check(
+      '口径说明不把筛选合计当作全 Key 账本',
+      scopeNote.includes('不等于全 Key 账本支出') && scopeNote.includes('人工补记按请求汇总'),
+      scopeNote.slice(0, 240)
+    );
 
     // 登录只允许加载需要立即展示的接口：其它标签页必须等到点击才请求。
     const afterLogin = await hits();
@@ -306,13 +338,48 @@ async function main() {
     check('展示保留边界', (await cdp.text('#usage-retention')).includes('2026-07-01'));
     check('趋势图渲染 SVG 柱状与成本折线', (await cdp.count('#usage-chart svg rect')) === 8 && (await cdp.count('#usage-chart svg path.cost-line')) === 1);
     check('趋势图例区分请求与执行', (await cdp.text('#usage-legend')).includes('执行次数'));
+    check(
+      '趋势成本线标注为不含人工补记的执行成本',
+      (await cdp.text('#usage-legend')).includes('执行成本') && (await cdp.text('#usage-legend')).includes('不含人工补记'),
+      await cdp.text('#usage-legend')
+    );
 
     const itemsText = await cdp.text('#usage-items');
     check('明细标注请求/执行/响应模型', itemsText.includes('请求模型') && itemsText.includes('执行模型') && itemsText.includes('响应模型'));
     check('命名空间差异仅提示不当作异常', itemsText.includes('仅命名空间前缀不同'), itemsText.slice(0, 200));
-    check('缓存成本缺失时显示未结算', itemsText.includes('未结算'));
+    // 质量非完整（partial/unknown）且服务端未给金额时必须是「未结算」，不能显示 0。
+    const execCosts = await cdp.evaluate(
+      "(() => { const cards = [...document.querySelectorAll('#usage-items .card')];" +
+        " const pick = (id) => { const card = cards.find((c) => c.innerText.indexOf(id) >= 0); if (!card) return null;" +
+        " return [...card.querySelectorAll('tbody tr')].map((r) => { const tds = [...r.querySelectorAll('td')];" +
+        " return { quality: tds[5] ? tds[5].innerText.trim() : '', cost: tds[6] ? tds[6].innerText.replace(/\\n/g, ' ') : '' }; }); };" +
+        " return { unknown: pick('req-002'), partial: pick('req-005') }; })()"
+    );
+    check(
+      '未知质量且无金额时显示未结算而不是 0',
+      !!execCosts.unknown &&
+        execCosts.unknown[0].quality.indexOf('未知') >= 0 &&
+        execCosts.unknown[0].cost.indexOf('未结算') >= 0 &&
+        execCosts.unknown[0].cost.indexOf('质量非完整（unknown）') >= 0 &&
+        execCosts.unknown[0].cost.indexOf('不是 0') >= 0,
+      JSON.stringify(execCosts.unknown)
+    );
+    check(
+      '非完整质量但有已知金额时照常显示金额',
+      !!execCosts.partial &&
+        execCosts.partial[0].quality.indexOf('部分') >= 0 &&
+        execCosts.partial[0].cost.indexOf('USD') >= 0 &&
+        execCosts.partial[0].cost.indexOf('未结算') < 0,
+      JSON.stringify(execCosts.partial)
+    );
     check('显式全零价格显示免费', itemsText.includes('显式全零：免费'));
     check('待定请求提供财务处理入口', itemsText.includes('处理待定'));
+    check('只有 pending 请求提供人工处理入口', (await cdp.count('#usage-items button:not([disabled])')) > 0 && (await cdp.evaluate("[...document.querySelectorAll('#usage-items .card')].filter((c) => [...c.querySelectorAll('button')].some((b) => b.textContent.trim() === '处理待定')).length")) === 1);
+    check(
+      '进行中的请求不显示人工处理入口',
+      await cdp.evaluate("(() => { const cards = [...document.querySelectorAll('#usage-items .card')]; const active = cards.find((c) => c.innerText.includes('req-007')); return !!active && ![...active.querySelectorAll('button')].some((b) => b.textContent.trim() === '处理待定'); })()")
+    );
+    check('请求卡片展示人工补记而不是隐藏', itemsText.includes('人工补记（adjustment_micro_usd）') && itemsText.includes('人工补记 2.5 USD'), itemsText.replace(/\n/g, ' ').slice(0, 240));
     check('执行行区分质量状态', itemsText.includes('完整') && itemsText.includes('部分') && itemsText.includes('未知'), itemsText.slice(0, 200));
     check('结果与状态按契约枚举显示为中文', itemsText.includes('成功') && itemsText.includes('失败') && itemsText.includes('拒绝') && itemsText.includes('已结算') && itemsText.includes('待定'), itemsText.slice(0, 200));
     check('服务端返回的 HTML 片段被当作纯文本', itemsText.includes('<img src=x'), itemsText.slice(-200));
@@ -361,8 +428,26 @@ async function main() {
     const resultOptions = await cdp.evaluate("[...document.querySelectorAll('#usage-result option')].map((o) => o.value)");
     check(
       '结果筛选只提供契约枚举值',
-      JSON.stringify(resultOptions) === JSON.stringify(['', 'succeeded', 'failed', 'rejected', 'canceled']),
+      JSON.stringify(resultOptions) === JSON.stringify(['', 'succeeded', 'failed', 'rejected', 'canceled', 'active', 'pending']),
       JSON.stringify(resultOptions)
+    );
+    // provider/auth 过滤只作用于执行维度：界面必须说清哪些数字不是全 Key 台账。
+    const scopedNote = await cdp.text('#usage-quality-note');
+    check(
+      '按 Provider 过滤时明确只匹配执行且不等于全 Key 台账',
+      scopedNote.includes('已按 Provider/auth_id 过滤') && scopedNote.includes('不能把该合计当作全 Key 台账'),
+      scopedNote.slice(0, 240)
+    );
+    const scopedSummary = await cdp.text('#usage-summary');
+    check(
+      '过滤后执行成本说明匹配范围、人工补记说明不受过滤',
+      scopedSummary.includes('已按 Provider/auth_id 过滤') && scopedSummary.includes('不受 Provider/auth_id 过滤'),
+      scopedSummary.replace(/\n/g, ' ').slice(0, 240)
+    );
+    check(
+      '按 Provider 过滤时请求卡片标注执行维度受限',
+      (await cdp.text('#usage-items')).includes('只包含匹配的执行'),
+      (await cdp.text('#usage-items')).replace(/\n/g, ' ').slice(0, 240)
     );
 
     await cdp.setValue('#usage-search', '__boom__');

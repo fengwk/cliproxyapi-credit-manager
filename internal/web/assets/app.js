@@ -634,14 +634,11 @@
     return { label: key || '未知', tone: '' };
   }
 
-  // 只有服务端标记为 pending 的请求才需要管理员处理；状态缺失且没有任何执行记录时按待定处理。
+  // 只有服务端标记为 pending 的请求才可人工 Resolve：active 仍在执行并占用并发与持有金额，
+  // 后端会拒绝（ErrConflict），因此界面不得为 active 提供入口。
   function isPendingRequest(request) {
     if (!request || typeof request !== 'object') return false;
-    var stateText = String(request.state == null ? '' : request.state).trim().toLowerCase();
-    if (stateText === 'pending') return true;
-    if (stateText === 'active' || stateText === 'settled') return false;
-    var executions = request.executions || [];
-    return executions.length === 0 && !request.completed_at;
+    return String(request.state == null ? '' : request.state).trim().toLowerCase() === 'pending';
   }
 
   /* ------------------------------------------------------------------ *
@@ -983,6 +980,9 @@
     qualityTone: qualityTone,
     credentialStatus: credentialStatus,
     isPendingRequest: isPendingRequest,
+    hasExecutionScope: hasExecutionScope,
+    usageSummaryCards: usageSummaryCards,
+    usageScopeNote: usageScopeNote,
     metricValueText: metricValueText,
     bucketPercent: bucketPercent,
     bucketTone: bucketTone,
@@ -1686,19 +1686,24 @@
     renderUsagePagination(report);
   }
 
-  function renderUsageSummary(summary) {
-    var container = $('usage-summary');
-    var noteNode = $('usage-quality-note');
-    if (!container) return;
-    if (!summary) {
-      replace(container, []);
-      if (noteNode) noteNode.textContent = '';
-      return;
-    }
+  // 只有按执行维度过滤（provider/auth_id）时，明细与成本才只覆盖匹配的执行。
+  function hasExecutionScope(filters) {
+    var input = filters || {};
+    return String(input.provider || '').trim() !== '' || String(input.auth || '').trim() !== '';
+  }
+
+  // 汇总卡片的纯描述：金额/标签/说明都可单测，避免界面误把执行成本、人工补记与请求计数混在一起。
+  // 契约：summary.failed 是失败请求数（failed/canceled/rejected），summary.pending 是未结算请求数
+  // （active+pending），summary.cost_micro_usd 只统计匹配的执行，summary.adjustment_micro_usd 是
+  // 管理员 Resolve 的人工记账，必须单独展示。
+  function usageSummaryCards(summary, filters) {
+    var scoped = hasExecutionScope(filters);
     var requests = summaryValue(summary, 'requests');
     var executions = summaryValue(summary, 'executions');
     var failed = summaryValue(summary, 'failed');
     var pending = summaryValue(summary, 'pending');
+    var cost = summaryValue(summary, 'cost_micro_usd');
+    var adjustment = summaryValue(summary, 'adjustment_micro_usd');
     var completeExecutions = summaryValue(summary, 'complete_executions');
     var tokens = summary.tokens || {};
     var ratio = summary.cache_read_ratio;
@@ -1708,35 +1713,94 @@
       ratioText = (ratio * 100).toFixed(2) + '%';
     }
 
-    var cards = [
-      metricCard('请求数（Request 行）', formatInt(requests), '每个请求可包含多次执行'),
-      metricCard('执行数（实际执行）', formatInt(executions), '含重试与多执行'),
-      metricCard('失败执行', formatInt(failed), null, failed ? 'danger' : ''),
-      metricCard('待定请求', formatInt(pending), pending ? '等待管理员处理，不计入成本' : '无待定请求', pending ? 'warn' : ''),
-      metricCard('成本合计', formatMicroUSD(summaryValue(summary, 'cost_micro_usd')), formatInt(summaryValue(summary, 'cost_micro_usd')) + ' µUSD'),
-      metricCard('完整质量执行', formatInt(completeExecutions), 'quality = complete'),
-      metricCard('缓存读占比', ratioText, ratio === null || ratio === undefined ? '服务端未提供该指标' : '视图覆盖说明见下方'),
-      metricCard('tokens 合计', formatInt(tokens.total), '规范 tokens'),
-      metricCard('输入 tokens', formatInt(tokens.input), 'canonical uncached input'),
-      metricCard('输出 tokens', formatInt(tokens.output), '不含思考 tokens'),
-      metricCard('缓存读 tokens', formatInt(tokens.cache_read), null),
-      metricCard('缓存写 tokens', formatInt(tokens.cache_write), null),
-      metricCard('思考 tokens', formatInt(tokens.reasoning), null),
+    return [
+      { label: '请求数（Request 行）', value: formatInt(requests), sub: '每个请求可包含多次执行' },
+      { label: '执行数（实际执行）', value: formatInt(executions), sub: '含重试与多执行' },
+      {
+        label: '失败请求',
+        value: formatInt(failed),
+        sub: '按请求结果统计（failed / canceled / rejected），不是失败执行数',
+        tone: Number(intString(failed)) ? 'danger' : '',
+      },
+      {
+        label: '未结算请求',
+        value: formatInt(pending),
+        sub: pending
+          ? '进行中或待定：已知用量照常入账，未知部分待核账'
+          : '没有进行中或待定的请求',
+        tone: Number(intString(pending)) ? 'warn' : '',
+      },
+      {
+        label: '执行成本',
+        value: formatMicroUSD(cost),
+        sub:
+          formatInt(cost) + ' µUSD　仅匹配范围内的执行计量' + (scoped ? '，已按 Provider/auth_id 过滤' : ''),
+      },
+      {
+        label: '人工补记',
+        value: formatMicroUSD(adjustment),
+        sub:
+          formatInt(adjustment) +
+          ' µUSD　管理员 Resolve 记账，不计入执行成本' +
+          (scoped ? '；该金额按请求汇总，不受 Provider/auth_id 过滤' : ''),
+        tone: Number(intString(adjustment)) ? 'warn' : '',
+      },
+      { label: '完整质量执行', value: formatInt(completeExecutions), sub: 'quality = complete' },
+      {
+        label: '缓存读占比',
+        value: ratioText,
+        sub: ratio === null || ratio === undefined ? '服务端未提供该指标' : '只覆盖完整质量执行，说明见下方',
+      },
+      { label: 'tokens 合计', value: formatInt(tokens.total), sub: '规范 tokens' },
+      { label: '输入 tokens', value: formatInt(tokens.input), sub: 'canonical uncached input' },
+      { label: '输出 tokens', value: formatInt(tokens.output), sub: '不含思考 tokens' },
+      { label: '缓存读 tokens', value: formatInt(tokens.cache_read) },
+      { label: '缓存写 tokens', value: formatInt(tokens.cache_write) },
+      { label: '思考 tokens', value: formatInt(tokens.reasoning) },
     ];
-    replace(container, cards);
+  }
 
-    if (noteNode) {
-      var coverage = '—';
-      var execCount = Number(intString(executions));
-      var completeCount = Number(intString(completeExecutions));
-      if (isFinite(execCount) && execCount > 0) {
-        coverage = ((completeCount / execCount) * 100).toFixed(1) + '%';
-      }
-      noteNode.textContent =
-        '质量覆盖说明：缓存读占比是服务端提供的指标，只覆盖质量判定为「完整（complete）」的执行；' +
-        '完整执行占比 = ' + formatInt(completeExecutions) + ' / ' + formatInt(executions) + ' = ' + coverage + '。' +
-        '质量判定为「部分（partial）」或「未知（unknown）」的执行不计入占比，也不会被当作 0 结算。';
+  // 汇总下方的口径说明：明确哪里是匹配执行、哪里是请求级人工记账。
+  function usageScopeNote(summary, filters) {
+    var executions = summary ? summaryValue(summary, 'executions') : 0;
+    var completeExecutions = summary ? summaryValue(summary, 'complete_executions') : 0;
+    var coverage = '—';
+    var execCount = Number(intString(executions));
+    var completeCount = Number(intString(completeExecutions));
+    if (isFinite(execCount) && execCount > 0) {
+      coverage = ((completeCount / execCount) * 100).toFixed(1) + '%';
     }
+    var text =
+      '质量覆盖说明：缓存读占比只覆盖质量判定为「完整（complete）」的执行；' +
+      '完整执行占比 = ' + formatInt(completeExecutions) + ' / ' + formatInt(executions) + ' = ' + coverage + '。' +
+      '「部分（partial）」或「未知（unknown）」的执行不计入占比，也不会被当作 0 结算。';
+    text +=
+      '口径说明：执行成本与明细只统计当前筛选范围内的执行，人工补记按请求汇总，' +
+      '两者相加仍不等于全 Key 账本支出（账本还包含其它请求与保留策略之外的记录）。';
+    if (hasExecutionScope(filters)) {
+      text +=
+        ' 当前已按 Provider/auth_id 过滤：明细只包含匹配的执行，人工补记仍是整笔请求的记账，' +
+        '因此不能把该合计当作全 Key 台账。';
+    }
+    return text;
+  }
+
+  function renderUsageSummary(summary) {
+    var container = $('usage-summary');
+    var noteNode = $('usage-quality-note');
+    if (!container) return;
+    if (!summary) {
+      replace(container, []);
+      if (noteNode) noteNode.textContent = '';
+      return;
+    }
+    replace(
+      container,
+      usageSummaryCards(summary, state.usage.filters).map(function (card) {
+        return metricCard(card.label, card.value, card.sub, card.tone);
+      })
+    );
+    if (noteNode) noteNode.textContent = usageScopeNote(summary, state.usage.filters);
   }
 
   function trendNumber(point, key) {
@@ -1763,6 +1827,8 @@
         executions: trendNumber(point, 'executions'),
         cost: trendNumber(point, 'cost_micro_usd'),
         costText: formatMicroUSD(point.cost_micro_usd),
+        adjustment: trendNumber(point, 'adjustment_micro_usd'),
+        adjustmentText: formatMicroUSD(point.adjustment_micro_usd),
         failed: trendNumber(point, 'failed'),
         pending: trendNumber(point, 'pending'),
       };
@@ -1810,15 +1876,16 @@
         title:
           formatDateTime(point.time) +
           '　执行次数：' + formatInt(point.executions) +
-          '　失败：' + formatInt(point.failed) +
-          '　待定：' + formatInt(point.pending) +
-          '　成本：' + point.costText,
+          '　失败请求：' + formatInt(point.failed) +
+          '　未结算请求：' + formatInt(point.pending) +
+          '　执行成本：' + point.costText +
+          '　人工补记：' + point.adjustmentText,
       });
       var costX = center;
       costPoints.push({
         x: costX,
         y: costYFor(point.cost),
-        title: formatDateTime(point.time) + '　成本：' + point.costText,
+        title: formatDateTime(point.time) + '　执行成本：' + point.costText + '（不含人工补记）',
       });
       xLabels.push({ x: center, text: bucket === 'hour' ? formatHourLabel(point.time) : formatDayLabel(point.time) });
     });
@@ -1927,7 +1994,7 @@
         { color: '#4c8dff', label: '请求次数（每个入站请求一行）' },
         { color: '#2f6b52', label: '执行次数（实际执行，含重试）' },
       ];
-      if (model.showCostLine) items.push({ color: '#d29922', label: '成本（USD，独立右侧刻度，仅供参考）', line: true });
+      if (model.showCostLine) items.push({ color: '#d29922', label: '执行成本（USD，独立右侧刻度；不含人工补记）', line: true });
       replace(
         legend,
         items.map(function (item) {
@@ -1983,7 +2050,12 @@
     var statusTone = execution.failed ? 'danger' : 'ok';
     var settled = execution.cost_micro_usd !== undefined && execution.cost_micro_usd !== null;
     var costText = settled ? formatMicroUSD(execution.cost_micro_usd) : '未结算';
-    var costSub = settled ? formatInt(execution.cost_micro_usd) + ' µUSD' : '服务端未给出结算金额';
+    var quality = String(execution.quality == null ? '' : execution.quality).toLowerCase();
+    var costSub = settled
+      ? formatInt(execution.cost_micro_usd) + ' µUSD'
+      : quality === 'partial' || quality === 'unknown'
+        ? '质量非完整（' + quality + '）：服务端未给出结算金额，不是 0'
+        : '服务端未给出结算金额（不是 0）';
 
     var responseCell = el('td', {}, [
       el('div', { class: 'nowrap mono', text: execution.response_model ? String(execution.response_model) : '未上报' }),
@@ -2061,6 +2133,9 @@
       return request.key_id || '—';
     })();
 
+    var adjustmentMicro = request.adjustment_micro_usd === undefined || request.adjustment_micro_usd === null ? 0 : request.adjustment_micro_usd;
+    var adjustmentNonZero = intString(adjustmentMicro) !== '0';
+
     var head = el('div', { class: 'row-title' }, [
       el('span', { class: 'key-label mono', text: '请求 ' + shortId(request.id), title: String(request.id || '') }),
       badge(outcomeLabel(request.outcome), outcomeTone(request.outcome)),
@@ -2074,6 +2149,11 @@
       }),
       el('span', { class: 'pill-note', text: '执行 ' + formatInt(executions.length) + ' 次' }),
       el('span', { class: 'pill-note', text: '持有 ' + formatMicroUSD(request.held_micro_usd) }),
+      // 人工补记必须始终可见，不能藏在执行列表里与执行成本混算。
+      el('span', {
+        class: 'pill-note' + (adjustmentNonZero ? ' is-warn' : ''),
+        text: '人工补记 ' + formatMicroUSD(adjustmentMicro),
+      }),
     ]);
 
     var actions = el('div', { class: 'btn-row' }, [
@@ -2123,16 +2203,35 @@
         el('span', { class: 'kv-k', text: '价格' }),
         el('span', { class: 'kv-v', text: requestPriceText(request) }),
       ]),
+      el('div', { class: 'kv' }, [
+        el('span', { class: 'kv-k', text: '人工补记（adjustment_micro_usd）' }),
+        el('span', { class: 'kv-v', text: formatMicroUSDPair(adjustmentMicro) + '（管理员 Resolve 记账，独立于执行成本）' }),
+      ]),
     ]);
+
+    var scoped = hasExecutionScope(state.usage.filters);
 
     return el('div', { class: 'card' }, [
       head,
       relation.namespaceOnly ? el('p', { class: 'note', text: relation.note }) : null,
+      scoped
+        ? el('p', {
+            class: 'note',
+            text:
+              '当前按 Provider/auth_id 过滤：下方明细与该卡片的执行相关数字只包含匹配的执行，' +
+              '而人工补记是该请求的全部人工记账，因此两者不能当作全 Key 账本的对账口径。',
+          })
+        : null,
       meta,
       actions,
       executions.length
         ? executionTable(request)
-        : el('p', { class: 'note', text: '该请求尚无执行记录；若仍为待定状态，需要管理员在「处理待定」中释放或扣费。' }),
+        : el('p', {
+            class: 'note',
+            text: isPendingRequest(request)
+              ? '该请求尚无执行记录，状态为待定：已知用量照常入账，未知部分需要管理员在「处理待定」中释放或扣费。'
+              : '该请求尚无执行记录；进行中的请求只持有金额，等执行事件到达后才会计费。',
+          }),
     ]);
   }
 

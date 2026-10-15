@@ -125,6 +125,31 @@ func TestAppJSContractEnums(t *testing.T) {
 	}
 }
 
+// 界面必须区分执行成本与人工补记，并按契约解释失败/未结算计数。
+func TestAppJSAccountingWording(t *testing.T) {
+	js := readAsset(t, "app.js")
+
+	required := []string{
+		"adjustment_micro_usd", // 人工补记的契约字段
+		"失败请求",                 // summary.failed 是失败请求数，不是失败执行数
+		"未结算请求",                // summary.pending 是 active+pending
+		"执行成本",
+		"人工补记",
+		"已知用量照常入账",
+	}
+	for _, token := range required {
+		if !strings.Contains(js, token) {
+			t.Errorf("app.js 缺少 %q", token)
+		}
+	}
+	// 只断言卡片标签本身，不禁止说明文案里对这些口径的正常引用。
+	for _, stale := range []string{"label: '失败执行'", "label: '待定请求'", "label: '成本合计'", "不计入成本"} {
+		if strings.Contains(js, stale) {
+			t.Errorf("app.js 仍保留错误口径卡片 %q", stale)
+		}
+	}
+}
+
 // 界面必须用 textContent 渲染服务端数据，且不落地任何凭据。
 func TestAppJSRenderSafety(t *testing.T) {
 	js := readAsset(t, "app.js")

@@ -195,6 +195,8 @@ const REQUESTS_PAGE_1 = [
     started_at: '2026-10-13T08:00:00Z',
     completed_at: '2026-10-13T08:00:02Z',
     held_micro_usd: 0,
+    // 管理员 Resolve 的人工记账必须与执行成本分开显示（契约字段：adjustment_micro_usd）。
+    adjustment_micro_usd: 2500000,
     price: PRICES[0],
     executions: [
       {
@@ -229,6 +231,19 @@ const REQUESTS_PAGE_1 = [
     started_at: '2026-10-15T13:00:00Z',
     completed_at: '2026-10-15T13:00:00Z',
     held_micro_usd: 0,
+    price: PRICES[0],
+    executions: [],
+  },
+  {
+    // 进行中的请求：仍占用并发与持有金额，后端 Resolve 只接受 pending，因此不得给出人工处理入口。
+    id: 'req-007',
+    trace_id: 'trace007',
+    key_id: 'key-1',
+    model: 'gpt-5',
+    state: 'active',
+    started_at: '2026-10-15T14:00:00Z',
+    held_micro_usd: 1500000,
+    adjustment_micro_usd: 0,
     price: PRICES[0],
     executions: [],
   },
@@ -289,7 +304,13 @@ const HEALTH = {
   retention_months: 3,
   capture_enabled: true,
   last_error: 'mock 财务维护失败：cleanup 未完成',
-  max_pending_requests: 128,
+  // 真实 handler 会在同一响应里附带插件配置；界面必须把它当作未知字段原样列出。
+  config: {
+    data_dir: '/tmp/cm-mock-data',
+    retention_months: 3,
+    max_pending_requests: 128,
+    capture: { enabled: true, retention: '24h', max_body_bytes: 1048576, max_storage_bytes: 1073741824 },
+  },
 };
 
 const CREDENTIALS = {
@@ -406,22 +427,24 @@ function usageReport(query) {
           complete_executions: 0,
         }
       : {
-          requests: 4,
-          executions: 6,
-          failed: 1,
-          pending: 1,
+          requests: 6,
+          executions: 4,
+          // 契约：failed 是失败请求数（failed/canceled/rejected），pending 是 active+pending 的未结算请求数。
+          failed: 2,
+          pending: 2,
           cost_micro_usd: BIG_COST,
+          adjustment_micro_usd: 2500000,
           tokens: { input: 12500, cache_read: 4000, cache_write: 0, output: 8700, reasoning: 3000, total: BIG_TOKENS },
-          complete_executions: 4,
+          complete_executions: 2,
           cache_read_ratio: 0.2424,
         },
     trend: empty
       ? []
       : [
-          { time: '2026-10-12T00:00:00Z', requests: 3, executions: 5, failed: 0, pending: 0, cost_micro_usd: 1200000, tokens: { total: 1000 } },
-          { time: '2026-10-13T00:00:00Z', requests: 7, executions: 9, failed: 2, pending: 1, cost_micro_usd: 5600000, tokens: { total: 2000 } },
-          { time: '2026-10-14T00:00:00Z', requests: 4, executions: 4, failed: 0, pending: 0, cost_micro_usd: BIG_COST, tokens: { total: 3000 } },
-          { time: '2026-10-15T00:00:00Z', requests: 2, executions: 1, failed: 1, pending: 1, cost_micro_usd: 0, tokens: { total: 4000 } },
+          { time: '2026-10-12T00:00:00Z', requests: 3, executions: 5, failed: 0, pending: 0, cost_micro_usd: 1200000, adjustment_micro_usd: 0, tokens: { total: 1000 } },
+          { time: '2026-10-13T00:00:00Z', requests: 7, executions: 9, failed: 2, pending: 1, cost_micro_usd: 5600000, adjustment_micro_usd: 2500000, tokens: { total: 2000 } },
+          { time: '2026-10-14T00:00:00Z', requests: 4, executions: 4, failed: 0, pending: 0, cost_micro_usd: BIG_COST, adjustment_micro_usd: 0, tokens: { total: 3000 } },
+          { time: '2026-10-15T00:00:00Z', requests: 2, executions: 1, failed: 1, pending: 1, cost_micro_usd: 0, adjustment_micro_usd: 0, tokens: { total: 4000 } },
         ],
     items: empty ? [] : items,
     total: empty ? 0 : 25,
