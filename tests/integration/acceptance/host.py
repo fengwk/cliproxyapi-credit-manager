@@ -62,6 +62,8 @@ class HostConfig:
         request_retry: int = 3,
         openai_upstream_keys=None,
         gemini_upstream_keys=None,
+        session_affinity: bool = False,
+        session_affinity_ttl: str = "1h",
     ):
         self.root = Path(root)
         self.plugin_library = Path(plugin_library)
@@ -77,6 +79,8 @@ class HostConfig:
         self.extra_top_yaml = extra_top_yaml
         self.enable_plugins = enable_plugins
         self.request_retry = request_retry
+        self.session_affinity = session_affinity
+        self.session_affinity_ttl = session_affinity_ttl
         self.openai_upstream_keys = list(openai_upstream_keys or [])
         self.gemini_upstream_keys = list(gemini_upstream_keys or [])
         self.port = free_port()
@@ -106,6 +110,12 @@ class HostConfig:
         for key in self.client_keys:
             lines.append(f'    - "{key}"')
         lines.append('routing:')
+        # `session-affinity` and its TTL are direct children of `routing`, next
+        # to `retry`; they are rendered once here so no second top-level
+        # `routing:` block is emitted.
+        if self.session_affinity:
+            lines.append('  session-affinity: true')
+            lines.append(f'  session-affinity-ttl: "{self.session_affinity_ttl}"')
         lines.append('  retry:')
         lines.append(f'    request-retry: {self.request_retry}')
         lines.append('oauth:')

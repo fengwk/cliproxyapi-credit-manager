@@ -30,7 +30,7 @@ from acceptance.mock import Script  # noqa: E402
 from acceptance.report import Recorder  # noqa: E402
 
 DEFAULT_MODULES = ["abi", "core", "accounting", "auth", "capture", "report", "resources",
-                   "namespace", "lifecycle", "retry", "warmup", "gemini", "browser"]
+                   "namespace", "lifecycle", "retry", "warmup", "affinity", "gemini", "browser"]
 
 
 def parse_args(argv):
