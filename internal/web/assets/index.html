@@ -1,0 +1,222 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<meta name="robots" content="noindex">
+<title>信用管理 · credit-manager</title>
+<link rel="stylesheet" href="./style.css">
+</head>
+<body>
+<div id="app" class="app">
+
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true">CM</span>
+      <span class="brand-text">
+        <span class="brand-title">信用与额度管理</span>
+        <span class="brand-sub">credit-manager 插件管理界面</span>
+      </span>
+    </div>
+    <div class="topbar-actions">
+      <span id="session-status" class="session-status" role="status">未登录</span>
+      <button id="logout-button" class="btn btn-ghost" type="button" hidden>清除密钥</button>
+    </div>
+  </header>
+
+  <section id="login-view" class="login-view" aria-labelledby="login-title">
+    <div class="login-card">
+      <h2 id="login-title">输入管理密钥</h2>
+      <p class="hint">
+        管理密钥仅保留在当前页面的内存中，用于向管理 API 发送 <code>Authorization</code> 请求头。
+        界面不会把密钥写入 localStorage、sessionStorage、Cookie 或 URL，刷新页面后需重新输入。
+      </p>
+      <form id="login-form" class="login-form" autocomplete="off" novalidate>
+        <div class="field">
+          <label for="management-key">管理密钥</label>
+          <input id="management-key" name="management-key" type="password" autocomplete="off"
+                 spellcheck="false" autocapitalize="off" required>
+        </div>
+        <button id="login-button" class="btn btn-primary" type="submit">登录</button>
+      </form>
+      <p id="login-error" class="inline-error" role="alert" hidden></p>
+      <p class="hint hint-warn">
+        连续 5 次提交错误的密钥会导致当前客户端 IP 被临时封禁约 30 分钟，因此本界面不会自动重试登录；
+        请确认密钥正确后再提交。
+      </p>
+    </div>
+  </section>
+
+  <div id="main-view" hidden>
+
+    <nav class="tabs" role="tablist" aria-label="管理功能">
+      <button class="tab" type="button" role="tab" id="tab-usage" data-tab="usage" aria-controls="panel-usage" aria-selected="true" tabindex="0">使用统计</button>
+      <button class="tab" type="button" role="tab" id="tab-keys" data-tab="keys" aria-controls="panel-keys" aria-selected="false" tabindex="-1">客户端 Key</button>
+      <button class="tab" type="button" role="tab" id="tab-prices" data-tab="prices" aria-controls="panel-prices" aria-selected="false" tabindex="-1">价格</button>
+      <button class="tab" type="button" role="tab" id="tab-credentials" data-tab="credentials" aria-controls="panel-credentials" aria-selected="false" tabindex="-1">上游凭据与额度</button>
+      <button class="tab" type="button" role="tab" id="tab-health" data-tab="health" aria-controls="panel-health" aria-selected="false" tabindex="-1">状态</button>
+    </nav>
+
+    <main class="panels">
+
+      <section id="panel-usage" class="panel" role="tabpanel" aria-labelledby="tab-usage" tabindex="0">
+        <form id="usage-filters" class="filter-bar" autocomplete="off">
+          <div class="field">
+            <label for="usage-from">开始时间</label>
+            <input id="usage-from" type="datetime-local">
+          </div>
+          <div class="field">
+            <label for="usage-to">结束时间</label>
+            <input id="usage-to" type="datetime-local">
+          </div>
+          <div class="field">
+            <label for="usage-quick">快捷范围</label>
+            <select id="usage-quick">
+              <option value="">自定义</option>
+              <option value="1h">最近 1 小时</option>
+              <option value="24h" selected>最近 24 小时</option>
+              <option value="7d">最近 7 天</option>
+              <option value="30d">最近 30 天</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="usage-key">客户端 Key</label>
+            <select id="usage-key"><option value="">全部</option></select>
+          </div>
+          <div class="field">
+            <label for="usage-model">模型</label>
+            <input id="usage-model" type="text" placeholder="精确模型名" spellcheck="false">
+          </div>
+          <div class="field">
+            <label for="usage-provider">上游 Provider</label>
+            <input id="usage-provider" type="text" spellcheck="false">
+          </div>
+          <div class="field">
+            <label for="usage-auth">上游凭据 (auth_id)</label>
+            <input id="usage-auth" type="text" spellcheck="false">
+          </div>
+          <div class="field">
+            <label for="usage-result">结果</label>
+            <select id="usage-result">
+              <option value="">全部</option>
+              <option value="succeeded">成功</option>
+              <option value="failed">失败</option>
+              <option value="rejected">拒绝</option>
+              <option value="canceled">取消</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="usage-search">关键词</label>
+            <input id="usage-search" type="search" placeholder="ID / trace / 模型等" spellcheck="false">
+          </div>
+          <div class="field">
+            <label for="usage-bucket">趋势粒度</label>
+            <select id="usage-bucket">
+              <option value="day" selected>按天</option>
+              <option value="hour">按小时</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="usage-page-size">每页条数</label>
+            <select id="usage-page-size">
+              <option value="20" selected>20</option>
+              <option value="50">50</option>
+              <option value="100">100</option>
+            </select>
+          </div>
+          <div class="filter-actions">
+            <button id="usage-apply" class="btn btn-primary" type="submit">查询</button>
+            <button id="usage-reset" class="btn" type="button">重置</button>
+          </div>
+        </form>
+
+        <p id="usage-status" class="status-line" role="status"></p>
+        <div id="usage-error" class="error-box" role="alert" hidden></div>
+
+        <div id="usage-summary" class="card-grid" aria-label="汇总"></div>
+        <p id="usage-quality-note" class="note"></p>
+
+        <section class="card" aria-labelledby="usage-chart-title">
+          <div class="card-head">
+            <h3 id="usage-chart-title">趋势</h3>
+            <div id="usage-legend" class="legend"></div>
+          </div>
+          <div id="usage-chart" class="chart"></div>
+        </section>
+
+        <section class="card" aria-labelledby="usage-items-title">
+          <div class="card-head">
+            <h3 id="usage-items-title">请求明细</h3>
+            <span id="usage-total" class="muted"></span>
+          </div>
+          <p id="usage-retention" class="note"></p>
+          <div id="usage-items"></div>
+          <div id="usage-pagination" class="pagination"></div>
+        </section>
+      </section>
+
+      <section id="panel-keys" class="panel" role="tabpanel" aria-labelledby="tab-keys" tabindex="0" hidden>
+        <div class="toolbar">
+          <button id="keys-create" class="btn btn-primary" type="button">新建 Key</button>
+          <button id="keys-refresh" class="btn" type="button">刷新</button>
+        </div>
+        <p id="keys-status" class="status-line" role="status"></p>
+        <div id="keys-error" class="error-box" role="alert" hidden></div>
+        <div id="keys-list"></div>
+      </section>
+
+      <section id="panel-prices" class="panel" role="tabpanel" aria-labelledby="tab-prices" tabindex="0" hidden>
+        <div class="toolbar">
+          <button id="prices-create" class="btn btn-primary" type="button">新增价格</button>
+          <button id="prices-refresh" class="btn" type="button">刷新</button>
+        </div>
+        <p class="hint">
+          价格一律以「微美元 / 每 100 万 tokens」的整数保存（1 USD = 1,000,000 微美元），界面同时给出等值美元换算供核对，不做浮点换算。
+        </p>
+        <p id="prices-status" class="status-line" role="status"></p>
+        <div id="prices-error" class="error-box" role="alert" hidden></div>
+        <div id="prices-list"></div>
+      </section>
+
+      <section id="panel-credentials" class="panel" role="tabpanel" aria-labelledby="tab-credentials" tabindex="0" hidden>
+        <div class="toolbar">
+          <button id="credentials-refresh" class="btn" type="button">刷新凭据列表</button>
+        </div>
+        <p class="hint">
+          本页只读取 CPA 的凭据列表与插件额度接口，不修改上游凭据、不导入原生密钥、不发起 OAuth 流程。
+          额度是否可用完全取决于每个凭据自身上报的能力，未上报时如实显示为不支持。
+        </p>
+        <p id="credentials-status" class="status-line" role="status"></p>
+        <div id="credentials-error" class="error-box" role="alert" hidden></div>
+        <div id="credentials-list"></div>
+      </section>
+
+      <section id="panel-health" class="panel" role="tabpanel" aria-labelledby="tab-health" tabindex="0" hidden>
+        <div class="toolbar">
+          <button id="health-refresh" class="btn" type="button">刷新状态</button>
+        </div>
+        <p id="health-status" class="status-line" role="status"></p>
+        <div id="health-error" class="error-box" role="alert" hidden></div>
+        <div id="health-cards" class="card-grid"></div>
+        <section class="card" aria-labelledby="health-extra-title">
+          <div class="card-head">
+            <h3 id="health-extra-title">其他字段</h3>
+          </div>
+          <div id="health-extra"></div>
+        </section>
+      </section>
+
+    </main>
+  </div>
+
+  <footer class="footer">
+    <span class="muted">credit-manager · 管理界面为静态页面，所有数据实时从管理 API 读取。</span>
+  </footer>
+
+  <div id="modal-root" class="modal-root" hidden></div>
+  <div id="toast-root" class="toast-root" role="status" aria-live="polite"></div>
+</div>
+<script src="./app.js" defer></script>
+</body>
+</html>
