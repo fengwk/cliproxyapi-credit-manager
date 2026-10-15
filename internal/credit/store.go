@@ -252,6 +252,13 @@ func Open(opts Options) (*Store, error) {
 		_ = lock.release()
 		return nil, err
 	}
+	// The secret is on disk but its directory entry may not be: sync the
+	// directory for a freshly created pepper and for a pepper that was read
+	// back, before the ledger is opened at all.
+	if err := syncDataDir(dir); err != nil {
+		_ = lock.release()
+		return nil, err
+	}
 	// SQLite sidecars inherit the main file's permissions.
 	file, err := os.OpenFile(dbPath, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
@@ -365,16 +372,27 @@ func loadPepper(path string) ([]byte, error) {
 	if err := f.Close(); err != nil {
 		return nil, fmt.Errorf("close pepper: %w", err)
 	}
-	// Flushing the file only makes its content durable; flushing the directory
-	// makes the new name durable as well.
-	if d, err := os.Open(filepath.Dir(path)); err == nil {
-		syncErr := d.Sync()
-		_ = d.Close()
-		if syncErr != nil {
-			return nil, fmt.Errorf("sync data dir: %w", syncErr)
-		}
-	}
 	return b, nil
+}
+
+// syncDataDir flushes the directory entry of the data directory. Flushing a
+// file only makes its content durable, so the pepper has to be followed by a
+// directory sync before any financial commit can happen. Every platform this
+// package supports can do it, so a failing open, sync or close aborts Open
+// instead of being silently skipped.
+func syncDataDir(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return fmt.Errorf("open data dir: %w", err)
+	}
+	var errs []error
+	if syncErr := d.Sync(); syncErr != nil {
+		errs = append(errs, fmt.Errorf("sync data dir: %w", syncErr))
+	}
+	if closeErr := d.Close(); closeErr != nil {
+		errs = append(errs, fmt.Errorf("close data dir: %w", closeErr))
+	}
+	return errors.Join(errs...)
 }
 
 func (s *Store) migrate(ctx context.Context) error {
