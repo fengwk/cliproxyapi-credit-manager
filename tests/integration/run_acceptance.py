@@ -43,11 +43,6 @@ def parse_args(argv):
     return parser.parse_args(argv)
 
 
-def available_modules():
-    directory = HERE / "acceptance" / "cases"
-    return sorted(path.stem for path in directory.glob("*.py") if path.stem != "__init__")
-
-
 def reset_artifacts(artifacts: Path) -> None:
     """Remove harness-owned host directories so each run starts from clean state.
 
@@ -77,14 +72,12 @@ def main(argv=None):
              "modules": modules, "cases_planned": len(specs)}
 
     started = time.time()
-    host_started = False
     try:
         ctx.mock.start()
-        # A default host is booted so every case starts from an isolated state;
-        # cases may recreate it (restart/persistence scenarios).
+        # A default host is booted so host-plugins.json evidence exists; every
+        # case then runs against its own freshly booted isolated host.
         ctx.build_host(root=artifacts / "host")
         ctx.host.start()
-        host_started = True
         ctx.wire_clients()
         # Persist the raw host registration for evidence.
         try:
