@@ -4,9 +4,12 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"math"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 )
 
 const (
@@ -870,4 +873,233 @@ func TestZeroRatePriceStillRequiresUsage(t *testing.T) {
 	if got := h.key(key.ID).SpentMicroUSD; got != 0 {
 		t.Fatalf("spent = %d, want 0", got)
 	}
+}
+
+// TestPeriodLimitsCountUnresolvedHolds proves that a hold which is already
+// admitted in the current period blocks further admissions, so two concurrent
+// requests cannot jointly exceed a daily/weekly/monthly monetary limit while
+// neither has been charged yet.
+func TestPeriodLimitsCountUnresolvedHolds(t *testing.T) {
+	cases := []struct {
+		name  string
+		apply func(*KeySpec)
+	}{
+		{"daily", func(s *KeySpec) { s.DailyMicroUSD = 100 }},
+		{"weekly", func(s *KeySpec) { s.WeeklyMicroUSD = 100 }},
+		{"monthly", func(s *KeySpec) { s.MonthlyMicroUSD = 100 }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t)
+			h.mustPrice("m1", Rates{Input: million}) // 1 token costs 1 microUSD
+			spec := KeySpec{Enabled: true}
+			tc.apply(&spec)
+			key, _ := h.mustKey(spec)
+			ctx := h.ctx()
+
+			first := h.mustReserve(ReserveInput{ID: "r1", TraceID: "t1", KeyID: key.ID,
+				RequestedModel: "m1", InputEstimate: 60})
+			if first.HeldMicroUSD != 60 {
+				t.Fatalf("hold = %d, want 60", first.HeldMicroUSD)
+			}
+			// Nothing has been charged yet, yet the window is already occupied.
+			_, err := h.store.Reserve(ctx, ReserveInput{ID: "r2", TraceID: "t2", KeyID: key.ID,
+				RequestedModel: "m1", InputEstimate: 60})
+			if !errors.Is(err, ErrQuota) {
+				t.Fatalf("second hold err = %v, want ErrQuota", err)
+			}
+			// An admission that still fits exactly is admitted.
+			if _, err := h.store.Reserve(ctx, ReserveInput{ID: "r3", TraceID: "t3", KeyID: key.ID,
+				RequestedModel: "m1", InputEstimate: 40}); err != nil {
+				t.Fatalf("hold exactly at the limit: %v", err)
+			}
+			// Closing the first request releases its hold in the same period.
+			h.mustComplete(Completion{ID: first.ID, TraceID: first.TraceID, Outcome: OutcomeRejected})
+			if k := h.key(key.ID); k.HeldMicroUSD != 40 {
+				t.Fatalf("hold after release = %d, want 40", k.HeldMicroUSD)
+			}
+			if _, err := h.store.Reserve(ctx, ReserveInput{ID: "r4", TraceID: "t4", KeyID: key.ID,
+				RequestedModel: "m1", InputEstimate: 60}); err != nil {
+				t.Fatalf("hold after release should fit: %v", err)
+			}
+		})
+	}
+}
+
+// TestPeriodLimitsIgnoreHoldsFromOtherPeriods keeps the same-period rule from
+// overcorrecting: work admitted in an earlier period keeps its hold, but it
+// does not occupy the next period's monetary window.
+func TestPeriodLimitsIgnoreHoldsFromOtherPeriods(t *testing.T) {
+	h := newHarness(t)
+	h.mustPrice("m1", Rates{Input: million})
+	key, _ := h.mustKey(KeySpec{Enabled: true, MonthlyMicroUSD: 100})
+	jan := time.Date(2026, time.January, 10, 12, 0, 0, 0, time.UTC)
+	h.clock.set(jan)
+	if _, err := h.store.Reserve(h.ctx(), ReserveInput{ID: "r1", TraceID: "t1", KeyID: key.ID,
+		RequestedModel: "m1", InputEstimate: 100, At: jan}); err != nil {
+		t.Fatalf("january reserve: %v", err)
+	}
+	feb := time.Date(2026, time.February, 3, 9, 0, 0, 0, time.UTC)
+	h.clock.set(feb)
+	if _, err := h.store.Reserve(h.ctx(), ReserveInput{ID: "r2", TraceID: "t2", KeyID: key.ID,
+		RequestedModel: "m1", InputEstimate: 100, At: feb}); err != nil {
+		t.Fatalf("february reserve: %v", err)
+	}
+	// The old hold is still unresolved and still counted by the lifetime window.
+	if k := h.key(key.ID); k.HeldMicroUSD != 200 {
+		t.Fatalf("held = %d, want both holds retained", k.HeldMicroUSD)
+	}
+}
+
+// TestTokenEstimatesArePeriodScoped makes sure an unresolved request only
+// consumes the token window it was admitted in, while the lifetime window keeps
+// counting it.
+func TestTokenEstimatesArePeriodScoped(t *testing.T) {
+	h := newHarness(t)
+	h.mustPrice("m1", Rates{Input: million})
+	ctx := h.ctx()
+	jan := time.Date(2026, time.January, 10, 12, 0, 0, 0, time.UTC)
+	feb := time.Date(2026, time.February, 3, 9, 0, 0, 0, time.UTC)
+
+	// Period window: the January estimate must not starve February.
+	h.clock.set(jan)
+	scoped, _ := h.mustKey(KeySpec{Enabled: true,
+		ModelTokenLimits: []ModelTokenLimit{{Model: "m1", Total: 400, Monthly: 200}}})
+	if _, err := h.store.Reserve(ctx, ReserveInput{ID: "s1", TraceID: "ts1", KeyID: scoped.ID,
+		RequestedModel: "m1", InputEstimate: 200, At: jan}); err != nil {
+		t.Fatalf("january reserve: %v", err)
+	}
+	if _, err := h.store.Reserve(ctx, ReserveInput{ID: "s2", TraceID: "ts2", KeyID: scoped.ID,
+		RequestedModel: "m1", InputEstimate: 1, At: jan}); !errors.Is(err, ErrQuota) {
+		t.Fatalf("same month err = %v, want ErrQuota", err)
+	}
+	h.clock.set(feb)
+	if _, err := h.store.Reserve(ctx, ReserveInput{ID: "s3", TraceID: "ts3", KeyID: scoped.ID,
+		RequestedModel: "m1", InputEstimate: 200, At: feb}); err != nil {
+		t.Fatalf("next month must have its own window: %v", err)
+	}
+
+	// Lifetime window: a stale unresolved estimate still counts against total.
+	lifetime, _ := h.mustKey(KeySpec{Enabled: true,
+		ModelTokenLimits: []ModelTokenLimit{{Model: "m1", Total: 300}}})
+	h.clock.set(jan)
+	if _, err := h.store.Reserve(ctx, ReserveInput{ID: "l1", TraceID: "tl1", KeyID: lifetime.ID,
+		RequestedModel: "m1", InputEstimate: 200, At: jan}); err != nil {
+		t.Fatalf("lifetime january reserve: %v", err)
+	}
+	h.clock.set(feb)
+	if _, err := h.store.Reserve(ctx, ReserveInput{ID: "l2", TraceID: "tl2", KeyID: lifetime.ID,
+		RequestedModel: "m1", InputEstimate: 200, At: feb}); !errors.Is(err, ErrQuota) {
+		t.Fatalf("lifetime err = %v, want ErrQuota", err)
+	}
+}
+
+// TestLedgerArithmeticDoesNotOverflowToReal drives the ledger near MaxInt64.
+// SQLite would silently store an overflowing INTEGER sum as a REAL, so every
+// accumulator must reject the operation and roll the transaction back instead
+// of corrupting money or token accounting.
+func TestLedgerArithmeticDoesNotOverflowToReal(t *testing.T) {
+	const rate = 1_000_000_000_000          // microUSD per 1M tokens
+	const tokensNearMax = 9_000_000_000_000 // * rate / 1M = 9e18 microUSD per charge
+
+	// Guard helper: no monetary or token value may be stored as a float.
+	assertExactIntegers := func(t *testing.T, h *harness, keyID, requestID string) {
+		t.Helper()
+		checks := []struct {
+			name  string
+			query string
+			args  []any
+		}{
+			{"key money", `SELECT COUNT(*) FROM keys WHERE id = ? AND (typeof(spent_micro_usd) <> 'integer' OR typeof(held_micro_usd) <> 'integer')`, []any{keyID}},
+			{"money counters", `SELECT COUNT(*) FROM key_money_counters WHERE key_id = ? AND typeof(micro_usd) <> 'integer'`, []any{keyID}},
+			{"token counters", `SELECT COUNT(*) FROM key_token_counters WHERE key_id = ? AND typeof(tokens) <> 'integer'`, []any{keyID}},
+			{"request charge", `SELECT COUNT(*) FROM requests WHERE id = ? AND typeof(charge_micro_usd) <> 'integer'`, []any{requestID}},
+		}
+		for _, c := range checks {
+			bad, err := counterValue(context.Background(), h.store.db, c.query, c.args...)
+			if err != nil {
+				t.Fatalf("%s: %v", c.name, err)
+			}
+			if bad != 0 {
+				t.Fatalf("%s: %d values were stored as REAL", c.name, bad)
+			}
+		}
+	}
+
+	t.Run("money", func(t *testing.T) {
+		h := newHarness(t)
+		h.mustPrice("big", Rates{Input: rate})
+		key, _ := h.mustKey(KeySpec{Enabled: true})
+		req := h.mustReserve(ReserveInput{ID: "r1", TraceID: "t1", KeyID: key.ID,
+			RequestedModel: "big", InputEstimate: tokensNearMax})
+		h.mustUsage(usageFor("u1", req, "big", tokens(tokensNearMax, 0, 0, 0, 0)))
+		before := h.key(key.ID)
+		if before.SpentMicroUSD < math.MaxInt64/2 {
+			t.Fatalf("spent = %d, not near the int64 boundary as intended", before.SpentMicroUSD)
+		}
+		// A second identical charge would push the accumulated total past int64.
+		err := h.store.RecordUsage(h.ctx(), usageFor("u2", req, "big", tokens(tokensNearMax, 0, 0, 0, 0)))
+		if err == nil {
+			t.Fatal("second charge: want an overflow error, got nil")
+		}
+		if !errors.Is(err, ErrInvalid) {
+			t.Fatalf("second charge err = %v, want ErrInvalid", err)
+		}
+		after := h.key(key.ID)
+		if after.SpentMicroUSD != before.SpentMicroUSD || after.HeldMicroUSD != before.HeldMicroUSD {
+			t.Fatalf("ledger moved after a rejected charge: %+v -> %+v", before, after)
+		}
+		if n, err := counterValue(h.ctx(), h.store.db,
+			`SELECT COUNT(*) FROM usages WHERE request_id = ?`, req.ID); err != nil || n != 1 {
+			t.Fatalf("usages = %d (%v), want the rejected execution rolled back", n, err)
+		}
+		assertExactIntegers(t, h, key.ID, req.ID)
+
+		// The hold accumulator is guarded the same way.
+		_, err = h.store.Reserve(h.ctx(), ReserveInput{ID: "r2", TraceID: "t2", KeyID: key.ID,
+			RequestedModel: "big", InputEstimate: tokensNearMax})
+		if err == nil || !errors.Is(err, ErrInvalid) {
+			t.Fatalf("hold overflow err = %v, want ErrInvalid", err)
+		}
+		if n, err := counterValue(h.ctx(), h.store.db,
+			`SELECT COUNT(*) FROM requests WHERE id = ?`, "r2"); err != nil || n != 0 {
+			t.Fatalf("rejected reservation was kept: %d (%v)", n, err)
+		}
+		// Releasing is still exact and the charged spend survives.
+		if err := h.store.Resolve(h.ctx(), req.ID, Resolution{Action: ActionRelease, Reason: "overflow probe"}); err != nil {
+			t.Fatalf("resolve: %v", err)
+		}
+		final := h.key(key.ID)
+		if final.HeldMicroUSD != 0 || final.SpentMicroUSD != before.SpentMicroUSD {
+			t.Fatalf("after release spent %d held %d, want %d/0", final.SpentMicroUSD, final.HeldMicroUSD, before.SpentMicroUSD)
+		}
+		assertExactIntegers(t, h, key.ID, req.ID)
+	})
+
+	t.Run("tokens", func(t *testing.T) {
+		h := newHarness(t)
+		h.mustPrice("t", Rates{Input: 1}) // cheap money, huge token counts
+		key, _ := h.mustKey(KeySpec{Enabled: true})
+		const huge = int64(9_000_000_000_000_000_000)
+		req := h.mustReserve(ReserveInput{ID: "r1", TraceID: "t1", KeyID: key.ID,
+			RequestedModel: "t", InputEstimate: 1})
+		// Raw counters are left empty: this case is about the durable token
+		// counters, not about an inconsistent provider payload.
+		first := usageFor("u1", req, "t", tokens(huge, 0, 0, 0, 0))
+		first.Raw = pluginapi.UsageDetail{}
+		h.mustUsage(first)
+		// The token counters now sit one charge below the int64 limit.
+		second := usageFor("u2", req, "t", tokens(huge, 0, 0, 0, 0))
+		second.Raw = pluginapi.UsageDetail{}
+		err := h.store.RecordUsage(h.ctx(), second)
+		if err == nil || !errors.Is(err, ErrInvalid) {
+			t.Fatalf("token counter overflow err = %v, want ErrInvalid", err)
+		}
+		if n, err := counterValue(h.ctx(), h.store.db,
+			`SELECT COALESCE(SUM(tokens),0) FROM key_token_counters WHERE key_id = ? AND win = ?`,
+			key.ID, windowTotal); err != nil || n != huge {
+			t.Fatalf("token counter = %d (%v), want %d unchanged", n, err, huge)
+		}
+		assertExactIntegers(t, h, key.ID, req.ID)
+	})
 }

@@ -126,8 +126,12 @@ type Request struct {
 	StartedAt    time.Time  `json:"started_at"`
 	CompletedAt  *time.Time `json:"completed_at,omitempty"`
 	HeldMicroUSD int64      `json:"held_micro_usd"`
-	Price        Price      `json:"price"`
-	Executions   []Usage    `json:"executions"`
+	// AdjustmentMicroUSD totals manual Resolve charges booked against this
+	// request. It is reported next to the execution cost, never inside it, so
+	// manual ledger entries are neither hidden nor double counted.
+	AdjustmentMicroUSD int64   `json:"adjustment_micro_usd"`
+	Price              Price   `json:"price"`
+	Executions         []Usage `json:"executions"`
 }
 
 type Completion struct {
@@ -159,11 +163,15 @@ type Filter struct {
 }
 
 type Summary struct {
-	Requests           int64    `json:"requests"`
-	Executions         int64    `json:"executions"`
-	Failed             int64    `json:"failed"`
-	Pending            int64    `json:"pending"`
-	CostMicroUSD       int64    `json:"cost_micro_usd"`
+	Requests     int64 `json:"requests"`
+	Executions   int64 `json:"executions"`
+	Failed       int64 `json:"failed"`
+	Pending      int64 `json:"pending"`
+	CostMicroUSD int64 `json:"cost_micro_usd"`
+	// AdjustmentMicroUSD totals manual Resolve charges of the same selection.
+	// CostMicroUSD stays execution derived; cost + adjustments reconciles with
+	// the key ledger spend for the same request set.
+	AdjustmentMicroUSD int64    `json:"adjustment_micro_usd"`
 	Tokens             Tokens   `json:"tokens"`
 	CompleteExecutions int64    `json:"complete_executions"`
 	CacheReadRatio     *float64 `json:"cache_read_ratio,omitempty"`

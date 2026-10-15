@@ -293,6 +293,20 @@ func TestReportSnapshotIsConsistentUnderConcurrentWrites(t *testing.T) {
 			if err != nil {
 				return
 			}
+			if i%5 == 0 {
+				// Every fifth write becomes a request with untrustworthy usage
+				// that an administrator closes with a manual charge, so the
+				// adjustment series is exercised under concurrent writes too.
+				if err := h.store.Complete(ctx, Completion{ID: req.ID, TraceID: req.TraceID,
+					Outcome: OutcomeFailed, StatusCode: 502}); err != nil {
+					return
+				}
+				if err := h.store.Resolve(ctx, req.ID, Resolution{Action: ActionCharge,
+					AmountMicroUSD: 7, Reason: "manual"}); err != nil {
+					return
+				}
+				continue
+			}
 			if err := h.store.RecordUsage(ctx, usageFor("u-"+id, req, "m1", tokens(1, 0, 0, 0, 0))); err != nil {
 				return
 			}
@@ -313,16 +327,21 @@ func TestReportSnapshotIsConsistentUnderConcurrentWrites(t *testing.T) {
 		if rep.Summary.Requests != rep.Total {
 			t.Fatalf("summary requests %d != total %d", rep.Summary.Requests, rep.Total)
 		}
-		var bucketSum, bucketCost int64
+		var bucketSum, bucketCost, bucketAdjustments int64
 		for _, p := range rep.Trend {
 			bucketSum += p.Summary.Requests
 			bucketCost += p.Summary.CostMicroUSD
+			bucketAdjustments += p.Summary.AdjustmentMicroUSD
 		}
 		if bucketSum != rep.Total {
 			t.Fatalf("trend requests %d != total %d", bucketSum, rep.Total)
 		}
 		if bucketCost != rep.Summary.CostMicroUSD {
 			t.Fatalf("trend cost %d != summary cost %d", bucketCost, rep.Summary.CostMicroUSD)
+		}
+		if bucketAdjustments != rep.Summary.AdjustmentMicroUSD {
+			t.Fatalf("trend adjustments %d != summary adjustments %d",
+				bucketAdjustments, rep.Summary.AdjustmentMicroUSD)
 		}
 		want := rep.Total
 		if want > int64(rep.PageSize) {
@@ -336,5 +355,136 @@ func TestReportSnapshotIsConsistentUnderConcurrentWrites(t *testing.T) {
 	wg.Wait()
 	if checks == 0 {
 		t.Fatal("no report was verified")
+	}
+}
+
+// TestReportSeparatesCostFromAdjustments verifies the ledger view of manual
+// Resolve charges: execution cost stays execution derived, adjustments are
+// reported as their own number, and the pair reconciles with the key ledger
+// without double counting or hiding anything.
+func TestReportSeparatesCostFromAdjustments(t *testing.T) {
+	h := newHarness(t)
+	h.mustPrice("m1", Rates{Input: million}) // 1 token costs 1 microUSD
+	key, _ := h.mustKey(KeySpec{Enabled: true})
+	ctx := h.ctx()
+	from := testEpoch.AddDate(0, 0, -1)
+	to := testEpoch.AddDate(0, 0, 4)
+
+	// A measured execution: 100 microUSD of real, usage derived cost.
+	measured := h.mustReserve(ReserveInput{ID: "r1", TraceID: "t1", KeyID: key.ID,
+		RequestedModel: "m1", InputEstimate: 100})
+	h.mustUsage(usageFor("u1", measured, "m1", tokens(100, 0, 0, 0, 0)))
+	h.mustComplete(Completion{ID: measured.ID, TraceID: measured.TraceID, Outcome: OutcomeSucceeded})
+
+	// A request with no trustworthy usage, closed by an administrator.
+	manual := h.mustReserve(ReserveInput{ID: "r2", TraceID: "t2", KeyID: key.ID,
+		RequestedModel: "m1", InputEstimate: 500})
+	h.mustComplete(Completion{ID: manual.ID, TraceID: manual.TraceID, Outcome: OutcomeFailed, StatusCode: 502})
+
+	// The adjustment is booked two days after the request itself, so its
+	// period attribution is observable.
+	h.clock.set(testEpoch.AddDate(0, 0, 2).Add(2 * time.Hour))
+	if err := h.store.Resolve(ctx, manual.ID, Resolution{Action: ActionCharge,
+		AmountMicroUSD: 777, Reason: "provider billed out of band"}); err != nil {
+		t.Fatalf("resolve charge: %v", err)
+	}
+	// A third request keeps the later day non-empty in the trend.
+	later := h.mustReserve(ReserveInput{ID: "r3", TraceID: "t3", KeyID: key.ID,
+		RequestedModel: "m1", InputEstimate: 10})
+	h.mustUsage(usageFor("u3", later, "m1", tokens(10, 0, 0, 0, 0)))
+	h.mustComplete(Completion{ID: later.ID, TraceID: later.TraceID, Outcome: OutcomeSucceeded})
+
+	ledger := h.key(key.ID)
+	if ledger.SpentMicroUSD != 100+777+10 {
+		t.Fatalf("ledger spent = %d, want 887", ledger.SpentMicroUSD)
+	}
+	if ledger.HeldMicroUSD != 0 {
+		t.Fatalf("ledger held = %d, want 0", ledger.HeldMicroUSD)
+	}
+
+	rep, err := h.store.Report(ctx, Filter{From: from, To: to, Bucket: "day"})
+	if err != nil {
+		t.Fatalf("report: %v", err)
+	}
+	// Manual charges never inflate the measured cost ...
+	if rep.Summary.CostMicroUSD != 110 {
+		t.Fatalf("summary cost = %d, want the usage derived 110", rep.Summary.CostMicroUSD)
+	}
+	// ... and they are never hidden either.
+	if rep.Summary.AdjustmentMicroUSD != 777 {
+		t.Fatalf("summary adjustments = %d, want 777", rep.Summary.AdjustmentMicroUSD)
+	}
+	// Cost plus adjustments reconstitutes the ledger spend exactly.
+	if ledger.SpentMicroUSD != rep.Summary.CostMicroUSD+rep.Summary.AdjustmentMicroUSD {
+		t.Fatalf("ledger %d != cost %d + adjustments %d", ledger.SpentMicroUSD,
+			rep.Summary.CostMicroUSD, rep.Summary.AdjustmentMicroUSD)
+	}
+
+	// Items carry the adjustment on the request it belongs to.
+	items := map[string]Request{}
+	for _, item := range rep.Items {
+		items[item.ID] = item
+	}
+	if len(items) != 3 {
+		t.Fatalf("items = %d, want 3", len(items))
+	}
+	if items["r2"].AdjustmentMicroUSD != 777 {
+		t.Fatalf("r2 adjustments = %d, want 777", items["r2"].AdjustmentMicroUSD)
+	}
+	if items["r1"].AdjustmentMicroUSD != 0 || items["r3"].AdjustmentMicroUSD != 0 {
+		t.Fatalf("unadjusted requests report %d/%d", items["r1"].AdjustmentMicroUSD, items["r3"].AdjustmentMicroUSD)
+	}
+	if items["r2"].State != stateSettled || items["r2"].Outcome != OutcomeFailed {
+		t.Fatalf("r2 = %+v, want a settled failure", items["r2"])
+	}
+
+	// The trend attributes an adjustment to the request period, not to the
+	// moment the administrator acted, so buckets keep summing to the summary.
+	var trendCost, trendAdjustments int64
+	for _, p := range rep.Trend {
+		trendCost += p.Summary.CostMicroUSD
+		trendAdjustments += p.Summary.AdjustmentMicroUSD
+	}
+	if trendCost != rep.Summary.CostMicroUSD || trendAdjustments != rep.Summary.AdjustmentMicroUSD {
+		t.Fatalf("trend sums %d/%d do not match summary %d/%d", trendCost, trendAdjustments,
+			rep.Summary.CostMicroUSD, rep.Summary.AdjustmentMicroUSD)
+	}
+	if len(rep.Trend) != 2 {
+		t.Fatalf("trend points = %d, want 2", len(rep.Trend))
+	}
+	if rep.Trend[0].Summary.AdjustmentMicroUSD != 777 || rep.Trend[1].Summary.AdjustmentMicroUSD != 0 {
+		t.Fatalf("trend adjustments = %d/%d, want 777/0", rep.Trend[0].Summary.AdjustmentMicroUSD,
+			rep.Trend[1].Summary.AdjustmentMicroUSD)
+	}
+	if rep.Trend[0].Summary.CostMicroUSD != 100 || rep.Trend[1].Summary.CostMicroUSD != 10 {
+		t.Fatalf("trend costs = %d/%d, want 100/10", rep.Trend[0].Summary.CostMicroUSD,
+			rep.Trend[1].Summary.CostMicroUSD)
+	}
+
+	// An execution filter drops a request that has no matching execution,
+	// together with its request level adjustment: the manual charge stays
+	// attached to a request that is not part of the selection.
+	byProvider, err := h.store.Report(ctx, Filter{From: from, To: to, Provider: "openai"})
+	if err != nil {
+		t.Fatalf("provider report: %v", err)
+	}
+	if byProvider.Total != 2 || byProvider.Summary.CostMicroUSD != 110 || byProvider.Summary.AdjustmentMicroUSD != 0 {
+		t.Fatalf("openai summary = %+v, want only the two measured requests", byProvider.Summary)
+	}
+	byOther, err := h.store.Report(ctx, Filter{From: from, To: to, Provider: "anthropic"})
+	if err != nil {
+		t.Fatalf("other provider report: %v", err)
+	}
+	if byOther.Total != 0 || byOther.Summary.AdjustmentMicroUSD != 0 || byOther.Summary.CostMicroUSD != 0 {
+		t.Fatalf("unmatched provider summary = %+v, want empty", byOther.Summary)
+	}
+	// The same holds for a key filter that excludes the adjusted request.
+	other, _ := h.mustKey(KeySpec{Enabled: true})
+	byKey, err := h.store.Report(ctx, Filter{From: from, To: to, KeyID: other.ID})
+	if err != nil {
+		t.Fatalf("other key report: %v", err)
+	}
+	if byKey.Summary.AdjustmentMicroUSD != 0 {
+		t.Fatalf("adjustment leaked into an unrelated key: %d", byKey.Summary.AdjustmentMicroUSD)
 	}
 }
