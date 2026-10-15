@@ -32,7 +32,11 @@ func (s *Store) Reserve(ctx context.Context, in ReserveInput) (Request, error) {
 			if existing.traceID != in.TraceID || existing.keyID != in.KeyID || existing.model != in.RequestedModel {
 				return fmt.Errorf("%w: lifecycle id already bound to another request", ErrConflict)
 			}
-			out = existing.toRequest(nil)
+			adjustments, err := adjustmentTotals(ctx, tx, "r.id = ?", []any{existing.id})
+			if err != nil {
+				return err
+			}
+			out = existing.toRequest(nil, adjustments)
 			return nil
 		case errors.Is(err, ErrNotFound):
 		default:
@@ -94,8 +98,7 @@ func (s *Store) Reserve(ctx context.Context, in ReserveInput) (Request, error) {
 			return fmt.Errorf("insert request: %w", err)
 		}
 		if hold != 0 {
-			if _, err := tx.ExecContext(ctx, `UPDATE keys SET held_micro_usd = held_micro_usd + ? WHERE id = ?`,
-				hold, key.id); err != nil {
+			if err := bumpKeyColumn(ctx, tx, key.id, "held_micro_usd", hold); err != nil {
 				return fmt.Errorf("update key hold: %w", err)
 			}
 		}
@@ -148,7 +151,18 @@ func (s *Store) checkMoneyLimits(ctx context.Context, tx *sql.Tx, key *keyRow, a
 		if err != nil {
 			return err
 		}
-		total, err := checkedAdd(spent, hold)
+		// Unresolved requests admitted in this same period still hold budget
+		// that has not been charged yet; without them two concurrent requests
+		// could each pass the check and jointly exceed the limit.
+		held, err := periodHold(ctx, tx, key.id, l.win, at)
+		if err != nil {
+			return err
+		}
+		total, err := checkedAdd(spent, held)
+		if err != nil {
+			return err
+		}
+		total, err = checkedAdd(total, hold)
 		if err != nil {
 			return err
 		}
@@ -202,14 +216,6 @@ func (s *Store) checkTokenLimits(ctx context.Context, tx *sql.Tx, key *keyRow, m
 	if limit == nil {
 		return nil
 	}
-	reserved, err := reservedTokens(ctx, tx, key.id, model)
-	if err != nil {
-		return err
-	}
-	admit, err := checkedAdd(reserved, estimate)
-	if err != nil {
-		return err
-	}
 	windows := []struct {
 		win   string
 		limit int64
@@ -222,6 +228,16 @@ func (s *Store) checkTokenLimits(ctx context.Context, tx *sql.Tx, key *keyRow, m
 	for _, w := range windows {
 		if w.limit <= 0 {
 			continue
+		}
+		// Estimates are period scoped: an unresolved request only occupies the
+		// period it was admitted in, so stale work cannot starve the next one.
+		reserved, err := reservedTokens(ctx, tx, key.id, model, w.win, at)
+		if err != nil {
+			return err
+		}
+		admit, err := checkedAdd(reserved, estimate)
+		if err != nil {
+			return err
 		}
 		used, err := tokenCounter(ctx, tx, key.id, model, w.win, periodOf(w.win, at))
 		if err != nil {

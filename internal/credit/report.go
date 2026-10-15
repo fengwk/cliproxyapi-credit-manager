@@ -209,7 +209,26 @@ func (s *Store) reportSummary(ctx context.Context, q querier, where string, args
 		return Summary{}, fmt.Errorf("summarize executions: %w", err)
 	}
 	totals.apply(&sum)
+	adjustments, err := adjustmentTotals(ctx, q, where, args)
+	if err != nil {
+		return Summary{}, err
+	}
+	sum.AdjustmentMicroUSD = adjustments
 	return sum, nil
+}
+
+// adjustmentTotals sums manual Resolve charges of the filtered requests. The
+// predicate is the request-level one: an adjustment belongs to a request, not
+// to a single execution, so it is reported whole whenever the request is
+// reported. CostMicroUSD stays execution derived, and cost + adjustments
+// reconciles with the key ledger spend for the same request selection.
+func adjustmentTotals(ctx context.Context, q querier, where string, args []any) (int64, error) {
+	total, err := counterValue(ctx, q, `SELECT COALESCE(SUM(a.amount_micro_usd),0) FROM adjustments a
+		JOIN requests r ON r.id = a.request_id WHERE `+where, args...)
+	if err != nil {
+		return 0, fmt.Errorf("summarize adjustments: %w", err)
+	}
+	return total, nil
 }
 
 func (s *Store) reportTrend(ctx context.Context, q querier, where string, args []any, execWhere string, execArgs []any, bucket int64) ([]Point, error) {
@@ -269,6 +288,37 @@ func (s *Store) reportTrend(ctx context.Context, q querier, where string, args [
 	if err := execRows.Err(); err != nil {
 		return nil, fmt.Errorf("iterate trend executions: %w", err)
 	}
+
+	// Adjustments follow the bucket of the request they belong to, so the
+	// trend always sums to the summary total.
+	adjustRows, err := q.QueryContext(ctx, `SELECT (r.started_at / ?) * ? AS bucket,
+		COALESCE(SUM(a.amount_micro_usd),0)
+		FROM adjustments a JOIN requests r ON r.id = a.request_id
+		WHERE `+where+` GROUP BY bucket ORDER BY bucket`,
+		append([]any{bucket, bucket}, args...)...)
+	if err != nil {
+		return nil, fmt.Errorf("trend adjustments: %w", err)
+	}
+	defer adjustRows.Close()
+	for adjustRows.Next() {
+		var (
+			b     int64
+			total int64
+		)
+		if err := adjustRows.Scan(&b, &total); err != nil {
+			return nil, fmt.Errorf("scan trend adjustments: %w", err)
+		}
+		point, ok := points[b]
+		if !ok {
+			point = &Summary{}
+			points[b] = point
+			order = append(order, b)
+		}
+		point.AdjustmentMicroUSD = total
+	}
+	if err := adjustRows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate trend adjustments: %w", err)
+	}
 	slices.Sort(order)
 	out := make([]Point, 0, len(order))
 	for _, b := range order {
@@ -320,13 +370,35 @@ func (s *Store) reportItems(ctx context.Context, q querier, where string, args [
 			return nil, fmt.Errorf("iterate executions: %w", err)
 		}
 	}
+	adjustments := map[string]int64{}
+	if len(ids) > 0 {
+		adjustRows, err := q.QueryContext(ctx, `SELECT a.request_id, COALESCE(SUM(a.amount_micro_usd),0)
+			FROM adjustments a WHERE a.request_id IN (`+placeholders(len(ids))+`) GROUP BY a.request_id`, ids...)
+		if err != nil {
+			return nil, fmt.Errorf("list adjustments: %w", err)
+		}
+		defer adjustRows.Close()
+		for adjustRows.Next() {
+			var (
+				id    string
+				total int64
+			)
+			if err := adjustRows.Scan(&id, &total); err != nil {
+				return nil, fmt.Errorf("scan adjustments: %w", err)
+			}
+			adjustments[id] = total
+		}
+		if err := adjustRows.Err(); err != nil {
+			return nil, fmt.Errorf("iterate adjustments: %w", err)
+		}
+	}
 	out := make([]Request, 0, len(entries))
 	for _, r := range entries {
 		executions := byRequest[r.id]
 		if executions == nil {
 			executions = []Usage{}
 		}
-		out = append(out, r.toRequest(executions))
+		out = append(out, r.toRequest(executions, adjustments[r.id]))
 	}
 	return out, nil
 }
@@ -370,15 +442,17 @@ func (s *Store) Resolve(ctx context.Context, id string, resolution Resolution) e
 			if err := addMoney(ctx, tx, req.keyID, req.startedAt, amount); err != nil {
 				return err
 			}
-			if _, err := tx.ExecContext(ctx, `UPDATE keys SET spent_micro_usd = spent_micro_usd + ? WHERE id = ?`,
-				amount, req.keyID); err != nil {
-				return fmt.Errorf("update key spend: %w", err)
+			if err := bumpKeyColumn(ctx, tx, req.keyID, "spent_micro_usd", amount); err != nil {
+				return err
 			}
-			if _, err := tx.ExecContext(ctx, `UPDATE requests SET charge_micro_usd = charge_micro_usd + ? WHERE id = ?`,
-				amount, req.id); err != nil {
-				return fmt.Errorf("update request charge: %w", err)
+			if err := bumpRequestCharge(ctx, tx, req.id, amount); err != nil {
+				return err
 			}
-			req.charge += amount
+			next, err := checkedAdd(req.charge, amount)
+			if err != nil {
+				return err
+			}
+			req.charge = next
 		}
 		return s.settleRequest(ctx, tx, req, at, resolution.Action)
 	})

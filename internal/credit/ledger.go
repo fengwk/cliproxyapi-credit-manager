@@ -26,22 +26,23 @@ type reqRow struct {
 	resolved      string
 }
 
-func (r *reqRow) toRequest(executions []Usage) Request {
+func (r *reqRow) toRequest(executions []Usage, adjustment int64) Request {
 	if executions == nil {
 		executions = []Usage{}
 	}
 	return Request{
-		ID:           r.id,
-		TraceID:      r.traceID,
-		KeyID:        r.keyID,
-		Model:        r.model,
-		Outcome:      r.outcome,
-		State:        r.state,
-		StartedAt:    r.startedAt,
-		CompletedAt:  r.completedAt,
-		HeldMicroUSD: r.held,
-		Price:        r.price,
-		Executions:   executions,
+		ID:                 r.id,
+		TraceID:            r.traceID,
+		KeyID:              r.keyID,
+		Model:              r.model,
+		Outcome:            r.outcome,
+		State:              r.state,
+		StartedAt:          r.startedAt,
+		CompletedAt:        r.completedAt,
+		HeldMicroUSD:       r.held,
+		AdjustmentMicroUSD: adjustment,
+		Price:              r.price,
+		Executions:         executions,
 	}
 }
 
@@ -90,6 +91,28 @@ func loadRequestByTrace(ctx context.Context, q querier, traceID string) (*reqRow
 	return loadRequest(ctx, q, "trace_id = ?", traceID)
 }
 
+// periodBounds returns the half open UTC range of a counter window that
+// contains at. Every window uses the same concrete range in SQL so admission
+// and accrual always agree on which period a value belongs to.
+func periodBounds(win string, at time.Time) (time.Time, time.Time) {
+	u := at.UTC()
+	switch win {
+	case windowDay:
+		start := time.Date(u.Year(), u.Month(), u.Day(), 0, 0, 0, 0, time.UTC)
+		return start, start.AddDate(0, 0, 1)
+	case windowWeek:
+		day := time.Date(u.Year(), u.Month(), u.Day(), 0, 0, 0, 0, time.UTC)
+		offset := (int(day.Weekday()) + 6) % 7 // Monday starts an ISO week
+		start := day.AddDate(0, 0, -offset)
+		return start, start.AddDate(0, 0, 7)
+	case windowMonth:
+		start := time.Date(u.Year(), u.Month(), 1, 0, 0, 0, 0, time.UTC)
+		return start, start.AddDate(0, 1, 0)
+	default:
+		return time.Time{}, time.Time{}
+	}
+}
+
 // addMoney accrues an amount into the durable total/day/week/month counters of
 // a key, stamped with the request admission period.
 func addMoney(ctx context.Context, q querier, keyID string, at time.Time, delta int64) error {
@@ -97,11 +120,8 @@ func addMoney(ctx context.Context, q querier, keyID string, at time.Time, delta 
 		return nil
 	}
 	for _, win := range []string{windowTotal, windowDay, windowWeek, windowMonth} {
-		if _, err := q.ExecContext(ctx, `INSERT INTO key_money_counters(key_id, win, period, micro_usd)
-			VALUES(?,?,?,?)
-			ON CONFLICT(key_id, win, period) DO UPDATE SET micro_usd = micro_usd + excluded.micro_usd`,
-			keyID, win, periodOf(win, at), delta); err != nil {
-			return fmt.Errorf("update money counter: %w", err)
+		if err := bumpMoneyCounter(ctx, q, keyID, win, periodOf(win, at), delta); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -114,14 +134,114 @@ func addTokens(ctx context.Context, q querier, keyID, model string, at time.Time
 		return nil
 	}
 	for _, win := range []string{windowTotal, windowDay, windowWeek, windowMonth} {
-		if _, err := q.ExecContext(ctx, `INSERT INTO key_token_counters(key_id, model, win, period, tokens)
-			VALUES(?,?,?,?,?)
-			ON CONFLICT(key_id, model, win, period) DO UPDATE SET tokens = tokens + excluded.tokens`,
-			keyID, model, win, periodOf(win, at), delta); err != nil {
-			return fmt.Errorf("update token counter: %w", err)
+		if err := bumpTokenCounter(ctx, q, keyID, model, win, periodOf(win, at), delta); err != nil {
+			return err
 		}
 	}
 	return nil
+}
+
+// bumpMoneyCounter adds delta to one money counter row. SQLite silently turns an
+// overflowing INTEGER sum into a REAL, which would corrupt money, so the sum is
+// computed in Go with an overflow check and written back as an exact integer
+// inside the caller transaction.
+func bumpMoneyCounter(ctx context.Context, q querier, keyID, win, period string, delta int64) error {
+	cur, err := moneyCounter(ctx, q, keyID, win, period)
+	if err != nil {
+		return err
+	}
+	next, err := checkedAdd(cur, delta)
+	if err != nil {
+		return fmt.Errorf("money counter %s: %w", win, err)
+	}
+	if next < 0 {
+		return fmt.Errorf("%w: negative money counter %s", ErrConflict, win)
+	}
+	if _, err := q.ExecContext(ctx, `INSERT INTO key_money_counters(key_id, win, period, micro_usd)
+		VALUES(?,?,?,?)
+		ON CONFLICT(key_id, win, period) DO UPDATE SET micro_usd = excluded.micro_usd`,
+		keyID, win, period, next); err != nil {
+		return fmt.Errorf("update money counter: %w", err)
+	}
+	return nil
+}
+
+// bumpTokenCounter is the token counterpart of bumpMoneyCounter.
+func bumpTokenCounter(ctx context.Context, q querier, keyID, model, win, period string, delta int64) error {
+	cur, err := tokenCounter(ctx, q, keyID, model, win, period)
+	if err != nil {
+		return err
+	}
+	next, err := checkedAdd(cur, delta)
+	if err != nil {
+		return fmt.Errorf("token counter %s: %w", win, err)
+	}
+	if next < 0 {
+		return fmt.Errorf("%w: negative token counter %s", ErrConflict, win)
+	}
+	if _, err := q.ExecContext(ctx, `INSERT INTO key_token_counters(key_id, model, win, period, tokens)
+		VALUES(?,?,?,?,?)
+		ON CONFLICT(key_id, model, win, period) DO UPDATE SET tokens = excluded.tokens`,
+		keyID, model, win, period, next); err != nil {
+		return fmt.Errorf("update token counter: %w", err)
+	}
+	return nil
+}
+
+// bumpKeyColumn applies a checked delta to one monetary column of a key row.
+// column is always a package constant.
+func bumpKeyColumn(ctx context.Context, q querier, keyID, column string, delta int64) error {
+	cur, err := counterValue(ctx, q, `SELECT `+column+` FROM keys WHERE id = ?`, keyID)
+	if err != nil {
+		return err
+	}
+	next, err := checkedAdd(cur, delta)
+	if err != nil {
+		return fmt.Errorf("key %s: %w", column, err)
+	}
+	if next < 0 {
+		return fmt.Errorf("%w: negative %s for key %s", ErrConflict, column, keyID)
+	}
+	res, err := q.ExecContext(ctx, `UPDATE keys SET `+column+` = ? WHERE id = ?`, next, keyID)
+	if err != nil {
+		return fmt.Errorf("update key %s: %w", column, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("update key %s: %w", column, err)
+	}
+	if n != 1 {
+		return fmt.Errorf("%w: key %s not found for %s", ErrConflict, keyID, column)
+	}
+	return nil
+}
+
+// bumpRequestCharge accrues the booked cost of a request the same overflow safe
+// way as the key ledger.
+func bumpRequestCharge(ctx context.Context, q querier, requestID string, delta int64) error {
+	cur, err := counterValue(ctx, q, `SELECT charge_micro_usd FROM requests WHERE id = ?`, requestID)
+	if err != nil {
+		return err
+	}
+	next, err := checkedAdd(cur, delta)
+	if err != nil {
+		return fmt.Errorf("request charge: %w", err)
+	}
+	if _, err := q.ExecContext(ctx, `UPDATE requests SET charge_micro_usd = ? WHERE id = ?`, next, requestID); err != nil {
+		return fmt.Errorf("update request charge: %w", err)
+	}
+	return nil
+}
+
+// periodHold sums the still open holds of unresolved requests admitted inside
+// the window period. Holds never move between periods, so last month's pending
+// work cannot consume this month's budget, while the lifetime window keeps
+// counting every unresolved hold.
+func periodHold(ctx context.Context, q querier, keyID, win string, at time.Time) (int64, error) {
+	start, end := periodBounds(win, at)
+	return counterValue(ctx, q, `SELECT COALESCE(SUM(held_micro_usd),0) FROM requests
+		WHERE key_id = ? AND state IN (?,?) AND started_at >= ? AND started_at < ?`,
+		keyID, stateActive, statePending, unixNano(start), unixNano(end))
 }
 
 func counterValue(ctx context.Context, q querier, query string, args ...any) (int64, error) {
@@ -146,10 +266,19 @@ func tokenCounter(ctx context.Context, q querier, keyID, model, win, period stri
 		keyID, model, win, period)
 }
 
-// reservedTokens sums admission estimates of unresolved requests.
-func reservedTokens(ctx context.Context, q querier, keyID, model string) (int64, error) {
+// reservedTokens sums admission estimates of unresolved requests for one
+// window. Period windows only count requests admitted inside that period, so a
+// request opened last month does not consume this month's token budget; the
+// lifetime window still counts every unresolved request.
+func reservedTokens(ctx context.Context, q querier, keyID, model, win string, at time.Time) (int64, error) {
+	if win == windowTotal {
+		return counterValue(ctx, q, `SELECT COALESCE(SUM(token_estimate),0) FROM requests
+			WHERE key_id=? AND model=? AND state IN (?,?)`, keyID, model, stateActive, statePending)
+	}
+	start, end := periodBounds(win, at)
 	return counterValue(ctx, q, `SELECT COALESCE(SUM(token_estimate),0) FROM requests
-		WHERE key_id=? AND model=? AND state IN (?,?)`, keyID, model, stateActive, statePending)
+		WHERE key_id=? AND model=? AND state IN (?,?) AND started_at >= ? AND started_at < ?`,
+		keyID, model, stateActive, statePending, unixNano(start), unixNano(end))
 }
 
 type usageAgg struct {
@@ -175,18 +304,22 @@ func (s *Store) applyCharge(ctx context.Context, tx *sql.Tx, req *reqRow, usageI
 	if err := addMoney(ctx, tx, req.keyID, req.startedAt, amount); err != nil {
 		return err
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE keys SET spent_micro_usd = spent_micro_usd + ? WHERE id = ?`,
-		amount, req.keyID); err != nil {
-		return fmt.Errorf("update key spend: %w", err)
+	if err := bumpKeyColumn(ctx, tx, req.keyID, "spent_micro_usd", amount); err != nil {
+		return err
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE usages SET charged = 1 WHERE id = ?`, usageID); err != nil {
 		return fmt.Errorf("mark usage charged: %w", err)
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE requests SET charge_micro_usd = charge_micro_usd + ? WHERE id = ?`,
-		amount, req.id); err != nil {
-		return fmt.Errorf("update request charge: %w", err)
+	if err := bumpRequestCharge(ctx, tx, req.id, amount); err != nil {
+		return err
 	}
-	req.charge += amount
+	// req.charge mirrors what was just persisted, so the cached row used by the
+	// rest of the transaction cannot drift from the ledger.
+	next, err := checkedAdd(req.charge, amount)
+	if err != nil {
+		return err
+	}
+	req.charge = next
 	return nil
 }
 
@@ -198,17 +331,10 @@ func (s *Store) settleRequest(ctx context.Context, tx *sql.Tx, req *reqRow, at t
 		return nil
 	}
 	if req.held != 0 {
-		res, err := tx.ExecContext(ctx, `UPDATE keys SET held_micro_usd = held_micro_usd - ?
-			WHERE id = ? AND held_micro_usd >= ?`, req.held, req.keyID, req.held)
-		if err != nil {
+		// A negative result would mean the request released more than the key
+		// ever held, so bumpKeyColumn fails instead of corrupting the ledger.
+		if err := bumpKeyColumn(ctx, tx, req.keyID, "held_micro_usd", -req.held); err != nil {
 			return fmt.Errorf("release hold: %w", err)
-		}
-		n, err := res.RowsAffected()
-		if err != nil {
-			return fmt.Errorf("release hold: %w", err)
-		}
-		if n != 1 {
-			return fmt.Errorf("%w: hold accounting is inconsistent for key %s", ErrConflict, req.keyID)
 		}
 		req.held = 0
 	}
