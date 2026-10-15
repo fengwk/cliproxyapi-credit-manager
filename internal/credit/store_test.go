@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -519,5 +520,124 @@ func TestUpdateKeyRejectsMaterial(t *testing.T) {
 	}
 	if _, err := h.store.Authenticate(h.ctx(), "sk-injected-material-0001"); !errors.Is(err, ErrUnauthorized) {
 		t.Fatalf("injected material err = %v, want ErrUnauthorized", err)
+	}
+}
+
+// callerScopeVectors were produced by an independent implementation of the host
+// derivation (python hashlib.sha256 over "cli-proxy-api:caller-scope:v1\x00" +
+// principal), not by this package. They pin the exact wire value the host puts
+// into caller_scope metadata.
+var callerScopeVectors = []struct {
+	principal string
+	scope     string
+}{
+	{"cmk:11111111-2222-4333-8444-555555555555", "0924e47f31032f9fe4db5e1962c74e5dce602db2a9bc0cc7ce21c5b3937a8e64"},
+	{"cmk:abcdefab-1234-4567-89ab-cdefabcdefab", "4ea269ea8219a15517aa8eaed744ed8dc2db213a21588efa1eea9c94d45bb40a"},
+}
+
+// TestCallerScopeMatchesHostContract verifies the scope against external
+// vectors so a local mistake cannot be masked by using the same code twice.
+func TestCallerScopeMatchesHostContract(t *testing.T) {
+	for _, v := range callerScopeVectors {
+		if got := callerScope(v.principal); got != v.scope {
+			t.Fatalf("callerScope(%q) = %q, want %q", v.principal, got, v.scope)
+		}
+		// The host trims the value and returns an empty scope for empty input.
+		if got := callerScope("  " + v.principal + "\t"); got != v.scope {
+			t.Fatalf("callerScope with padding = %q, want %q", got, v.scope)
+		}
+	}
+	if got := callerScope(""); got != "" {
+		t.Fatalf("callerScope(empty) = %q, want empty", got)
+	}
+	if got := callerScope("   "); got != "" {
+		t.Fatalf("callerScope(blank) = %q, want empty", got)
+	}
+}
+
+// TestKeyScopeIsHostCallerScope proves the stored scope is exactly the host
+// derivation for the key principal, and that KeyByScope resolves it.
+func TestKeyScopeIsHostCallerScope(t *testing.T) {
+	h := newHarness(t)
+	key, _ := h.mustKey(KeySpec{Enabled: true})
+	if !strings.HasPrefix(key.Principal, principalPrefix) {
+		t.Fatalf("principal = %q, want %s prefix", key.Principal, principalPrefix)
+	}
+	want := callerScope(key.Principal)
+	if key.Scope != want {
+		t.Fatalf("scope = %q, want caller scope %q", key.Scope, want)
+	}
+	if len(key.Scope) != 64 {
+		t.Fatalf("scope = %q, want 64 hex characters", key.Scope)
+	}
+	// A generated key must not use the retired random scope format.
+	if strings.HasPrefix(key.Scope, "cms:") {
+		t.Fatalf("scope %q still uses the random prefix", key.Scope)
+	}
+	resolved, err := h.store.KeyByScope(h.ctx(), want)
+	if err != nil {
+		t.Fatalf("key by scope: %v", err)
+	}
+	if resolved.ID != key.ID || resolved.Principal != key.Principal {
+		t.Fatalf("resolved key = %+v", resolved)
+	}
+	// The native layer resolves every request through this scope, so an
+	// unrelated value must stay unknown.
+	if _, err := h.store.KeyByScope(h.ctx(), callerScope("cmk:00000000-0000-4000-8000-000000000000")); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("unknown scope err = %v, want ErrNotFound", err)
+	}
+	if _, err := h.store.KeyByScope(h.ctx(), "cms:not-a-scope"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("legacy scope err = %v, want ErrNotFound", err)
+	}
+	// Two keys never share a scope.
+	other, _ := h.mustKey(KeySpec{Enabled: true})
+	if other.Scope == key.Scope {
+		t.Fatal("two keys share one scope")
+	}
+	if _, err := h.store.KeyByScope(h.ctx(), other.Scope); err != nil {
+		t.Fatalf("resolving the second key: %v", err)
+	}
+}
+
+// TestScopeStableAcrossRotationAndRestart keeps the principal/scope pair
+// stable for the whole life of a key.
+func TestScopeStableAcrossRotationAndRestart(t *testing.T) {
+	h := newHarness(t)
+	key, _ := h.mustKey(KeySpec{Enabled: true})
+	// A key created with custom material uses the same derivation.
+	custom, _ := h.mustKey(KeySpec{Material: "sk-custom-scope-material-1", Enabled: true})
+	if custom.Scope != callerScope(custom.Principal) {
+		t.Fatalf("custom key scope = %q", custom.Scope)
+	}
+	if custom.Scope == key.Scope {
+		t.Fatal("distinct keys must not share a scope")
+	}
+	// Rotation keeps the identity of the key intact.
+	rotated, _, err := h.store.RotateKey(h.ctx(), key.ID, "")
+	if err != nil {
+		t.Fatalf("rotate: %v", err)
+	}
+	if rotated.Scope != key.Scope || rotated.Principal != key.Principal {
+		t.Fatalf("rotation changed identity: %+v", rotated)
+	}
+	if err := h.store.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	reopened, err := Open(Options{DataDir: h.dir, Now: h.clock.now})
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer reopened.Close()
+	for _, want := range []Key{key, custom} {
+		reloaded, err := reopened.KeyByScope(context.Background(), want.Scope)
+		if err != nil {
+			t.Fatalf("key by scope after restart: %v", err)
+		}
+		if reloaded.ID != want.ID || reloaded.Scope != want.Scope || reloaded.Principal != want.Principal {
+			t.Fatalf("reloaded key = %+v, want %+v", reloaded, want)
+		}
+		if reloaded.Scope != callerScope(reloaded.Principal) {
+			t.Fatalf("persisted scope %q is not the host derivation of %q", reloaded.Scope, reloaded.Principal)
+		}
 	}
 }

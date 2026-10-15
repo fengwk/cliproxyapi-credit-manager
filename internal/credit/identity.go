@@ -11,7 +11,6 @@ import (
 
 const (
 	principalPrefix = "cmk:"
-	scopePrefix     = "cms:"
 	materialPrefix  = "sk-"
 	materialChars   = 48
 	alphabet        = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
@@ -70,6 +69,24 @@ func newMaterial() (string, error) {
 	}
 	sb.Write(out)
 	return sb.String(), nil
+}
+
+// callerScopeSalt is the host namespace salt. CPA derives the trusted
+// caller_scope value as hex(sha256(salt + principal)). The derivation is
+// duplicated here with stdlib crypto so this package keeps the host's identity
+// stable without depending on the SDK session graph.
+const callerScopeSalt = "cli-proxy-api:caller-scope:v1\x00"
+
+// callerScope mirrors session.CallerScope of the host SDK. The scope is an
+// irreversible identity, never a secret, and it must match what the host puts
+// into caller_scope metadata or every request would fail authentication.
+func callerScope(principal string) string {
+	value := strings.TrimSpace(principal)
+	if value == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(callerScopeSalt + value))
+	return hex.EncodeToString(sum[:])
 }
 
 // materialHMAC is the irreversible key verifier. Plain material is never stored.

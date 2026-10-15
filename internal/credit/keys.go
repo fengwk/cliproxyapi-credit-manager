@@ -243,10 +243,10 @@ func (s *Store) CreateKey(ctx context.Context, spec KeySpec) (Key, string, error
 	if err != nil {
 		return Key{}, "", err
 	}
-	scope, err := newUUID()
-	if err != nil {
-		return Key{}, "", err
-	}
+	principalValue := principalPrefix + principal
+	// The scope must equal the host's trusted session.CallerScope(principal),
+	// otherwise the native layer can never resolve a request back to this key.
+	scope := callerScope(principalValue)
 	hmac := materialHMAC(s.pepper, material)
 	now := s.nowUTC()
 	var out Key
@@ -259,7 +259,7 @@ func (s *Store) CreateKey(ctx context.Context, spec KeySpec) (Key, string, error
 			 daily_micro_usd, weekly_micro_usd, monthly_micro_usd, max_concurrent,
 			 allowed_models, expires_at, created_at, spent_micro_usd, held_micro_usd)
 			VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,0)`,
-			id, principalPrefix+principal, scopePrefix+scope, fingerprintOf(hmac), hmac,
+			id, principalValue, scope, fingerprintOf(hmac), hmac,
 			norm.Label, boolInt(norm.Enabled), norm.QuotaMicroUSD, norm.DailyMicroUSD, norm.WeeklyMicroUSD,
 			norm.MonthlyMicroUSD, norm.MaxConcurrent, allowed, nullableNano(norm.ExpiresAt), unixNano(now)); err != nil {
 			return fmt.Errorf("insert key: %w", err)
@@ -269,8 +269,8 @@ func (s *Store) CreateKey(ctx context.Context, spec KeySpec) (Key, string, error
 		}
 		out = Key{
 			ID:          id,
-			Principal:   principalPrefix + principal,
-			Scope:       scopePrefix + scope,
+			Principal:   principalValue,
+			Scope:       scope,
 			Fingerprint: fingerprintOf(hmac),
 			Spec:        norm,
 			CreatedAt:   now,
