@@ -211,41 +211,56 @@ def pinned_no_fallback(ctx):
 
 
 @case("warmup.parallel_same_account_request_billed",
-      "a customer request runs alongside the warmup worker on the same account and is billed normally")
+      "a customer request runs alongside the warmup worker on the exact same credential (AuthID) and is billed normally")
 def parallel_billed(ctx):
-    _boot(ctx, "parallel")
-    ctx.set_price(MODEL)
-    auth_id, provider = _discover_credential(ctx)
-    baseline = ctx.usage_rows()["total"]
-    item, key = ctx.new_key(label="warmup-customer")
+    # Bind a single synthetic upstream credential so warmup's pinned AuthID and
+    # the customer request's Usage.AuthID identify the same account exactly.
+    # With two api keys the host may pick either, which would only prove
+    # same-entry, not same-credential. The list is restored so no other case is
+    # perturbed (retry keeps its two keys).
+    saved_keys = list(ctx.openai_upstream_keys)
+    bound_key = saved_keys[0]
+    ctx.openai_upstream_keys = [bound_key]
+    try:
+        _boot(ctx, "parallel")
+        ctx.set_price(MODEL)
+        auth_id, provider = _discover_credential(ctx)
+        baseline = ctx.usage_rows()["total"]
+        item, key = ctx.new_key(label="warmup-customer")
 
-    ctx.mock.reset()
-    # A 1s interval keeps the worker probing for the duration of the case.
-    _patch_warmup(ctx, auth_id, provider, interval="1s")
-    check(ctx.wait_until(lambda: _probes(ctx) or None, timeout=10), "the warmup worker is probing")
+        ctx.mock.reset()
+        # A 1s interval keeps the worker probing for the duration of the case.
+        _patch_warmup(ctx, auth_id, provider, interval="1s")
+        check(ctx.wait_until(lambda: _probes(ctx) or None, timeout=10), "the warmup worker is probing")
 
-    response = ctx.client.chat(key, MODEL)
-    check_eq(response.status, 200, "the customer request succeeds while warmup runs")
-    check(b"synthetic answer" in response.raw, "the customer request is answered upstream")
+        response = ctx.client.chat(key, MODEL)
+        check_eq(response.status, 200, "the customer request succeeds while warmup runs")
+        check(b"synthetic answer" in response.raw, "the customer request is answered upstream")
 
-    request = ctx.wait_until(lambda: ctx.find_request(key_id=item["id"]), timeout=15)
-    check(request is not None, "the customer request is recorded")
-    execution = request["executions"][0]
-    # The account is the configured entry; the host may pick any of its api
-    # keys, so assert the same entry/provider rather than one exact key id.
-    check_eq(execution["provider"], provider,
-             "the customer request used the same upstream provider/account")
-    check(execution["auth_id"].startswith("openai-compatibility:synthetic-openai:"),
-          f"the customer request used the same configured account entry: {execution['auth_id']}")
-    check_eq(execution["cost_micro_usd"], 14, "the customer request was charged exactly 14")
-    check_eq(_spent(ctx, item["id"]), 14, "the customer key was charged 14")
-    check_eq(_held(ctx, item["id"]), 0, "the settled customer request holds nothing")
-    check_eq(ctx.usage_rows()["total"], baseline + 1,
-             "only the customer request was accounted; probes added no ledger rows")
-    check(len(_probes(ctx)) >= 1, "probes kept running in parallel with the customer request")
-    return {"auth_id": auth_id, "customer_cost": execution["cost_micro_usd"], "customer_auth_id": execution["auth_id"],
-            "customer_spent": _spent(ctx, item["id"]), "customer_held": _held(ctx, item["id"]),
-            "probes": len(_probes(ctx)), "usage_total": ctx.usage_rows()["total"]}
+        request = ctx.wait_until(lambda: ctx.find_request(key_id=item["id"]), timeout=15)
+        check(request is not None, "the customer request is recorded")
+        execution = request["executions"][0]
+        check_eq(execution["auth_id"], auth_id,
+                 "the customer request used the exact same credential (AuthID) as warmup")
+        check_eq(execution["provider"], provider,
+                 "the customer request used the same provider/account entry")
+        check_eq(execution["cost_micro_usd"], 14, "the customer request was charged exactly 14")
+        check_eq(_spent(ctx, item["id"]), 14, "the customer key was charged 14")
+        check_eq(_held(ctx, item["id"]), 0, "the settled customer request holds nothing")
+        check_eq(ctx.usage_rows()["total"], baseline + 1,
+                 "only the customer request was accounted; probes added no ledger rows")
+        check(len(_probes(ctx)) >= 1, "probes kept running in parallel with the customer request")
+        check(all(call["upstream_key"] == bound_key for call in _probes(ctx)),
+              "every probe used the bound credential")
+        result = {"auth_id": auth_id, "provider": provider, "bound_upstream_key": bound_key,
+                  "customer_cost": execution["cost_micro_usd"], "customer_auth_id": execution["auth_id"],
+                  "customer_spent": _spent(ctx, item["id"]), "customer_held": _held(ctx, item["id"]),
+                  "probes": len(_probes(ctx)),
+                  "probe_upstream_keys": sorted({c["upstream_key"] for c in _probes(ctx)}),
+                  "usage_total": ctx.usage_rows()["total"]}
+    finally:
+        ctx.openai_upstream_keys = saved_keys
+    return result
 
 
 @case("warmup.forged_session_header_still_billed",

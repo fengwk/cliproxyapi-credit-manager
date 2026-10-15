@@ -85,19 +85,25 @@ Each case's host lives at `<artifacts>/host-<n>-<case>/` with `config.yaml`,
 | `abi` | Direct `.so` probe via ctypes: ABI 1 / RPC schema 6 negotiation, passive-only capabilities (no executor/router/scheduler), older-schema host rejected. |
 | `core` | Host lists the plugin (enabled, metadata, published menu); health; management auth gate (401 without/with wrong key). |
 | `accounting` | Exact cost (input 10 / output 4 / total 14 = 14 microUSD), canonical buckets, complete quality, distinct execution id, same-key ledger, all-zero price is free, unpriced model denied with no upstream call and no poisoning of other keys. |
-| `auth` | Five credential locations, invalid/absent denial with no upstream call, invalid Bearer + valid Google fallback, first-candidate-wins on conflict, original CPA key rejected while exclusive, custom (non `sk-`) prefix key. |
+| `auth` | Five credential locations, invalid/absent denial with no upstream call, invalid Bearer + valid Google fallback, first-candidate-wins on conflict, original CPA key rejected while exclusive, custom (non `sk-`) prefix key. Deployment fail-closed: a plugin-managed key is accepted at all five locations while the plugin is loaded, and with `plugins.enabled: false` (library not loaded) all five are denied with no upstream call while the plugin instance stays unregistered. |
 | `capture` | Disabled vs unavailable vs captured states, lazy fetch, header + JSON redaction, 64-bit integer fidelity, adjustable body limit (oversize skipped). |
 | `report` | `from/to/key_id/model/result/search/page/page_size/bucket` filters, pagination, trend sums equal the summary, full-UUID trace ids searchable. |
 | `resources` | Public resource base serves only the embedded static shell, unauthenticated and credential-free; resource paths cannot reach the financial API. |
 | `namespace` | Request model vs execution/response model are kept distinct for an aliased model; billing uses the requested model's price. |
 | `lifecycle` | Unknown usage stays pending (never free); client cancel does not hang and keeps the hold; restart retains the settled balance and keeps unfinished work pending. |
 | `retry` | A 429 on the first upstream credential fails over, one client request, two independent per-attempt usage rows (failed-unknown not written off), hold retained; all-failures never bill as free. |
-| `warmup` | Background warmup: default-off issues no background activity; enabled issues a *real* pinned host model execution (upstream 1, host log shows credential selection with no client scope) that creates no customer ledger row/hold/charge; an unknown `AuthID` fails with no host-side fallback; a customer request runs alongside the worker and is billed; a forged warmup session header is still billed in full; reconfiguring to disabled leaves no residual worker. |
+| `warmup` | Background warmup: default-off issues no background activity; enabled issues a *real* pinned host model execution (upstream 1, host log shows credential selection with no client scope) that creates no customer ledger row/hold/charge; an unknown `AuthID` fails with no host-side fallback; with a single bound credential a customer request runs alongside the worker on the *exact same AuthID* and is billed; a forged warmup session header is still billed in full; reconfiguring to disabled leaves no residual worker. |
 | `gemini` | Native `generateContent` and `streamGenerateContent` (`alt=sse`) authenticate, forward the upstream Google key and bill. |
 | `browser` | Real isolated-context Chromium: in-memory login, usage render, no localStorage/sessionStorage/cookie/URL credential persistence, lazy capture-body modal with redaction and 64-bit fidelity. |
 
 ## Environment notes
 
+- The plugin is a security control, not an optional add-on: a plugin-managed
+  client key is only valid while the plugin is loaded. Running CPA with
+  `plugins.enabled: false` (or without the library) does not merely stop credit
+  accounting -- it denies every plugin key at all five credential locations, so
+  the deployment fails closed rather than silently falling back to the original
+  CPA `access.api-keys`. The `auth` module's deployment case asserts this.
 - Put `GOTMPDIR` on persistent home storage; some hosts run `/tmp` on a
   quota-limited tmpfs and `go build` of the ~90 MB host binary can otherwise fail
   with `disk quota exceeded`.
