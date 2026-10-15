@@ -138,13 +138,7 @@ class HostConfig:
         lines.append('  configs:')
         lines.append(f'    {self.plugin_id}:')
         lines.append('      enabled: true')
-        for key, value in self.plugin_config.items():
-            if isinstance(value, bool):
-                lines.append(f'      {key}: {str(value).lower()}')
-            elif isinstance(value, str):
-                lines.append(f'      {key}: "{value}"')
-            else:
-                lines.append(f'      {key}: {value}')
+        _emit_mapping(lines, 6, self.plugin_config)
         if self.extra_plugin_yaml:
             lines.append(self.extra_plugin_yaml.rstrip("\n"))
         return "\n".join(lines) + "\n"
@@ -247,3 +241,27 @@ class Host:
     def __exit__(self, *exc):
         self.stop()
         return False
+
+
+def _yaml_scalar(value):
+    if isinstance(value, bool):
+        return str(value).lower()
+    if isinstance(value, (int, float)):
+        return str(value)
+    if value is None:
+        return "null"
+    return '"' + str(value).replace('\\', '\\\\').replace('"', '\\"') + '"'
+
+
+def _emit_mapping(lines, indent, mapping):
+    pad = " " * indent
+    for key, value in mapping.items():
+        if isinstance(value, dict):
+            lines.append(f'{pad}{key}:')
+            _emit_mapping(lines, indent + 2, value)
+        elif isinstance(value, (list, tuple)):
+            lines.append(f'{pad}{key}:')
+            for entry in value:
+                lines.append(f'{pad}  - {_yaml_scalar(entry)}')
+        else:
+            lines.append(f'{pad}{key}: {_yaml_scalar(value)}')

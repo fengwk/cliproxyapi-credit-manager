@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -24,6 +25,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
 from acceptance.context import Context, load_specs  # noqa: E402
+from acceptance.mock import Script  # noqa: E402
 from acceptance.report import Recorder  # noqa: E402
 
 DEFAULT_MODULES = ["abi", "core", "accounting", "auth", "capture", "report", "lifecycle", "retry", "gemini", "browser"]
@@ -45,10 +47,24 @@ def available_modules():
     return sorted(path.stem for path in directory.glob("*.py") if path.stem != "__init__")
 
 
+def reset_artifacts(artifacts: Path) -> None:
+    """Remove harness-owned host directories so each run starts from clean state.
+
+    Only directories this harness creates are touched, so the isolated host
+    databases and logs from the previous run do not leak counts into this one.
+    """
+    if not artifacts.exists():
+        return
+    for child in artifacts.iterdir():
+        if child.is_dir() and (child.name.startswith("host") or child.name == "abi-probe-data"):
+            shutil.rmtree(child, ignore_errors=True)
+
+
 def main(argv=None):
     args = parse_args(argv)
     artifacts = Path(args.artifacts)
     artifacts.mkdir(parents=True, exist_ok=True)
+    reset_artifacts(artifacts)
     recorder = Recorder(artifacts)
 
     modules = [m for m in (args.modules.split(",") if args.modules else DEFAULT_MODULES) if m]
@@ -80,6 +96,8 @@ def main(argv=None):
             # Cases run against the shared isolated host; a case that needs a
             # fresh database or different configuration calls ctx.recreate_host.
             ctx.mock.reset()
+            ctx.mock.default_script = Script()
+            ctx.mock.fail_first = 0
             record = recorder.run(spec["name"], lambda fn=spec["fn"]: fn(ctx), spec["expects"], mock=ctx.mock)
             status = "PASS" if record["pass"] else "FAIL"
             print(f"[{status}] {spec['name']}", file=sys.stderr)

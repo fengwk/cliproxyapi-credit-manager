@@ -105,7 +105,7 @@ class Client:
     def get(self, path, headers=None, timeout=30):
         return Response(*http("GET", self.base_url + path, headers=headers, timeout=timeout))
 
-    def chat(self, key, model, stream=False, content="synthetic", max_tokens=None, location="bearer", extra=None):
+    def chat(self, key, model, stream=False, content="synthetic", max_tokens=None, location="bearer", extra=None, timeout=30):
         body = {
             "model": model,
             "messages": [{"role": "user", "content": content}],
@@ -115,7 +115,7 @@ class Client:
             body["max_tokens"] = max_tokens
         if extra:
             body.update(extra)
-        return self.post("/v1/chat/completions", body, headers=auth_headers(key, location))
+        return self.post("/v1/chat/completions", body, headers=auth_headers(key, location), timeout=timeout)
 
     def gemini(self, key, model, action="generateContent", location="goog", body=None, extra=None):
         payload = body or {"contents": [{"role": "user", "parts": [{"text": "synthetic"}]}]}
@@ -131,7 +131,7 @@ class Client:
 def auth_headers(key, location="bearer"):
     if location == "bearer":
         return {"Authorization": f"Bearer {key}"}
-    if location == "x-goog-api-key":
+    if location in ("x-goog-api-key", "goog"):
         return {"x-goog-api-key": key}
     if location == "x-api-key":
         return {"x-api-key": key}

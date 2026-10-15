@@ -40,12 +40,13 @@ class Script:
     body: optional raw JSON body to answer instead of a generated completion.
     """
 
-    def __init__(self, status=200, usage=None, delay=0.0, body=None, text="synthetic answer"):
+    def __init__(self, status=200, usage=None, delay=0.0, body=None, text="synthetic answer", omit_usage=False):
         self.status = status
         self.usage = dict(usage) if usage is not None else dict(DEFAULT_USAGE)
         self.delay = delay
         self.body = body
         self.text = text
+        self.omit_usage = omit_usage
 
 
 class UpstreamMock:
@@ -56,6 +57,10 @@ class UpstreamMock:
         self.scripts = dict(scripts or {})
         self.default_script = Script()
         self.calls = []
+        # When fail_first > 0, the next N upstream calls answer fail_status before
+        # any per-key script, so credential failover can be exercised.
+        self.fail_first = 0
+        self.fail_status = 429
         self._lock = threading.Lock()
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), self._handler())
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
@@ -133,19 +138,33 @@ class UpstreamMock:
 
             def _send(self, status, payload, content_type="application/json", extra_headers=None):
                 raw = payload if isinstance(payload, (bytes, bytearray)) else wire(payload)
-                self.send_response(status)
-                self.send_header("Content-Type", content_type)
-                self.send_header("Content-Length", str(len(raw)))
-                for name, value in (extra_headers or {}).items():
-                    self.send_header(name, value)
-                self.end_headers()
-                self.wfile.write(raw)
+                try:
+                    self.send_response(status)
+                    self.send_header("Content-Type", content_type)
+                    self.send_header("Content-Length", str(len(raw)))
+                    for name, value in (extra_headers or {}).items():
+                        self.send_header(name, value)
+                    self.end_headers()
+                    self.wfile.write(raw)
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    # The client cancelled; nothing to answer.
+                    pass
 
             def do_POST(self):
                 path = self.path
                 gemini = path.startswith("/v1beta")
                 body = self._read_body()
                 row = self._record(path, body, gemini)
+                with mock._lock:
+                    if mock.fail_first > 0:
+                        mock.fail_first -= 1
+                        forced = mock.fail_status
+                    else:
+                        forced = 0
+                if forced:
+                    self._send(forced, {"error": {"message": f"synthetic forced {forced}",
+                                                  "type": "synthetic_error", "code": forced}})
+                    return
                 script = mock._script_for(row["upstream_key"])
                 if script.delay:
                     time.sleep(script.delay)
@@ -166,7 +185,7 @@ class UpstreamMock:
                     self._send_openai(script, model, bool(body.get("stream")))
 
             def _openai_completion(self, script, model):
-                return {
+                payload = {
                     "id": "chatcmpl-synthetic",
                     "object": "chat.completion",
                     "created": int(time.time()),
@@ -178,8 +197,10 @@ class UpstreamMock:
                             "finish_reason": "stop",
                         }
                     ],
-                    "usage": script.usage,
                 }
+                if not script.omit_usage:
+                    payload["usage"] = script.usage
+                return payload
 
             def _send_openai(self, script, model, stream):
                 if script.body is not None:
