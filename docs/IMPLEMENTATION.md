@@ -79,7 +79,40 @@ Usage.APIKey is principal, AccessProvider must belong to plugin. ResponseModel
 only actual record.ResponseModel, never record.Model fallback. No guessed joins.
 Maintenance failures sticky health; finance failure blocks new Reserve, usage
 errors observable. Source internal/warmup must not attach to customer records.
-Warmup deferred until core verified; don't advertise if absent.
+
+## Warmup (optional, disabled by default)
+
+Plugin-local YAML only: `warmup.enabled` (default false), `warmup.interval`
+(default 1h) and `warmup.targets[]` of `auth_id`, `provider`, `model`,
+`protocol` (openai|claude|gemini, default openai). auth_id, provider and model
+are mandatory so a probe can never fall back to host credential or provider
+selection. No credential material, hold, cap or cooldown is expressed here.
+
+One serial worker starts only when enabled AND targets are non-empty; it issues
+one `host.model.execute` per target immediately and then once per interval, at
+most one in flight. Every probe pins AuthID+ForcedProvider, is non-streaming,
+carries a legal single-turn "max_tokens 1" body, a fresh random proprietary
+session header marker and no caller identity or host callback id. It uses a
+fresh host context, so the host skips this plugin's own interceptors for it: a
+probe never reserves, never settles and never touches the customer ledger.
+Usage attribution does not depend on the marker (a forgeable header is never a
+billing gate): a background execution has no client AccessProvider, so
+`isOwnAccessProvider` rejects its usage before any ledger row is considered, and
+a customer request that forges the marker is still billed in full.
+
+Lifecycle limits, stated accurately: the worker is cancelled on quiesce,
+shutdown and any reconfigure, so no new probe starts; a probe already inside the
+synchronous, non-cancellable host callback can not be aborted. Reconfigure waits
+`warmupSwapGrace` (5s) for it and then refuses with 409 while keeping the old
+configuration and worker, so a stuck probe delays config reload instead of being
+abandoned or duplicated. `plugin.shutdown` waits for that callback without a
+bound before returning, because the host frees the callback context and
+dlclose()s the library immediately afterwards; with warmup enabled and an
+upstream that hangs, plugin shutdown and the hot reload behind it can therefore
+take as long as that request. Neither wait is held across the call gate, so
+customer requests are never blocked behind a probe. Enabling warmup is a real
+request against a real credential: it can observe upstream failures, which is
+the point, and it never excludes or reserves an account on its own.
 
 ## Management HTTP contract
 

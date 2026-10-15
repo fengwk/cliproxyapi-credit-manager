@@ -75,6 +75,12 @@ type Manager struct {
 	lastError        string
 	admissionBlocked bool
 
+	// hostCall is the host callback bridge installed by the native ABI shim. It
+	// is nil when the plugin runs without a host and then issues no warmup.
+	hostCall func(method string, payload []byte) ([]byte, error)
+	// warmup is the single background warmup worker, nil when none is running.
+	warmup *warmupWorker
+
 	maintenanceCancel context.CancelFunc
 	maintenanceDone   chan struct{}
 }
@@ -248,6 +254,23 @@ func (m *Manager) apply(raw []byte, hostSchema uint32) ([]byte, error) {
 		})
 	}
 
+	// Drain the warmup probe before anything else changes, and before the
+	// exclusive gate is taken.
+	//
+	// Two reasons: a customer request must not be refused (or the gate held)
+	// while waiting on a probe that can run for as long as the upstream takes;
+	// and a probe's own nested execution can still deliver usage/complete
+	// callbacks into this plugin, which must never be blocked behind a gate
+	// held by the transition that is waiting for that same probe.
+	//
+	// A probe that does not drain inside the grace is never abandoned: the swap
+	// is refused, the previous configuration and its worker keep running, and
+	// no second worker is ever started. This is a recoverable operator conflict
+	// rather than a warmup fault, so it does not degrade health.
+	if !m.drainWarmupForSwap() {
+		return errorEnvelope(&PluginError{Code: "busy", Message: "a warmup probe is still in flight", HTTPStatus: http.StatusConflict})
+	}
+
 	// Refuse new accounting before the exclusive gate blocks the swap, then
 	// drain in-flight calls. Draining first is what makes the liveness check
 	// below sound: a reservation that started earlier must have committed
@@ -317,6 +340,7 @@ func (m *Manager) apply(raw []byte, hostSchema uint32) ([]byte, error) {
 		m.recordError(captureFault)
 	}
 	m.startMaintenance(store, captures)
+	m.startWarmup(cfg.Warmup)
 	return okEnvelope(reg)
 }
 
@@ -355,6 +379,7 @@ func (m *Manager) restore(raw []byte, hasConfig bool) {
 	m.state = stateLive
 	m.mu.Unlock()
 	m.startMaintenance(store, captures)
+	m.startWarmup(cfg.Warmup)
 }
 
 // newLiveState builds the serving snapshot and connects runtime diagnostics.
@@ -438,6 +463,13 @@ func (m *Manager) quiesce() {
 	current := m.live
 	m.mu.Unlock()
 
+	// Stop new probes before waiting on anything. A probe already inside the
+	// host is not awaited here: quiesce must not block on a synchronous host
+	// call it can not cancel, and the worker leaves on its own once that call
+	// returns. The worker reference stays installed so shutdown can wait for it
+	// before this library is unloaded.
+	m.cancelWarmup()
+
 	m.enterExclusive()
 	defer m.exitExclusive()
 	m.stopMaintenance()
@@ -467,6 +499,16 @@ func (m *Manager) shutdown() {
 	}
 	m.state = stateClosed
 	m.mu.Unlock()
+
+	// Wait for an in-flight warmup probe before returning, and before the
+	// exclusive gate is taken so a probe's own callbacks can still reach this
+	// plugin. The host frees its callback context and dlclose()s this library
+	// as soon as this returns, so this wait is intentionally unbounded: letting
+	// the library go while one of its goroutines can still return into host
+	// memory is a use-after-free, and a bounded wait would only hide it. There
+	// is no host-side cancellation for a model execution, so a stuck upstream
+	// request delays shutdown.
+	m.drainWarmupForShutdown()
 
 	m.enterExclusive()
 	defer m.exitExclusive()
