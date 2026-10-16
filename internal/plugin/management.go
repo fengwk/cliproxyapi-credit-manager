@@ -15,13 +15,16 @@ import (
 // host. The financial handler owns their behavior; registering them here keeps
 // the host contract in one place.
 var managementRouteSuffixes = map[string][]string{
-	"/api/keys":    {http.MethodGet, http.MethodPost, http.MethodPut},
-	"/api/rotate":  {http.MethodPost},
-	"/api/prices":  {http.MethodGet, http.MethodPut},
-	"/api/usage":   {http.MethodGet},
-	"/api/capture": {http.MethodGet},
-	"/api/resolve": {http.MethodPost},
-	"/api/health":  {http.MethodGet},
+	"/api/keys":              {http.MethodGet, http.MethodPost, http.MethodPut},
+	"/api/rotate":            {http.MethodPost},
+	"/api/prices":            {http.MethodGet, http.MethodPut},
+	"/api/pricing-rules":     {http.MethodGet, http.MethodPut},
+	"/api/delete-price-rule": {http.MethodPost},
+	"/api/price-preview":     {http.MethodGet},
+	"/api/usage":             {http.MethodGet},
+	"/api/capture":           {http.MethodGet},
+	"/api/resolve":           {http.MethodPost},
+	"/api/health":            {http.MethodGet},
 }
 
 // resourceAssets are the exact public static files this plugin serves. The list
@@ -96,7 +99,9 @@ func (m *Manager) handleManagementRegister(request []byte) ([]byte, error) {
 
 // sortedManagementSuffixes returns the declared suffixes in a stable order.
 func sortedManagementSuffixes() []string {
-	order := []string{"/api/keys", "/api/rotate", "/api/prices", "/api/usage", "/api/capture", "/api/resolve", "/api/health"}
+	order := []string{"/api/keys", "/api/rotate", "/api/prices", "/api/pricing-rules",
+		"/api/delete-price-rule", "/api/price-preview", "/api/usage", "/api/capture",
+		"/api/resolve", "/api/health"}
 	out := make([]string, 0, len(order))
 	for _, suffix := range order {
 		if _, ok := managementRouteSuffixes[suffix]; ok {
@@ -124,6 +129,15 @@ func managementRouteDescription(method, suffix string) string {
 			return "List configured model prices."
 		}
 		return "Upsert one model price."
+	case "/api/pricing-rules":
+		if method == http.MethodGet {
+			return "List pricing rules in resolution order."
+		}
+		return "Upsert one pricing rule."
+	case "/api/delete-price-rule":
+		return "Delete one pricing rule."
+	case "/api/price-preview":
+		return "Preview the effective price of a model."
 	case "/api/usage":
 		return "Usage and cost report."
 	case "/api/capture":

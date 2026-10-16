@@ -106,6 +106,8 @@ func (m *Manager) interceptBefore(req pluginapi.RequestInterceptRequest) plugina
 		RequestedModel: model,
 		InputEstimate:  int64(len(req.Body)),
 		OutputEstimate: outputEstimate(req.Body),
+		ServiceTier:    requestServiceTier(req.Body),
+		ImageCount:     requestImageCount(req.Body),
 		At:             m.now(),
 	}); errReserve != nil {
 		if !isBusinessRejection(errReserve) {
@@ -219,6 +221,63 @@ func outputEstimate(body []byte) int64 {
 		}
 	}
 	return defaultOutputEstimate
+}
+
+// requestServiceTier reads the requested service tier from the raw request body
+// without modifying it. Both the native service_tier key and the shorter tier
+// key are accepted; an absent or non-string value reads as empty.
+func requestServiceTier(body []byte) string {
+	var fields map[string]json.RawMessage
+	if len(body) == 0 || json.Unmarshal(body, &fields) != nil {
+		return ""
+	}
+	for _, name := range []string{"service_tier", "tier"} {
+		raw, ok := fields[name]
+		if !ok {
+			continue
+		}
+		var value string
+		if err := json.Unmarshal(raw, &value); err != nil {
+			continue
+		}
+		if trimmed := strings.TrimSpace(value); trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
+}
+
+// requestImageCount reads the requested image count from the raw request body
+// without modifying it. It is the count the operator asked for, not the number
+// of images an upstream actually returned (the plugin never inspects the
+// response). Values are clamped to the same 1..32 range the ledger bills, and
+// an absent, non-integer or non-positive count reads as one image.
+func requestImageCount(body []byte) int64 {
+	const maxImages = 32
+	if len(body) == 0 {
+		return 1
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(body, &fields); err != nil {
+		return 1
+	}
+	for _, name := range []string{"n", "n_images", "num_images", "image_count"} {
+		raw, ok := fields[name]
+		if !ok {
+			continue
+		}
+		var value int64
+		if err := json.Unmarshal(raw, &value); err != nil {
+			continue
+		}
+		if value > 0 {
+			if value > maxImages {
+				return maxImages
+			}
+			return value
+		}
+	}
+	return 1
 }
 
 // isBusinessRejection reports whether a credit failure refuses one request

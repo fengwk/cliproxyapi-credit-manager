@@ -74,6 +74,15 @@ func (m *Manager) recordUsage(record pluginapi.UsageRecord) {
 	}
 
 	normalized := accounting.Normalize(record)
+	// The billed service tier prefers the final tier reported by the upstream
+	// response, then the requested/reported tier. An empty value lets the
+	// ledger fall back to the tier frozen on the request snapshot; the ledger
+	// persists whichever tier actually billed so a replay is compared against
+	// it instead of silently repricing the execution.
+	serviceTier := strings.TrimSpace(record.ResponseServiceTier)
+	if serviceTier == "" {
+		serviceTier = strings.TrimSpace(record.ServiceTier)
+	}
 	// Pass the timestamp through unchanged, including a zero value: the credit
 	// ledger owns canonicalization and treats an omitted instant as "now", then
 	// compares a replay against the stored instant. Substituting a wall clock
@@ -91,6 +100,7 @@ func (m *Manager) recordUsage(record pluginapi.UsageRecord) {
 		Raw:           record.Detail,
 		Tokens:        normalized.Tokens,
 		Quality:       normalized.Quality,
+		ServiceTier:   serviceTier,
 		Failed:        record.Failed,
 		StatusCode:    record.Failure.StatusCode,
 		At:            record.RequestedAt,

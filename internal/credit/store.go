@@ -410,6 +410,9 @@ func (s *Store) migrate(ctx context.Context) error {
 		if err := migrateKeyFeatures(ctx, tx); err != nil {
 			return err
 		}
+		if err := migratePricingFeatures(ctx, tx); err != nil {
+			return err
+		}
 		_, err := tx.ExecContext(ctx,
 			`INSERT INTO meta(k, v) VALUES('schema_version', ?) ON CONFLICT(k) DO NOTHING`,
 			fmt.Sprint(1))

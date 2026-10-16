@@ -91,6 +91,15 @@ Usage.APIKey is principal, AccessProvider must belong to plugin. ResponseModel
 only actual record.ResponseModel, never record.Model fallback. No guessed joins.
 Maintenance failures sticky health; finance failure blocks new Reserve, usage
 errors observable. Source internal/warmup must not attach to customer records.
+Advanced pricing is non-invasive: the interceptor only reads the request body
+(service_tier/tier, and n/n_images/num_images/image_count clamped to 1..32,
+default 1) and never rewrites the request, its headers, its selection or the
+response. The billed service tier is `UsageRecord.ResponseServiceTier`, else
+`UsageRecord.ServiceTier`, else the tier frozen at admission. LIMITATION: the
+SDK `UsageRecord` exposes no image counters, so per-image billing charges the
+frozen requested image count once on a proven successful lifecycle and cannot
+reconcile an upstream that returns a different number of images; that requested
+count is intentionally not an "actual images returned" claim.
 
 ## Warmup (optional, disabled by default)
 
@@ -149,6 +158,23 @@ Envelope errors `{"error":"safe message"}`.
 - PUT `/api/keys` `{"id":id,"spec":KeySpec}` => `{"item":Key}`
 - POST `/api/rotate` `{"id":id,"key":"optional custom"}` => item,key
 - GET `/api/prices` => `{"items":[Price]}`; PUT `/api/prices` Price => `{"ok":true}`
+  (`Price` adds optional `billing_mode` `""|"token"|"per_image"` and
+  `per_image_micro_usd`; a per-image price ignores token rates.)
+- GET `/api/pricing-rules` => `{"items":[PricingRule]}`; PUT `/api/pricing-rules`
+  PricingRule => `{"item":PricingRule}`; POST `/api/delete-price-rule`
+  `{"id":id}` => `{"ok":true}`; GET
+  `/api/price-preview?model=&service_tier=&input_tokens=` => PriceMatch.
+  `PricingRule` is `{id,match_kind:exact|glob|regexp,pattern,priority,enabled,
+  price:Price,tiers:[PriceTier]}`; tiers live on the rule only, and
+  `PriceTier` is `{kind:context|service,threshold,service,label,rates:Rates}`
+  (zero rate inherits the rule price). `enabled` is an explicit bool: an enable
+  or disable is a full PUT, never a partial patch. Resolution is deterministic:
+  priority descending, then match kind (exact, glob, regexp), then id ascending;
+  the exact price book is a priority zero exact candidate that only a
+  higher-priority rule shadows. A matching disabled rule wins and denies the
+  model (`400`/`403`), it never falls through to a cheaper price. A reservation
+  freezes the whole rule (price, tiers, service tier, requested image count), so
+  editing or deleting a rule never reprices an admitted request.
 - GET `/api/usage` query from/to RFC3339,key_id,model,provider,auth_id,result,
   search,page,page_size,bucket(hour/day/month) => Report (summary/trend/items/all-match total).
 - GET `/api/capture?id=<lifecycle-id>` => Detail. Click only, never list body.

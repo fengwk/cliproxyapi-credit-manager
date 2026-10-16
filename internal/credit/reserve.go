@@ -19,6 +19,9 @@ func (s *Store) Reserve(ctx context.Context, in ReserveInput) (Request, error) {
 	if in.InputEstimate < 0 || in.OutputEstimate < 0 {
 		return Request{}, fmt.Errorf("%w: token estimates must not be negative", ErrInvalid)
 	}
+	if in.ImageCount < 0 {
+		return Request{}, fmt.Errorf("%w: image count must not be negative", ErrInvalid)
+	}
 	estimate, err := checkedAdd(in.InputEstimate, in.OutputEstimate)
 	if err != nil {
 		return Request{}, err
@@ -63,15 +66,11 @@ func (s *Store) Reserve(ctx context.Context, in ReserveInput) (Request, error) {
 		if !modelAllowed(key.spec.AllowedModels, in.RequestedModel) {
 			return fmt.Errorf("%w: model %s is not allowed for this key", ErrDenied, in.RequestedModel)
 		}
-		price, err := lookupPrice(ctx, tx, in.RequestedModel)
+		price, tiers, ruleID, err := resolvePricing(ctx, tx, in.RequestedModel)
 		if err != nil {
 			return err
 		}
-		hold, err := computeCost(price, Tokens{
-			Input:  in.InputEstimate,
-			Output: in.OutputEstimate,
-			Total:  estimate,
-		})
+		hold, err := holdFor(price, tiers, in, estimate)
 		if err != nil {
 			return err
 		}
@@ -87,15 +86,29 @@ func (s *Store) Reserve(ctx context.Context, in ReserveInput) (Request, error) {
 		if err := s.checkTokenLimits(ctx, tx, key, in.RequestedModel, estimate, at); err != nil {
 			return err
 		}
+		images := int64(0)
+		if price.IsPerImage() {
+			images = clampImageCount(in.ImageCount)
+		}
+		snapshot, err := encodePriceSnapshot(priceSnapshot{
+			Price:       price,
+			Tiers:       tiers,
+			RuleID:      ruleID,
+			ServiceTier: normalizeServiceTier(in.ServiceTier),
+			ImageCount:  images,
+		})
+		if err != nil {
+			return err
+		}
 		if _, err := tx.ExecContext(ctx, `INSERT INTO requests
 			(id, trace_id, key_id, model, state, outcome, status_code, started_at, completed_at,
 			 held_micro_usd, price_input, price_output, price_reasoning, price_cache_read,
 			 price_cache_write, price_version, token_estimate, charge_micro_usd, resolved,
-			 initial_hold_micro_usd)
-			VALUES(?,?,?,?,?,'',0,?,NULL,?,?,?,?,?,?,?,?,0,'',?)`,
+			 initial_hold_micro_usd, price_snapshot)
+			VALUES(?,?,?,?,?,'',0,?,NULL,?,?,?,?,?,?,?,?,0,'',?,?)`,
 			in.ID, in.TraceID, in.KeyID, in.RequestedModel, stateActive, unixNano(at), hold,
 			price.Rates.Input, price.Rates.Output, price.Rates.Reasoning, price.Rates.CacheRead,
-			price.Rates.CacheWrite, price.Version, estimate, hold); err != nil {
+			price.Rates.CacheWrite, price.Version, estimate, hold, snapshot); err != nil {
 			return fmt.Errorf("insert request: %w", err)
 		}
 		if hold != 0 {
@@ -120,6 +133,23 @@ func (s *Store) Reserve(ctx context.Context, in ReserveInput) (Request, error) {
 		return Request{}, err
 	}
 	return out, nil
+}
+
+// holdFor prices the pre-authorization hold of one admission.
+//
+// A per-image price holds the frozen requested image count. A token price holds
+// the canonical bucket estimates and applies only matching service tiers: the
+// admission estimate is far too coarse to select a context tier, so context
+// tiers are applied at settlement from actual usage instead.
+func holdFor(price Price, tiers []PriceTier, in ReserveInput, estimate int64) (int64, error) {
+	if price.IsPerImage() {
+		return perImageCost(price, in.ImageCount)
+	}
+	return tokenCost(price, tiers, Tokens{
+		Input:  in.InputEstimate,
+		Output: in.OutputEstimate,
+		Total:  estimate,
+	}, in.ServiceTier, false)
 }
 
 func (s *Store) checkMoneyLimits(ctx context.Context, tx *sql.Tx, key *keyRow, at time.Time, hold int64) error {

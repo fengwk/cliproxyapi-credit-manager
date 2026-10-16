@@ -205,6 +205,11 @@ func (h *Handler) Handle(req pluginapi.ManagementRequest) pluginapi.ManagementRe
 			return failure(err)
 		}
 		return response(200, map[string]bool{"ok": true})
+	case "GET /api/pricing-rules", "PUT /api/pricing-rules",
+		"POST /api/delete-price-rule", "GET /api/price-preview":
+		// Advanced pricing is served by its own entry point so the price book
+		// contract above stays untouched.
+		return h.HandlePricing(ctx, req)
 	case "GET /api/usage":
 		q := req.Query
 		f := credit.Filter{KeyID: q.Get("key_id"), Model: q.Get("model"), Provider: q.Get("provider"), AuthID: q.Get("auth_id"), Result: q.Get("result"), Search: q.Get("search"), Bucket: q.Get("bucket")}
