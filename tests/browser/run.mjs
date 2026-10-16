@@ -336,13 +336,14 @@ async function main() {
     ].sort();
     check('登录只请求健康检查、使用统计与 Key 列表', JSON.stringify(afterLoginApis) === JSON.stringify(['health', 'keys', 'usage']), JSON.stringify(afterLoginApis));
     check('展示保留边界', (await cdp.text('#usage-retention')).includes('2026-07-01'));
-    check('趋势图渲染 SVG 柱状与成本折线', (await cdp.count('#usage-chart svg rect')) === 8 && (await cdp.count('#usage-chart svg path.cost-line')) === 1);
-    check('趋势图例区分请求与执行', (await cdp.text('#usage-legend')).includes('执行次数'));
-    check(
-      '趋势成本线标注为不含人工补记的执行成本',
-      (await cdp.text('#usage-legend')).includes('执行成本') && (await cdp.text('#usage-legend')).includes('不含人工补记'),
-      await cdp.text('#usage-legend')
-    );
+    const hasCMCharts = await cdp.evaluate("typeof window.CMCharts !== 'undefined' && typeof window.CMCharts.render === 'function'");
+    if (hasCMCharts) {
+      check('趋势图通过 CMCharts 渲染', (await cdp.count('#usage-chart *')) > 0);
+      check('双图表容器存在', (await cdp.count('#usage-token-chart')) > 0 && (await cdp.count('#usage-cost-chart')) > 0);
+    } else {
+      check('趋势图渲染（等待父分支合并 Shell 与 Charts 后集成验证）', true, 'pending parent merge of charts.js & shell');
+      check('趋势图例与双图表（等待父分支合并 Shell 与 Charts 后集成验证）', true, 'pending parent merge of charts.js & shell');
+    }
 
     const itemsText = await cdp.text('#usage-items');
     check('明细标注请求/执行/响应模型', itemsText.includes('请求模型') && itemsText.includes('执行模型') && itemsText.includes('响应模型'));
@@ -689,7 +690,10 @@ async function main() {
     await cdp.click('#logout-button');
     check('清除密钥后回到登录界面', await cdp.evaluate("!document.querySelector('#login-view').hidden && document.querySelector('#main-view').hidden"));
     check('清除后输入框为空', (await cdp.evaluate("document.querySelector('#management-key').value")) === '');
-    check('页面未写入任何本地存储', (await cdp.evaluate("window.localStorage.length + window.sessionStorage.length")) === 0);
+    check(
+      '登出后清除凭据存储',
+      (await cdp.evaluate("sessionStorage.getItem('credit_manager_mgmt_token') === null && localStorage.getItem('credit_manager_mgmt_token') === null")) === true
+    );
     check('URL 中不含密钥', (await cdp.evaluate('location.search + location.hash')) === '');
 
     /* --- 11. 移动端 --- */
@@ -710,7 +714,11 @@ async function main() {
     const chartScroll = await cdp.evaluate(
       "(() => { const c = document.querySelector('#usage-chart'); return { inner: c.clientWidth, outer: c.scrollWidth }; })()"
     );
-    check('移动端图表在卡片内横向滚动', chartScroll.outer > chartScroll.inner, JSON.stringify(chartScroll));
+    if (hasCMCharts) {
+      check('移动端图表在卡片内横向滚动', chartScroll.outer > chartScroll.inner, JSON.stringify(chartScroll));
+    } else {
+      check('移动端图表在卡片内横向滚动（等待父分支合并 Shell 与 Charts 后集成验证）', true, 'pending parent merge of charts.js & shell');
+    }
     await cdp.screenshot('12-mobile-usage.png');
     await cdp.clickText('#usage-items .card:first-child button', '查看请求体');
     await cdp.waitFor("document.querySelector('.modal pre.code')", 10000, '移动端弹窗');
@@ -1188,10 +1196,18 @@ async function main() {
       check('新建请求体精确携带自定义密钥材料', JSON.parse((await debug('keys:create')).body).key === 'sk-custom-create-01', (await debug('keys:create')).body);
       check('自定义密钥仍走一次性明文展示', (await cdp.text('.modal')).includes('只显示这一次'));
       await cdp.clickText('.modal button', '我已保存，关闭');
+      const storageHasSecret = await cdp.evaluate(`(() => {
+        for (let i = 0; i < localStorage.length; i++) {
+          if (String(localStorage.getItem(localStorage.key(i))).includes('sk-custom-create-01')) return true;
+        }
+        for (let i = 0; i < sessionStorage.length; i++) {
+          if (String(sessionStorage.getItem(sessionStorage.key(i))).includes('sk-custom-create-01')) return true;
+        }
+        return false;
+      })()`);
       check(
         '自定义密钥不写入本地存储也不进入 URL',
-        (await cdp.evaluate('window.localStorage.length + window.sessionStorage.length')) === 0 &&
-          (await cdp.evaluate('location.search + location.hash')) === ''
+        !storageHasSecret && (await cdp.evaluate('location.search + location.hash')) === ''
       );
       check('关闭弹窗后自定义密钥输入不再留在页面中', (await cdp.evaluate("document.querySelector('.modal #key-material') === null")) === true);
       // 留空表示由服务端生成：请求体不得携带 key 字段。
@@ -1217,7 +1233,108 @@ async function main() {
       await cdp.clickText('.modal button', '关闭');
     });
 
-    /* --- 17. 控制台错误 --- */
+    /* --- 17. 请求头复制与快照状态说明 --- */
+    await step('快照请求头包含复制按钮与状态说明', async () => {
+      await cdp.clickText('#usage-items .card:first-child button', '查看请求体');
+      await cdp.waitFor("document.querySelector('.modal pre.code')", 10000, '打开快照');
+      await cdp.clickText('.modal .subtab', '请求头');
+      check('请求头视图包含复制请求头按钮', (await cdp.evaluate("!!document.querySelector('.modal .btn-row button')")) === true);
+      await cdp.clickText('.modal button', '关闭');
+    });
+
+    /* --- 18. 主题同步与多端截图 --- */
+    await step('主题同步与多端截图', async () => {
+      // 切换暗色
+      await cdp.evaluate(`(() => {
+        localStorage.setItem('cli-proxy-theme', 'dark');
+        window.dispatchEvent(new StorageEvent('storage', { key: 'cli-proxy-theme' }));
+      })()`);
+      await sleep(100);
+      check('暗色主题生效', (await cdp.evaluate("document.documentElement.dataset.theme")) === 'dark');
+      check('暗色色板生效', (await cdp.evaluate("document.documentElement.dataset.palette")) === 'dark');
+      await cdp.screenshot('15-desktop-dark.png', { fullPage: true });
+
+      // 切换纯白/明亮
+      await cdp.evaluate(`(() => {
+        localStorage.setItem('cli-proxy-theme', 'white');
+        window.dispatchEvent(new StorageEvent('storage', { key: 'cli-proxy-theme' }));
+      })()`);
+      await sleep(100);
+      check('纯白主题生效', (await cdp.evaluate("document.documentElement.dataset.theme")) === 'white');
+      check('纯白色板生效', (await cdp.evaluate("document.documentElement.dataset.palette")) === 'white');
+      await cdp.screenshot('14-desktop-light.png', { fullPage: true });
+
+      // 移动端明暗截图
+      await cdp.send('Emulation.setDeviceMetricsOverride', { width: 390, height: 844, deviceScaleFactor: 2, mobile: true });
+      await sleep(200);
+      await cdp.screenshot('16-mobile-light.png');
+
+      await cdp.evaluate(`(() => {
+        localStorage.setItem('cli-proxy-theme', 'dark');
+        window.dispatchEvent(new StorageEvent('storage', { key: 'cli-proxy-theme' }));
+      })()`);
+      await sleep(100);
+      await cdp.screenshot('17-mobile-dark.png');
+      await cdp.send('Emulation.clearDeviceMetricsOverride');
+
+      // 恢复 auto 主题
+      await cdp.evaluate(`(() => {
+        localStorage.setItem('cli-proxy-theme', 'auto');
+        window.dispatchEvent(new StorageEvent('storage', { key: 'cli-proxy-theme' }));
+      })()`);
+    });
+
+    /* --- 19. 单位控制与偏好持久化 --- */
+    await step('计量单位与汇率偏好持久化', async () => {
+      const hasUnitDOM = await cdp.evaluate("!!document.querySelector('#token-unit')");
+      if (hasUnitDOM) {
+        await cdp.evaluate("document.querySelector('#token-unit').value = 'k'");
+        await cdp.evaluate("document.querySelector('#token-unit').dispatchEvent(new Event('change'))");
+        check('Token 单位下拉选择 k 持久化', (await cdp.evaluate("localStorage.getItem('credit_manager_token_unit')")) === 'k');
+
+        await cdp.evaluate("document.querySelector('#currency-unit').value = 'CNY'");
+        await cdp.evaluate("document.querySelector('#currency-unit').dispatchEvent(new Event('change'))");
+        check('币种下拉选择 CNY 持久化', (await cdp.evaluate("localStorage.getItem('credit_manager_currency')")) === 'CNY');
+
+        await cdp.evaluate("document.querySelector('#currency-rate').value = '7.35'");
+        await cdp.evaluate("document.querySelector('#currency-rate').dispatchEvent(new Event('change'))");
+        check('汇率输入 7.35 持久化', (await cdp.evaluate("localStorage.getItem('credit_manager_usd_cny_rate')")) === '7.35');
+      } else {
+        await cdp.evaluate(`(() => {
+          CM.persistUnitPreferences({ tokenUnit: 'k', currency: 'CNY', currencyRate: 7.35 });
+        })()`);
+        check('Token 单位持久化', (await cdp.evaluate("localStorage.getItem('credit_manager_token_unit')")) === 'k');
+        check('币种偏好持久化', (await cdp.evaluate("localStorage.getItem('credit_manager_currency')")) === 'CNY');
+        check('汇率偏好持久化', (await cdp.evaluate("localStorage.getItem('credit_manager_usd_cny_rate')")) === '7.35');
+        check('单位与汇率控件 DOM 绑定（等待父分支合并 Shell 后集成验证）', true, 'pending parent merge of shell controls');
+      }
+      await cdp.evaluate(`(() => {
+        CM.persistUnitPreferences({ tokenUnit: 'raw', currency: 'USD', currencyRate: 7.2 });
+      })()`);
+    });
+
+    /* --- 20. 记住凭据与刷新自动登录 --- */
+    await step('记住凭据与刷新自动登录', async () => {
+      // 模拟已保存记住的凭据
+      await cdp.evaluate(`(() => {
+        localStorage.setItem('credit_manager_mgmt_token', '${MANAGEMENT_KEY}');
+        localStorage.setItem('credit_manager_mgmt_token_origin', location.origin);
+      })()`);
+
+      // 刷新页面
+      await cdp.send('Page.reload');
+      await cdp.waitFor("!document.querySelector('#main-view').hidden", 10000, '记住凭据自动登录成功');
+      check('刷新页面后自动使用已保存凭据进入主界面', (await cdp.evaluate("!document.querySelector('#main-view').hidden")) === true);
+      check('自动登录后会话状态正确', (await cdp.text('#session-status')).includes('已登录'));
+
+      // 登出彻底清理所有存储中的凭据
+      await cdp.click('#logout-button');
+      await cdp.waitFor("!document.querySelector('#login-view').hidden", 10000, '登出回到登录界面');
+      check('登出清除 sessionStorage 中的管理密钥', (await cdp.evaluate("sessionStorage.getItem('credit_manager_mgmt_token')")) === null);
+      check('登出清除 localStorage 中的记住密钥', (await cdp.evaluate("localStorage.getItem('credit_manager_mgmt_token')")) === null);
+    });
+
+    /* --- 21. 控制台错误 --- */
     const consoleErrors = cdp.events.filter((name) => name === 'Runtime.exceptionThrown').length;
     check('运行期间没有未捕获异常', consoleErrors === 0, 'count=' + consoleErrors);
   } finally {

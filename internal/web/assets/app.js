@@ -156,14 +156,48 @@
   }
 
   function formatMicroUSD(micro) {
-    var usd = microToUSDText(micro);
-    return usd === null ? '—' : usd + ' USD';
+    var usdText = microToUSDText(micro);
+    if (usdText === null) return '—';
+    if (state.currency === 'CNY') {
+      var usdNum = Number(usdText);
+      var cny = usdNum * (state.currencyRate || DEFAULT_USD_CNY_RATE);
+      var abs = Math.abs(cny);
+      var maxFrac = abs >= 100 ? 2 : (abs >= 1 ? 3 : 4);
+      return '¥' + cny.toLocaleString(undefined, { maximumFractionDigits: maxFrac });
+    }
+    return usdText + ' USD';
   }
 
   function formatMicroUSDPair(micro) {
-    var usd = microToUSDText(micro);
-    if (usd === null) return '—';
-    return usd + ' USD（' + formatInt(micro) + ' µUSD）';
+    var usdText = microToUSDText(micro);
+    if (usdText === null) return '—';
+    if (state.currency === 'CNY') {
+      var usdNum = Number(usdText);
+      var cny = usdNum * (state.currencyRate || DEFAULT_USD_CNY_RATE);
+      var abs = Math.abs(cny);
+      var maxFrac = abs >= 100 ? 2 : (abs >= 1 ? 3 : 4);
+      return '¥' + cny.toLocaleString(undefined, { maximumFractionDigits: maxFrac }) + '（' + formatInt(micro) + ' µUSD）';
+    }
+    return usdText + ' USD（' + formatInt(micro) + ' µUSD）';
+  }
+
+  function formatTokens(value) {
+    var text = intString(value);
+    if (!isIntegerText(text)) return '—';
+    var unit = state.tokenUnit || 'raw';
+    if (unit === 'raw') return formatInt(text);
+    var n = Number(text);
+    if (!isFinite(n)) return formatInt(text);
+    var cfg = {
+      k: { div: 1e3, suffix: 'k', maxFrac: 2 },
+      wan: { div: 1e4, suffix: '万', maxFrac: 2 },
+      m: { div: 1e6, suffix: 'm', maxFrac: 2 },
+    }[unit];
+    if (!cfg) return formatInt(text);
+    var scaled = n / cfg.div;
+    var abs = Math.abs(scaled);
+    var maxFrac = abs > 0 && abs < 0.01 ? 6 : (abs >= 100 ? 1 : cfg.maxFrac);
+    return scaled.toLocaleString(undefined, { maximumFractionDigits: maxFrac }) + cfg.suffix;
   }
 
   function formatBytes(value) {
@@ -436,7 +470,7 @@
    * 使用统计查询参数
    * ------------------------------------------------------------------ */
 
-  var USAGE_BUCKETS = ['hour', 'day'];
+  var USAGE_BUCKETS = ['hour', 'day', 'month'];
 
   function defaultUsageFilters(now) {
     var current = now ? new Date(now) : new Date();
@@ -823,12 +857,28 @@
    * 状态
    * ------------------------------------------------------------------ */
 
+  var TOKEN_KEY = 'credit_manager_mgmt_token';
+  var TOKEN_ORIGIN_KEY = 'credit_manager_mgmt_token_origin';
+  var TOKEN_UNIT_KEY = 'credit_manager_token_unit';
+  var CURRENCY_KEY = 'credit_manager_currency';
+  var USD_CNY_RATE_KEY = 'credit_manager_usd_cny_rate';
+  var CPA_THEME_KEY = 'cli-proxy-theme';
+  var THEMES = ['auto', 'light', 'white', 'dark'];
+  var TOKEN_UNITS = ['raw', 'k', 'wan', 'm'];
+  var CURRENCIES = ['USD', 'CNY'];
+  var DEFAULT_USD_CNY_RATE = 7.2;
+
   var state = {
     key: '',
     // 会话纪元：登录尝试、登出与会话失效时递增。请求在发起时捕获纪元，
     // 纪元变化后到达的任何响应（含失败）都被判定为过期，不得写回状态、渲染或触发登出。
     sessionEpoch: 0,
     tab: 'usage',
+    tokenUnit: 'raw',
+    currency: 'USD',
+    currencyRate: DEFAULT_USD_CNY_RATE,
+    theme: 'auto',
+    palette: 'white',
     usage: {
       filters: defaultUsageFilters(),
       report: null,
@@ -843,6 +893,210 @@
     credentials: { items: null, loading: false, error: '', quota: {}, loadSeq: 0 },
     health: { data: null, loading: false, error: '', loadSeq: 0 },
   };
+
+  function parseStoredPreference(value) {
+    if (!value) return '';
+    try {
+      var parsed = JSON.parse(value);
+      return parsed && typeof parsed === 'object'
+        ? (parsed.theme || (parsed.state && parsed.state.theme) || parsed.language || '')
+        : parsed;
+    } catch (_) {
+      return value;
+    }
+  }
+
+  function readStoredTheme() {
+    try {
+      var raw = parseStoredPreference(localStorage.getItem(CPA_THEME_KEY));
+      var candidate = String(raw || 'auto').toLowerCase();
+      return THEMES.indexOf(candidate) >= 0 ? candidate : 'auto';
+    } catch (_) {
+      return 'auto';
+    }
+  }
+
+  function applyTheme(theme) {
+    state.theme = THEMES.indexOf(theme) >= 0 ? theme : 'auto';
+    var isDark = false;
+    try {
+      isDark = !!(window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches);
+    } catch (_) {}
+    var palette = state.theme === 'auto' ? (isDark ? 'dark' : 'white') : state.theme;
+    state.palette = palette;
+    if (typeof document !== 'undefined' && document.documentElement) {
+      document.documentElement.dataset.theme = state.theme;
+      document.documentElement.dataset.palette = palette;
+    }
+    if (global.CMCharts && typeof global.CMCharts.refreshTheme === 'function') {
+      try { global.CMCharts.refreshTheme(); } catch (_) {}
+    }
+  }
+
+  function initThemeSync() {
+    applyTheme(readStoredTheme());
+    if (typeof window !== 'undefined') {
+      try {
+        if (window.matchMedia) {
+          window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', function () {
+            if (state.theme === 'auto') applyTheme('auto');
+          });
+        }
+      } catch (_) {}
+      window.addEventListener('storage', function (event) {
+        if (event && event.key === CPA_THEME_KEY) {
+          applyTheme(readStoredTheme());
+        }
+      });
+    }
+  }
+
+  function normalizeTokenUnit(unit) {
+    return TOKEN_UNITS.indexOf(unit) >= 0 ? unit : 'raw';
+  }
+
+  function normalizeCurrency(currency) {
+    return currency === 'CNY' ? 'CNY' : 'USD';
+  }
+
+  function normalizeRate(rate) {
+    var n = Number(rate);
+    return isFinite(n) && n > 0 ? n : DEFAULT_USD_CNY_RATE;
+  }
+
+  function readStoredCredential() {
+    var currentOrigin = typeof location !== 'undefined' ? location.origin : '';
+    try {
+      var sessOrigin = sessionStorage.getItem(TOKEN_ORIGIN_KEY);
+      if (!sessOrigin || sessOrigin === currentOrigin) {
+        var sessToken = (sessionStorage.getItem(TOKEN_KEY) || '').trim();
+        if (sessToken) return { token: sessToken, remembered: false };
+      }
+    } catch (_) {}
+    try {
+      var locOrigin = localStorage.getItem(TOKEN_ORIGIN_KEY);
+      if (!locOrigin || locOrigin === currentOrigin) {
+        var locToken = (localStorage.getItem(TOKEN_KEY) || '').trim();
+        if (locToken) return { token: locToken, remembered: true };
+      }
+    } catch (_) {}
+    return { token: '', remembered: false };
+  }
+
+  function persistCredential(key, remember) {
+    var trimmed = String(key || '').trim();
+    var currentOrigin = typeof location !== 'undefined' ? location.origin : '';
+    if (!trimmed) {
+      clearStoredCredential();
+      return;
+    }
+    try {
+      sessionStorage.setItem(TOKEN_KEY, trimmed);
+      sessionStorage.setItem(TOKEN_ORIGIN_KEY, currentOrigin);
+    } catch (_) {}
+    try {
+      if (remember) {
+        localStorage.setItem(TOKEN_KEY, trimmed);
+        localStorage.setItem(TOKEN_ORIGIN_KEY, currentOrigin);
+      } else {
+        localStorage.removeItem(TOKEN_KEY);
+        localStorage.removeItem(TOKEN_ORIGIN_KEY);
+      }
+    } catch (_) {}
+  }
+
+  function clearStoredCredential() {
+    try {
+      sessionStorage.removeItem(TOKEN_KEY);
+      sessionStorage.removeItem(TOKEN_ORIGIN_KEY);
+    } catch (_) {}
+    try {
+      localStorage.removeItem(TOKEN_KEY);
+      localStorage.removeItem(TOKEN_ORIGIN_KEY);
+    } catch (_) {}
+    var box = $('remember-management-key');
+    if (box) box.checked = false;
+  }
+
+  function readUnitPreferences() {
+    var tokenUnit = 'raw';
+    var currency = 'USD';
+    var rate = DEFAULT_USD_CNY_RATE;
+    try {
+      var u = localStorage.getItem(TOKEN_UNIT_KEY);
+      if (u) tokenUnit = normalizeTokenUnit(u);
+      var c = localStorage.getItem(CURRENCY_KEY);
+      if (c) currency = normalizeCurrency(c);
+      var r = localStorage.getItem(USD_CNY_RATE_KEY);
+      if (r) rate = normalizeRate(r);
+    } catch (_) {}
+    state.tokenUnit = tokenUnit;
+    state.currency = currency;
+    state.currencyRate = rate;
+  }
+
+  function syncUnitControls() {
+    var tu = $('token-unit');
+    if (tu) tu.value = state.tokenUnit || 'raw';
+    var cu = $('currency-unit');
+    if (cu) cu.value = state.currency || 'USD';
+    var cr = $('currency-rate');
+    if (cr) cr.value = String(state.currencyRate || DEFAULT_USD_CNY_RATE);
+  }
+
+  function wireUnitControls() {
+    readUnitPreferences();
+    syncUnitControls();
+
+    var tu = $('token-unit');
+    if (tu) {
+      tu.addEventListener('change', function () {
+        var val = normalizeTokenUnit(tu.value);
+        state.tokenUnit = val;
+        try { localStorage.setItem(TOKEN_UNIT_KEY, val); } catch (_) {}
+        rerenderAfterUnitChange();
+      });
+    }
+
+    var cu = $('currency-unit');
+    if (cu) {
+      cu.addEventListener('change', function () {
+        var val = normalizeCurrency(cu.value);
+        state.currency = val;
+        try { localStorage.setItem(CURRENCY_KEY, val); } catch (_) {}
+        rerenderAfterUnitChange();
+      });
+    }
+
+    var cr = $('currency-rate');
+    if (cr) {
+      var handleRate = function () {
+        var val = normalizeRate(cr.value);
+        state.currencyRate = val;
+        try { localStorage.setItem(USD_CNY_RATE_KEY, String(val)); } catch (_) {}
+        rerenderAfterUnitChange();
+      };
+      cr.addEventListener('change', handleRate);
+      cr.addEventListener('input', handleRate);
+    }
+  }
+
+  function rerenderAfterUnitChange() {
+    if (state.usage && state.usage.report) {
+      if (state.usage.report.summary) renderUsageSummary(state.usage.report.summary);
+      if (state.usage.report.trend) renderUsageTrend(state.usage.report.trend);
+      if (state.usage.report.items) renderUsageItems(state.usage.report.items);
+    }
+  }
+
+  function persistUnitPreferences(prefs) {
+    if (!prefs) return;
+    try {
+      if (prefs.tokenUnit) localStorage.setItem(TOKEN_UNIT_KEY, normalizeTokenUnit(prefs.tokenUnit));
+      if (prefs.currency) localStorage.setItem(CURRENCY_KEY, normalizeCurrency(prefs.currency));
+      if (prefs.currencyRate !== undefined) localStorage.setItem(USD_CNY_RATE_KEY, String(normalizeRate(prefs.currencyRate)));
+    } catch (_) {}
+  }
 
   function authHeaders() {
     return { Authorization: 'Bearer ' + state.key };
@@ -1034,6 +1288,17 @@
     modelTokenLimitsToText: modelTokenLimitsToText,
     splitAllowedModels: splitAllowedModels,
     truncateText: truncateText,
+    formatTokens: formatTokens,
+    readStoredCredential: readStoredCredential,
+    persistCredential: persistCredential,
+    clearStoredCredential: clearStoredCredential,
+    readStoredTheme: readStoredTheme,
+    applyTheme: applyTheme,
+    readUnitPreferences: readUnitPreferences,
+    persistUnitPreferences: persistUnitPreferences,
+    normalizeTokenUnit: normalizeTokenUnit,
+    normalizeCurrency: normalizeCurrency,
+    normalizeRate: normalizeRate,
   };
 
   /* ================================================================== *
@@ -1097,15 +1362,6 @@
 
   function el(tag, attrs, children) {
     var node = document.createElement(tag);
-    applyAttrs(node, attrs);
-    appendChildren(node, children);
-    return node;
-  }
-
-  var SVG_NS = 'http://www.w3.org/2000/svg';
-
-  function svgEl(tag, attrs, children) {
-    var node = document.createElementNS(SVG_NS, tag);
     applyAttrs(node, attrs);
     appendChildren(node, children);
     return node;
@@ -1481,7 +1737,7 @@
     if (mainView) mainView.hidden = false;
     var status = $('session-status');
     if (status) {
-      status.textContent = '已登录（密钥仅存于内存）';
+      status.textContent = '已登录';
       status.className = 'session-status is-active';
     }
     var logout = $('logout-button');
@@ -1509,6 +1765,8 @@
     'usage-summary',
     'usage-quality-note',
     'usage-chart',
+    'usage-token-chart',
+    'usage-cost-chart',
     'usage-legend',
     'usage-total',
     'usage-retention',
@@ -1545,6 +1803,7 @@
   function handleSessionExpired(message) {
     state.sessionEpoch++;
     state.key = '';
+    clearStoredCredential();
     clearSessionState();
     clearRenderedPrivateContent();
     closeDialog();
@@ -1567,12 +1826,59 @@
     return false;
   }
 
+  function autoConnectSavedCredential(savedToken) {
+    state.key = savedToken;
+    var epoch = ++state.sessionEpoch;
+    var button = $('login-button');
+    if (button) button.disabled = true;
+    var errorNode = $('login-error');
+    if (errorNode) {
+      errorNode.hidden = true;
+      errorNode.textContent = '';
+    }
+    api.health().then(
+      function () {
+        if (epoch !== state.sessionEpoch) return;
+        if (button) button.disabled = false;
+        var input = $('management-key');
+        if (input) input.value = '';
+        showMainView();
+        activateTab('usage', false);
+        state.usage.filters = defaultUsageFilters();
+        applyUsageFiltersToForm(state.usage.filters);
+        loadUsage(true);
+        loadKeys(true);
+      },
+      function (error) {
+        if (epoch !== state.sessionEpoch) return;
+        if (button) button.disabled = false;
+        state.key = '';
+        if (error && (error.kind === 'auth' || error.status === 401)) {
+          clearStoredCredential();
+        }
+        showLoginView();
+        var input = $('management-key');
+        if (input) input.value = '';
+        if (errorNode) {
+          errorNode.hidden = false;
+          var message = describeError(error);
+          if (error && (error.kind === 'auth' || error.status === 403)) {
+            message += '　（为避免触发管理接口的失败次数封禁，界面不会自动重试）';
+          }
+          errorNode.textContent = message;
+        }
+      }
+    );
+  }
+
   function submitLogin(event) {
     if (event) event.preventDefault();
     var input = $('management-key');
+    var rememberBox = $('remember-management-key');
     var button = $('login-button');
     var errorNode = $('login-error');
     var key = input ? input.value : '';
+    var remember = rememberBox ? !!rememberBox.checked : false;
     if (!key) {
       if (errorNode) {
         errorNode.hidden = false;
@@ -1593,6 +1899,7 @@
         if (epoch !== state.sessionEpoch) return;
         if (button) button.disabled = false;
         if (input) input.value = '';
+        persistCredential(key, remember);
         showMainView();
         activateTab('usage', false);
         state.usage.filters = defaultUsageFilters();
@@ -1609,7 +1916,7 @@
         if (errorNode) {
           errorNode.hidden = false;
           var message = describeError(error);
-          if (error.kind === 'auth') {
+          if (error.kind === 'auth' || (error && error.status === 403)) {
             message += '　（为避免触发管理接口的失败次数封禁，界面不会自动重试）';
           }
           errorNode.textContent = message;
@@ -1622,13 +1929,14 @@
     // 先递增会话纪元：所有在途请求立即失效，其响应不得再写回状态或弹窗。
     state.sessionEpoch++;
     state.key = '';
+    clearStoredCredential();
     clearSessionState();
     clearRenderedPrivateContent();
     closeDialog();
     showLoginView();
     var keyInput = $('management-key');
     if (keyInput) keyInput.value = '';
-    notify('已清除内存中的管理密钥');
+    notify('已清除管理密钥');
   }
 
   /* ---------------- 标签页 ---------------- */
@@ -1889,12 +2197,12 @@
         value: ratioText,
         sub: ratio === null || ratio === undefined ? '服务端未提供该指标' : '只覆盖完整质量执行，说明见下方',
       },
-      { label: 'tokens 合计', value: formatInt(tokens.total), sub: '规范 tokens' },
-      { label: '输入 tokens', value: formatInt(tokens.input), sub: 'canonical uncached input' },
-      { label: '输出 tokens', value: formatInt(tokens.output), sub: '不含思考 tokens' },
-      { label: '缓存读 tokens', value: formatInt(tokens.cache_read) },
-      { label: '缓存写 tokens', value: formatInt(tokens.cache_write) },
-      { label: '思考 tokens', value: formatInt(tokens.reasoning) },
+      { label: 'tokens 合计', value: formatTokens(tokens.total), sub: '规范 tokens' },
+      { label: '输入 tokens', value: formatTokens(tokens.input), sub: 'canonical uncached input' },
+      { label: '输出 tokens', value: formatTokens(tokens.output), sub: '不含思考 tokens' },
+      { label: '缓存读 tokens', value: formatTokens(tokens.cache_read) },
+      { label: '缓存写 tokens', value: formatTokens(tokens.cache_write) },
+      { label: '思考 tokens', value: formatTokens(tokens.reasoning) },
     ];
   }
 
@@ -1941,209 +2249,35 @@
     if (noteNode) noteNode.textContent = usageScopeNote(summary, state.usage.filters);
   }
 
-  function trendNumber(point, key) {
-    var value = point ? point[key] : 0;
-    var num = Number(intString(value));
-    return isFinite(num) ? num : 0;
-  }
-
-  // 纯计算：把 Report.trend 转成可直接绘制的几何模型，便于单测与复用。
-  function buildTrendChart(points, bucket) {
-    var width = 960;
-    var height = 260;
-    var padding = { top: 18, right: 64, bottom: 36, left: 64 };
-    var plot = {
-      x: padding.left,
-      y: padding.top,
-      w: width - padding.left - padding.right,
-      h: height - padding.top - padding.bottom,
-    };
-    var list = (points || []).map(function (point) {
-      return {
-        time: point.time,
-        requests: trendNumber(point, 'requests'),
-        executions: trendNumber(point, 'executions'),
-        cost: trendNumber(point, 'cost_micro_usd'),
-        costText: formatMicroUSD(point.cost_micro_usd),
-        adjustment: trendNumber(point, 'adjustment_micro_usd'),
-        adjustmentText: formatMicroUSD(point.adjustment_micro_usd),
-        failed: trendNumber(point, 'failed'),
-        pending: trendNumber(point, 'pending'),
-      };
-    });
-    var maxValue = 0;
-    var maxCost = 0;
-    list.forEach(function (point) {
-      maxValue = Math.max(maxValue, point.requests, point.executions);
-      maxCost = Math.max(maxCost, point.cost);
-    });
-    if (maxValue <= 0) maxValue = 1;
-
-    var slot = list.length ? plot.w / list.length : plot.w;
-    var barWidth = Math.max(2, Math.min(16, slot * 0.3));
-    var yFor = function (value) {
-      return plot.y + plot.h - (value / maxValue) * plot.h;
-    };
-    var costYFor = function (value) {
-      if (maxCost <= 0) return plot.y + plot.h;
-      return plot.y + plot.h - (value / maxCost) * plot.h;
-    };
-
-    var bars = [];
-    var costPoints = [];
-    var xLabels = [];
-
-    list.forEach(function (point, index) {
-      var center = plot.x + slot * index + slot / 2;
-      var requestsY = yFor(point.requests);
-      var executionsY = yFor(point.executions);
-      bars.push({
-        key: 'requests',
-        x: center - barWidth - 1,
-        y: requestsY,
-        w: barWidth,
-        h: plot.y + plot.h - requestsY,
-        title: formatDateTime(point.time) + '　请求次数：' + formatInt(point.requests),
-      });
-      bars.push({
-        key: 'executions',
-        x: center + 1,
-        y: executionsY,
-        w: barWidth,
-        h: plot.y + plot.h - executionsY,
-        title:
-          formatDateTime(point.time) +
-          '　执行次数：' + formatInt(point.executions) +
-          '　失败请求：' + formatInt(point.failed) +
-          '　未结算请求：' + formatInt(point.pending) +
-          '　执行成本：' + point.costText +
-          '　人工补记：' + point.adjustmentText,
-      });
-      var costX = center;
-      costPoints.push({
-        x: costX,
-        y: costYFor(point.cost),
-        title: formatDateTime(point.time) + '　执行成本：' + point.costText + '（不含人工补记）',
-      });
-      xLabels.push({ x: center, text: bucket === 'hour' ? formatHourLabel(point.time) : formatDayLabel(point.time) });
-    });
-
-    // 标签过多时只保留首、中、尾，避免重叠。
-    var visibleLabels = xLabels;
-    if (xLabels.length > 8) {
-      var middle = Math.floor(xLabels.length / 2);
-      visibleLabels = [xLabels[0], xLabels[middle], xLabels[xLabels.length - 1]];
-    }
-
-    var yTicks = [0, 0.5, 1].map(function (fraction) {
-      var value = Math.round(maxValue * fraction);
-      return { y: yFor(value), text: formatInt(value) };
-    });
-
-    var linePath = costPoints
-      .map(function (point, index) {
-        return (index === 0 ? 'M' : 'L') + point.x.toFixed(1) + ' ' + point.y.toFixed(1);
-      })
-      .join(' ');
-
-    return {
-      width: width,
-      height: height,
-      plot: plot,
-      bars: bars,
-      costPoints: costPoints,
-      linePath: costPoints.length > 1 ? linePath : '',
-      showCostLine: maxCost > 0 && costPoints.length > 0,
-      maxValue: maxValue,
-      maxCost: maxCost,
-      xLabels: visibleLabels,
-      yTicks: yTicks,
-      count: list.length,
-    };
-  }
-
-  function renderTrendChart(container, model) {
-    var svg = svgEl('svg', {
-      viewBox: '0 0 ' + model.width + ' ' + model.height,
-      role: 'img',
-      'aria-label': '趋势图：请求次数、执行次数与成本',
-      preserveAspectRatio: 'none',
-    });
-
-    model.yTicks.forEach(function (tick) {
-      svg.appendChild(svgEl('line', { class: 'grid-line', x1: model.plot.x, x2: model.plot.x + model.plot.w, y1: tick.y, y2: tick.y }));
-      svg.appendChild(
-        svgEl('text', { class: 'axis-label', x: model.plot.x - 8, y: tick.y + 3, 'text-anchor': 'end' }, [tick.text])
-      );
-    });
-
-    svg.appendChild(
-      svgEl('line', {
-        class: 'axis-line',
-        x1: model.plot.x,
-        x2: model.plot.x + model.plot.w,
-        y1: model.plot.y + model.plot.h,
-        y2: model.plot.y + model.plot.h,
-      })
-    );
-
-    model.bars.forEach(function (bar) {
-      var rect = svgEl('rect', {
-        class: bar.key === 'requests' ? 'bar-requests' : 'bar-executions',
-        x: bar.x,
-        y: bar.y,
-        width: bar.w,
-        height: Math.max(0, bar.h),
-        rx: 1.5,
-      });
-      rect.appendChild(svgEl('title', {}, [bar.title]));
-      svg.appendChild(rect);
-    });
-
-    if (model.showCostLine && model.linePath) {
-      svg.appendChild(svgEl('path', { class: 'cost-line', d: model.linePath }));
-      model.costPoints.forEach(function (point) {
-        var dot = svgEl('circle', { class: 'cost-dot', cx: point.x, cy: point.y, r: 2.5 });
-        dot.appendChild(svgEl('title', {}, [point.title]));
-        svg.appendChild(dot);
-      });
-    }
-
-    model.xLabels.forEach(function (label) {
-      svg.appendChild(svgEl('text', { class: 'axis-label', x: label.x, y: model.plot.y + model.plot.h + 16, 'text-anchor': 'middle' }, [label.text]));
-    });
-
-    replace(container, [svg]);
-  }
-
   function renderUsageTrend(trend) {
-    var container = $('usage-chart');
+    var reqContainer = $('usage-chart');
+    var tokenContainer = $('usage-token-chart');
+    var costContainer = $('usage-cost-chart');
     var legend = $('usage-legend');
-    if (!container) return;
+    if (!reqContainer && !tokenContainer && !costContainer) return;
+
     if (!trend || !trend.length) {
-      renderEmpty(container, '当前筛选范围内没有可绘制的趋势数据。');
+      if (reqContainer) renderEmpty(reqContainer, '当前筛选范围内没有可绘制的趋势数据。');
+      if (tokenContainer) renderEmpty(tokenContainer, '当前筛选范围内没有可绘制的趋势数据。');
+      if (costContainer) renderEmpty(costContainer, '当前筛选范围内没有可绘制的趋势数据。');
       if (legend) replace(legend, []);
       return;
     }
-    var model = buildTrendChart(trend, state.usage.filters.bucket);
-    renderTrendChart(container, model);
-    if (legend) {
-      var items = [
-        { color: '#4c8dff', label: '请求次数（每个入站请求一行）' },
-        { color: '#2f6b52', label: '执行次数（实际执行，含重试）' },
-      ];
-      if (model.showCostLine) items.push({ color: '#d29922', label: '执行成本（USD，独立右侧刻度；不含人工补记）', line: true });
-      replace(
-        legend,
-        items.map(function (item) {
-          return el('span', { class: 'legend-item' }, [
-            el('span', {
-              class: 'legend-swatch' + (item.line ? ' line' : ''),
-              style: 'background:' + item.color,
-            }),
-            el('span', { text: item.label }),
-          ]);
-        })
+
+    if (global.CMCharts && typeof global.CMCharts.render === 'function') {
+      global.CMCharts.render(
+        {
+          requests: reqContainer,
+          tokens: tokenContainer,
+          cost: costContainer,
+        },
+        trend,
+        {
+          bucket: (state.usage.filters && state.usage.filters.bucket) || 'day',
+          tokenUnit: state.tokenUnit || 'raw',
+          currency: state.currency || 'USD',
+          rate: Number(state.currencyRate) || DEFAULT_USD_CNY_RATE,
+        }
       );
     }
   }
@@ -2504,7 +2638,18 @@
 
     var renderView = function () {
       if (activeView.tab === 'headers') {
-        replace(viewContainer, [headersTable]);
+        var headerBar = el('div', { class: 'btn-row' }, [
+          copyButton(function () {
+            var lines = [];
+            var headers = data.headers || {};
+            Object.keys(headers).sort().forEach(function (key) {
+              var val = headers[key];
+              lines.push(key + ': ' + (Array.isArray(val) ? val.join(', ') : String(val)));
+            });
+            return lines.join('\n');
+          }, '复制请求头'),
+        ]);
+        replace(viewContainer, [headerBar, headersTable]);
         return;
       }
       var modeBar = el('div', { class: 'btn-row' }, [
@@ -2559,20 +2704,27 @@
       renderView();
     });
 
-    handle.setBody([
-      el('div', { class: 'row-title' }, [
-        badge(status.label, status.tone),
-        el('span', { class: 'pill-note', text: '请求 ID ' + (data.request_id || '—') }),
-        el('span', { class: 'pill-note', text: '记录时间 ' + formatDateTime(data.at) }),
-        el('span', { class: 'pill-note', text: '过期时间 ' + formatDateTime(data.expires_at) }),
-      ]),
+    var rowTitleNodes = [
+      badge(status.label, status.tone),
+      el('span', { class: 'pill-note', text: '请求 ID ' + (data.request_id || '—') }),
+      el('span', { class: 'pill-note', text: '记录时间 ' + formatDateTime(data.at) }),
+      el('span', { class: 'pill-note', text: '过期时间 ' + formatDateTime(data.expires_at) }),
+    ];
+    var bodyChildren = [el('div', { class: 'row-title' }, rowTitleNodes)];
+    if (data.status === 'expired') {
+      bodyChildren.push(el('p', { class: 'note hint-warn', text: '快照已过期：该请求已超出快照保留周期，详细数据已被清理。' }));
+    } else if (data.status === 'unavailable') {
+      bodyChildren.push(el('p', { class: 'note hint-warn', text: '快照不可用：该请求未捕获快照或在入库前已被丢弃。' }));
+    }
+    bodyChildren.push(
       el('p', {
         class: 'note',
         text: '该快照是执行入口处的请求快照（不是上游网络的原始字节），敏感头与明显的密钥字段已在写入前被替换。',
       }),
       tabsBar,
-      viewContainer,
-    ]);
+      viewContainer
+    );
+    handle.setBody(bodyChildren);
     renderView();
   }
 
@@ -3812,14 +3964,26 @@
     global.addEventListener('error', function (event) {
       notify('界面发生未预期错误：' + ((event && event.message) || '未知错误'), 'error');
     });
+    initThemeSync();
+    wireUnitControls();
     wireTabs();
     wireUsageForm();
     wireButtons();
     applyUsageFiltersToForm(state.usage.filters);
     renderUsageStatus();
-    showLoginView();
-    var keyInput = $('management-key');
-    if (keyInput) keyInput.focus();
+
+    var saved = readStoredCredential();
+    var rememberBox = $('remember-management-key');
+    if (rememberBox && saved.remembered) {
+      rememberBox.checked = true;
+    }
+    if (saved.token) {
+      autoConnectSavedCredential(saved.token);
+    } else {
+      showLoginView();
+      var keyInput = $('management-key');
+      if (keyInput) keyInput.focus();
+    }
   }
 
   if (typeof document !== 'undefined' && typeof document.addEventListener === 'function') {
