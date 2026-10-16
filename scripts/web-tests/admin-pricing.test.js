@@ -9,7 +9,9 @@
  *
  * - 纯函数部分直接断言请求体形状、64 位边界、目录映射与分页；
  * - DOM 部分用一个最小 DOM 桩驱动真实的编辑弹窗（新建/编辑/阶梯/确认门禁），
- *   桩在写入 innerHTML 时直接抛错，因此任何 XSS 式拼接都会让测试失败。
+ *   桩在写入 innerHTML 时直接抛错，因此任何 XSS 式拼接都会让测试失败；
+ * - 会话部分验证登出（dispose）后到达的响应/错误一律作废，不会写回界面、
+ *   也不会穿过重新登录（init）后的新会话。
  */
 const test = require('node:test');
 const assert = require('node:assert/strict');
@@ -246,21 +248,24 @@ function exactStringify(value) {
     .join(',') + '}';
 }
 
-function harness(responder) {
-  const doc = createDocument();
-  const calls = [];
-  const modals = [];
-  // 与页面一致：charts.js 已加载，提供统一的 formatInt 口径。
-  const win = { document: doc, CMCharts: require(path.join(ASSETS_DIR, 'charts.js')) };
-  const ctx = {
+// 每个 ctx 独立记录调用/提示/弹窗，便于断言「旧会话的回调绝不能写到新会话」。
+function makeStore() {
+  return { calls: [], toasts: [], modals: [] };
+}
+
+function makeContext(store, responder) {
+  return {
     api(requestPath, opts) {
       const call = { path: requestPath, opts: opts || {} };
-      calls.push(call);
+      store.calls.push(call);
       const response = responder ? responder(call) : undefined;
       if (response instanceof Error) return Promise.reject(response);
+      // 返回 Promise 时按 thenable 采纳，用于模拟「登出后才到达的响应」。
       return Promise.resolve(response === undefined ? { items: [] } : response);
     },
-    toast() {},
+    toast(message) {
+      store.toasts.push(message);
+    },
     showModal(options) {
       const handle = {
         title: options.title,
@@ -281,13 +286,36 @@ function harness(responder) {
           handle.closed = true;
         },
       };
-      modals.push(handle);
+      store.modals.push(handle);
       return handle;
     },
   };
+}
+
+function harness(responder) {
+  const doc = createDocument();
+  // 与页面一致：charts.js 已加载，提供统一的 formatInt 口径。
+  const win = { document: doc, CMCharts: require(path.join(ASSETS_DIR, 'charts.js')) };
+  const store = makeStore();
   const api = loadAdminPricing(win, doc);
+  const ctx = makeContext(store, responder);
   api.init(ctx);
-  return { api, doc, calls, modals, ctx, win };
+  return {
+    api,
+    doc,
+    ctx,
+    win,
+    calls: store.calls,
+    modals: store.modals,
+    toasts: store.toasts,
+    // 模拟「登出后重新登录」：新会话的调用与提示单独记录。
+    reattach(nextResponder) {
+      const nextStore = makeStore();
+      const nextCtx = makeContext(nextStore, nextResponder);
+      api.init(nextCtx);
+      return { ctx: nextCtx, calls: nextStore.calls, toasts: nextStore.toasts, modals: nextStore.modals };
+    },
+  };
 }
 
 const flush = () => new Promise((resolve) => setImmediate(resolve));
@@ -942,4 +970,298 @@ test('目录导入：精确规则带阶梯，缺失费率必须手工填写', as
   await flush();
   assert.match(missingEditor.error, /缓存读取费率 不能为空/);
   assert.equal(run.calls.filter((call) => call.opts.method === 'PUT').length, putsBefore, '缺失费率时不得写入');
+});
+
+/* ------------------------------------------------------------------ *
+ * 会话生命周期：登出后在途回调一律作废（含登出后重新登录）
+ * ------------------------------------------------------------------ */
+
+function sampleRule(overrides) {
+  return Object.assign({
+    id: 'rule-live',
+    match_kind: 'glob',
+    pattern: 'live/*',
+    priority: 1,
+    enabled: true,
+    price: {
+      model: 'live/*',
+      billing_mode: 'token',
+      per_image_micro_usd: 0,
+      rates: { input: 1, output: 2, cache_read: 0, cache_write: 0 },
+    },
+    tiers: [],
+  }, overrides || {});
+}
+
+// 可控的未决响应：用于模拟「请求已发出，登出后才返回」。
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
+function registerRuleList(doc) {
+  return {
+    listEl: doc.register('pricing-rules-list', 'div'),
+    countEl: doc.register('rules-count', 'span'),
+  };
+}
+
+test('登出后 dispose 清空模块界面并解绑按钮，重新 init 再绑定', async () => {
+  const run = harness(() => ({ items: [sampleRule()] }));
+  const { listEl, countEl } = registerRuleList(run.doc);
+  const createBtn = run.doc.register('rules-create', 'button');
+  const catalogBtn = run.doc.register('btn-load-model-catalog', 'button');
+  // 页面在 DOM 就绪后才 init：这里补一次 init 模拟真实绑定顺序。
+  run.api.init(run.ctx);
+  assert.equal(typeof createBtn.onclick, 'function', 'init 必须绑定新增规则按钮');
+  assert.equal(typeof catalogBtn.onclick, 'function', 'init 必须绑定目录按钮');
+
+  await run.api.load();
+  assert.ok(textOfNode(listEl).includes('live/*'), '加载后必须渲染列表');
+  assert.equal(countEl.textContent, '共 1 条高级规则');
+
+  run.api.dispose();
+  assert.equal(listEl.textContent, '', '登出必须清空规则列表');
+  assert.equal(countEl.textContent, '', '登出必须清空计数');
+  assert.equal(createBtn.onclick, null, '登出必须解绑按钮');
+  assert.equal(catalogBtn.onclick, null, '登出必须解绑按钮');
+
+  const next = run.reattach();
+  assert.equal(typeof createBtn.onclick, 'function', '重新登录必须重新绑定按钮');
+  assert.equal(typeof catalogBtn.onclick, 'function', '重新登录必须重新绑定按钮');
+  createBtn.onclick();
+  assert.ok(next.modals.length >= 1, '重新绑定后按钮必须仍能打开编辑器');
+});
+
+test('登出后在途的规则列表响应不得写回界面，也不得触达新会话', async () => {
+  const pending = deferred();
+  const run = harness((call) => (call.path === '/api/pricing-rules' ? pending.promise : undefined));
+  const { listEl, countEl } = registerRuleList(run.doc);
+
+  const loading = run.api.load();
+  assert.equal(countEl.textContent, '加载中...');
+
+  run.api.dispose();
+  const next = run.reattach();
+  pending.resolve({ items: [sampleRule()] });
+  await loading;
+  await flush();
+
+  assert.equal(listEl.textContent, '', '登出后到达的响应不得渲染');
+  assert.equal(listEl.childNodes.length, 0);
+  assert.equal(countEl.textContent, '', '登出后计数不得被改写');
+  assert.equal(next.calls.length, 0, '旧回调不得为新会话发起请求');
+  assert.deepEqual(next.toasts, [], '旧回调不得提示新会话');
+});
+
+test('登出后在途的规则列表错误不得渲染错误框', async () => {
+  const pending = deferred();
+  const run = harness((call) => (call.path === '/api/pricing-rules' ? pending.promise : undefined));
+  const { listEl, countEl } = registerRuleList(run.doc);
+
+  const loading = run.api.load();
+  run.api.dispose();
+  const next = run.reattach();
+  pending.reject(new Error('session gone'));
+  await loading;
+  await flush();
+
+  assert.equal(listEl.textContent, '', '登出后的错误不得渲染错误框');
+  assert.equal(listEl.querySelectorAll('.error-box').length, 0);
+  assert.equal(countEl.textContent, '', '登出后的错误不得写「加载失败」');
+  assert.deepEqual(next.toasts, []);
+});
+
+test('登出后在途的目录响应不得渲染，也不得请求新会话', async () => {
+  const pending = deferred();
+  const run = harness((call) => (call.path.indexOf('/api/model-catalog') === 0 ? pending.promise : undefined));
+  const handle = run.api.__test.openCatalogModal();
+  assert.equal(run.doc.querySelectorAll('.catalog-row').length, 0);
+
+  run.api.dispose();
+  const next = run.reattach();
+  pending.resolve(catalogSnapshot(3));
+  await flush();
+
+  assert.equal(run.doc.querySelectorAll('.catalog-row').length, 0, '登出后到达的目录不得渲染');
+  assert.equal(handle.error, '', '登出后到达的目录不得改写已作废弹窗');
+  assert.equal(textOfNode(run.doc.querySelector('.catalog-status')), '正在获取模型价格目录…');
+  assert.equal(next.calls.length, 0);
+});
+
+test('登出后在途的目录错误不得改写弹窗，也不得提示新会话', async () => {
+  const pending = deferred();
+  const run = harness((call) => (call.path.indexOf('/api/model-catalog') === 0 ? pending.promise : undefined));
+  const handle = run.api.__test.openCatalogModal();
+
+  run.api.dispose();
+  const next = run.reattach();
+  pending.reject(new Error('catalog offline'));
+  await flush();
+
+  assert.equal(handle.error, '', '登出后的错误不得写入已作废弹窗');
+  assert.equal(textOfNode(run.doc.querySelector('.catalog-status')), '正在获取模型价格目录…');
+  assert.deepEqual(next.toasts, []);
+});
+
+test('登出后在途的保存响应不得提示/关闭弹窗/刷新新会话', async () => {
+  const pending = deferred();
+  const run = harness((call) => (call.opts.method === 'PUT' ? pending.promise : undefined));
+  registerRuleList(run.doc);
+
+  const handle = run.api.__test.openRuleModal(sampleRule({ id: 'rule-save', pattern: 'save/*' }));
+  run.doc.getElementById('rule-pattern').value = 'save/*';
+  run.doc.getElementById('rule-priority').value = '1';
+  fillBaseRates(run.doc, { input: '1', output: '2', cacheRead: '0', cacheWrite: '0', reasoning: '' });
+  footerButton(handle, '保存规则').onclick();
+  await flush();
+
+  run.api.dispose();
+  const next = run.reattach();
+  pending.resolve({});
+  await flush();
+
+  assert.equal(handle.closed, false, '登出后到达的成功响应不得关闭弹窗');
+  assert.deepEqual(next.toasts, [], '登出后不得提示新会话');
+  assert.equal(next.calls.length, 0, '登出后不得为新会话刷新列表');
+});
+
+test('登出后在途的保存失败不得改写已作废弹窗的报错', async () => {
+  const pending = deferred();
+  const run = harness((call) => (call.opts.method === 'PUT' ? pending.promise : undefined));
+  registerRuleList(run.doc);
+
+  const handle = run.api.__test.openRuleModal(sampleRule({ id: 'rule-save-2', pattern: 'save2/*' }));
+  run.doc.getElementById('rule-priority').value = '1';
+  fillBaseRates(run.doc, { input: '1', output: '2', cacheRead: '0', cacheWrite: '0', reasoning: '' });
+  footerButton(handle, '保存规则').onclick();
+  await flush();
+
+  run.api.dispose();
+  const next = run.reattach();
+  pending.reject(new Error('write rejected'));
+  await flush();
+
+  assert.equal(handle.error, '', '登出后到达的失败响应不得写入已作废弹窗');
+  assert.deepEqual(next.toasts, [], '登出后不得向新会话提示失败');
+});
+
+test('登出后在途的删除响应不得提示，也不得刷新新会话', async () => {
+  const pending = deferred();
+  const run = harness((call) => {
+    if (call.path === '/api/delete-price-rule') return pending.promise;
+    if (call.path === '/api/pricing-rules') return { items: [sampleRule({ id: 'rule-del-live' })] };
+    return undefined;
+  });
+  registerRuleList(run.doc);
+  await run.api.load();
+
+  const deleteBtn = run.doc.querySelectorAll('#pricing-rules-list button').find((node) => textOfNode(node).trim() === '删除');
+  deleteBtn.onclick();
+  await flush();
+  const confirmModal = run.modals[run.modals.length - 1];
+  run.doc.getElementById('confirm-checkbox').checked = true;
+  footerButton(confirmModal, '删除').onclick();
+  await flush();
+  assert.equal(run.calls.filter((call) => call.path === '/api/delete-price-rule').length, 1);
+
+  run.api.dispose();
+  const next = run.reattach();
+  pending.resolve({});
+  await flush();
+
+  assert.deepEqual(next.toasts, [], '登出后不得提示「规则已删除」');
+  assert.equal(next.calls.length, 0, '登出后不得为新会话刷新列表');
+});
+
+/* ------------------------------------------------------------------ *
+ * 目录导入：同 ID upsert 覆盖确认与阶梯显式 0 的语义限制
+ * ------------------------------------------------------------------ */
+
+test('catalogEntryToRule 检测同 ID 冲突（slug 不是单射）', () => {
+  const { catalogEntryToRule } = harness().api.__test;
+  const entry = { id: 'a/b', rates: { input: 1, output: 2, cache_read: 0, cache_write: 0 } };
+  const mapping = catalogEntryToRule(entry, {}, [sampleRule({ id: 'other' }), sampleRule({ id: 'catalog-a-b', pattern: 'a-b' })]);
+  assert.equal(mapping.rule.id, 'catalog-a-b');
+  assert.ok(mapping.conflict, '必须检出同 ID 已存在的规则');
+  assert.equal(mapping.conflict.pattern, 'a-b');
+  assert.equal(catalogEntryToRule(entry, {}, []).conflict, null);
+  assert.equal(catalogEntryToRule(entry, {}).conflict, null, '未提供既有规则时不得误报冲突');
+});
+
+test('目录阶梯的显式 0 会被标注为「继承」语义限制（缺失仍跳过不补零）', () => {
+  const { catalogEntryToRule, catalogImportNote } = harness().api.__test;
+  const mapping = catalogEntryToRule({
+    id: 'vendor/zero-tier',
+    rates: { input: 1, output: 2, cache_read: 0, cache_write: 0 },
+    context_tiers: [
+      { threshold: 1000, rates: { input: 0, output: 2, cache_read: 0, cache_write: 0 } },
+      { threshold: 2000, rates: { input: 3, output: 4, cache_read: 1, cache_write: 1 } },
+      { threshold: 3000, rates: { input: 3, output: 4 } },
+    ],
+  }, { source: 'models.dev' });
+
+  assert.equal(mapping.rule.tiers.length, 2, '费率不完整的阶梯必须跳过');
+  assert.equal(mapping.skippedTiers, 1);
+  assert.equal(mapping.zeroTiers, 1, '显式 0 的阶梯必须被单独统计');
+  assert.equal(mapping.rule.tiers[0].rates.input, 0, '显式 0 不得被静默丢弃');
+
+  const note = catalogImportNote(mapping);
+  assert.match(note, /upsert/);
+  assert.match(note, /相同 ID 已存在的规则会被覆盖/);
+  assert.match(note, /显式 0/);
+  assert.match(note, /继承基础费率/);
+});
+
+test('目录导入命中同 ID 冲突时必须额外确认覆盖，未冲突则无需确认', async () => {
+  const existing = sampleRule({ id: 'catalog-opencode-go-glm-5', pattern: 'opencode-go/glm-5' });
+  const run = harness((call) => {
+    if (call.path.indexOf('/api/model-catalog') === 0) return catalogSnapshot(3);
+    if (call.path === '/api/pricing-rules') return { items: [existing] };
+    return undefined;
+  });
+  registerRuleList(run.doc);
+  await run.api.load();
+  run.api.__test.openCatalogModal();
+  await flush();
+
+  const pick = (modelID) => {
+    const search = run.doc.getElementById('catalog-search');
+    search.value = modelID;
+    search.oninput();
+    run.doc.querySelectorAll('.catalog-row')[0].querySelector('button').onclick();
+    return run.modals[run.modals.length - 1];
+  };
+
+  // 1) 无冲突：不渲染覆盖确认，导入提示仍需说明按 ID upsert 会覆盖同 ID。
+  const clean = pick('vendor0/model-0000');
+  assert.equal(run.doc.getElementById('rule-overwrite'), null, '无冲突不得要求覆盖确认');
+  assert.match(textOfNode(clean.body[0].querySelector('.rule-source-note')), /upsert/);
+  assert.equal(clean.body[0].querySelector('.rule-overwrite'), null);
+
+  // 2) 同 ID 冲突：必须额外勾选覆盖确认才允许写入。
+  const editor = pick('opencode-go/glm-5');
+  const overwriteBox = run.doc.getElementById('rule-overwrite');
+  assert.ok(overwriteBox, '同 ID 冲突必须渲染覆盖确认');
+  assert.match(textOfNode(editor.body[0].querySelector('.rule-source-note')), /已存在同 ID 的规则/);
+  assert.equal(run.doc.getElementById('rule-id').value, 'catalog-opencode-go-glm-5');
+
+  run.doc.getElementById('rule-confirm').checked = true;
+  footerButton(editor, '保存规则').onclick();
+  await flush();
+  assert.equal(putBodyText(run.calls), null, '未确认覆盖时不得写入');
+  assert.match(editor.error, /覆盖/);
+
+  overwriteBox.checked = true;
+  footerButton(editor, '保存规则').onclick();
+  await flush();
+  const body = jsonBody(run.calls);
+  assert.ok(body, '确认覆盖后必须写入');
+  assert.equal(body.id, 'catalog-opencode-go-glm-5', '覆盖写入沿用同一 ID');
+  assert.equal(body.pattern, 'opencode-go/glm-5');
 });
