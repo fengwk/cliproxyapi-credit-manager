@@ -83,13 +83,13 @@
         <h2 id="login-title">输入管理密钥</h2>
       </div>
       <p class="hint">
-        管理密钥在当前会话期间保留在内存中有效，用于向管理 API 发送 <code>Authorization</code> 请求头。勾选「记住管理密钥」后保存在本机浏览器的 localStorage 中以便后续自动填入；未勾选时仅在会话内存中保存，关闭页面后即失效。
+        管理密钥通过 <code>Authorization</code> 请求头发送。默认保存在当前标签的 sessionStorage 中，刷新无需重输；勾选「记住管理密钥」才写入 localStorage，方便下次自动登录。存储不可用时仅保留在内存，不写 Cookie 或 URL；共享设备请勿勾选记住。
       </p>
       <form id="login-form" class="login-form" method="post" autocomplete="off" novalidate>
         <div class="field">
           <label for="management-key">管理密钥</label>
           <input id="management-key" name="management-key" type="password" autocomplete="off"
-                 spellcheck="false" autocapitalize="off" required placeholder="Bearer management secret">
+                 spellcheck="false" autocapitalize="off" required placeholder="输入 CPA 管理密钥">
         </div>
         <div class="field remember-field">
           <label for="remember-management-key" class="remember-label">
