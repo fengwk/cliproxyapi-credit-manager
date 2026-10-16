@@ -141,12 +141,36 @@ func TestLookupAssetsAreSelfContainedAndSharedChartsWired(t *testing.T) {
 	if start < 0 {
 		t.Fatal("lookup.js is missing renderTrend")
 	}
-	cut := strings.Index(js[start:], "shared.render(")
+	cut := strings.Index(js[start:], "charts().render(")
 	if cut < 0 {
 		t.Fatal("renderTrend must call the shared renderer")
 	}
 	if head := js[start : start+cut]; strings.Contains(head, "clear(") {
 		t.Error("renderTrend must not clear the chart containers before reusing ECharts")
+	}
+	// The shared modules are required shipped assets: there is no fallback
+	// chart and no degraded numeric path that could fake financial values.
+	for _, gone := range []string{"renderTrendFallback", "fallbackBar", "JSON.parse(text)"} {
+		if strings.Contains(js, gone) {
+			t.Errorf("lookup.js must not keep the degraded implementation %s", gone)
+		}
+	}
+	if !strings.Contains(js, "页面资源加载不完整") || !strings.Contains(js, "el('submit').disabled = true") {
+		t.Error("lookup.js must fail closed with a visible error when a shared module is missing")
+	}
+	// Preferences change the display contract of every panel, not just charts.
+	if !strings.Contains(js, "renderAll()") {
+		t.Error("lookup.js must re-render the whole page when display preferences change")
+	}
+	for _, call := range []string{"renderQuotas(", "renderStats(", "renderRecent(", "renderTrend()"} {
+		idx := strings.Index(js, "function renderAll()")
+		if idx < 0 || !strings.Contains(js[idx:idx+1200], call) {
+			t.Errorf("renderAll must redraw %s", call)
+		}
+	}
+	if strings.Contains(js, "charts().formatDateTime") || strings.Contains(js, "charts().normalizeCurrency") ||
+		strings.Contains(js, "charts().normalizeTokenUnit") {
+		t.Error("lookup.js must only call the exported shared chart API")
 	}
 
 	// Amounts and token counts are 64-bit values: the JSON body is parsed with

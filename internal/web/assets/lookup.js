@@ -126,53 +126,40 @@
     return root && root.CMCharts ? root.CMCharts : null;
   }
 
-  function parseBody(text) {
+  // 共享模块是随包发布必需资源：缺失时启动即报错，绝不退化出错误数字。
+  function modulesReady() {
     var lossless = numbers();
-    return lossless && typeof lossless.parse === 'function' ? lossless.parse(text) : JSON.parse(text);
+    var shared = charts();
+    return !!(lossless && typeof lossless.parse === 'function' &&
+      shared && typeof shared.render === 'function' && typeof shared.formatMoneyMicro === 'function');
+  }
+
+  function parseBody(text) {
+    return numbers().parse(text);
   }
 
   function intText(value) {
-    var lossless = numbers();
-    if (lossless && typeof lossless.intText === 'function') return lossless.intText(value);
-    if (value === null || value === undefined) return '';
-    if (typeof value === 'number' && !Number.isFinite(value)) return String(value);
-    return String(value).trim();
+    return numbers().intText(value);
   }
 
   function formatInt(value) {
-    var shared = charts();
-    if (shared && typeof shared.formatInt === 'function') return shared.formatInt(value);
-    var text = intText(value);
-    return text === '' ? '—' : text;
+    return charts().formatInt(value);
   }
 
   function formatToken(value, unit) {
-    var shared = charts();
-    if (shared && typeof shared.tokenText === 'function') return shared.tokenText(value, unit);
-    return formatInt(value);
+    return charts().tokenText(value, unit);
   }
 
+  // 金额文本与货币后缀都由共享模块负责，这里不再自行拼接货币。
   function formatMoney(micro, currency, rate) {
-    var shared = charts();
-    if (shared && typeof shared.formatMoneyMicro === 'function') {
-      return shared.formatMoneyMicro(micro, currency, rate) + ' ' + shared.normalizeCurrency(currency);
-    }
-    var text = intText(micro);
-    return (text === '' ? '—' : text) + ' µUSD';
+    return charts().formatMoneyMicro(micro, currency, rate);
   }
 
+  // 共享模块不再导出日期格式化，这里保留一个最小的本地实现。
   function formatMoment(value) {
-    var shared = charts();
-    if (shared && typeof shared.formatDateTime === 'function') return shared.formatDateTime(value) || '—';
     if (!value) return '—';
     var date = new Date(value);
     return isNaN(date.getTime()) ? String(value) : date.toLocaleString();
-  }
-
-  function bucketText(value, grain) {
-    var shared = charts();
-    if (shared && typeof shared.bucketLabel === 'function') return shared.bucketLabel(value, grain) || '—';
-    return formatMoment(value);
   }
 
   /* ------------------------------------------------------------------ *
@@ -185,8 +172,6 @@
   }
 
   function normalizeTokenUnit(value) {
-    var shared = charts();
-    if (shared && typeof shared.normalizeTokenUnit === 'function') return shared.normalizeTokenUnit(value);
     return ['raw', 'k', 'wan', 'm'].indexOf(value) >= 0 ? value : 'raw';
   }
 
@@ -332,22 +317,21 @@
     return outcome ? outcome + ' · ' + (label || '—') : label || '—';
   }
 
+  // 精确合计：共享无损模块直接求和，缺少模块时启动阶段的错误提示已经阻断页面。
+  function sumExact(values) {
+    return numbers().sumIntTexts(values);
+  }
+
   function executionTokens(executions) {
-    var lossless = numbers();
-    var values = (executions || []).map(function (execution) {
+    return sumExact((executions || []).map(function (execution) {
       return (execution && execution.tokens ? execution.tokens.total : 0) || 0;
-    });
-    if (lossless && typeof lossless.sumIntTexts === 'function') return lossless.sumIntTexts(values);
-    return String(values.length);
+    }));
   }
 
   function executionCost(executions) {
-    var lossless = numbers();
-    var values = (executions || []).map(function (execution) {
+    return sumExact((executions || []).map(function (execution) {
       return execution && execution.cost_micro_usd != null ? execution.cost_micro_usd : 0;
-    });
-    if (lossless && typeof lossless.sumIntTexts === 'function') return lossless.sumIntTexts(values);
-    return '0';
+    }));
   }
 
   // 模型 Token 限额：后端只返回已配置的上限，0 表示该周期不限。
@@ -378,6 +362,7 @@
     executionCost: executionCost,
     tokenLimitText: tokenLimitText,
     parseBody: parseBody,
+    modulesReady: modulesReady,
     preferences: preferences,
     boot: boot,
   };
@@ -388,6 +373,7 @@
 
   var DATA_URL = 'lookup/data';
   var CAPTURE_URL = 'lookup/capture';
+  var MODULE_ERROR = '页面资源加载不完整（charts.js / numbers.js 未加载），无法显示精确账务数据，请刷新或联系维护者。';
 
   var state = {
     token: '',
@@ -400,7 +386,7 @@
     currency: 'USD',
     rate: DEFAULT_USD_CNY_RATE,
     trend: [],
-    summary: null,
+    payload: null,
   };
 
   // epoch 让任何一次迟到的响应失效；inflight 让上一次请求被真正取消。
@@ -508,7 +494,7 @@
   // 清空所有来自密钥的私有 DOM，并释放图表实例。
   function resetPrivateUI() {
     state.trend = [];
-    state.summary = null;
+    state.payload = null;
     ['quotas', 'token-limits', 'stats', 'recent-body'].forEach(function (id) {
       clear(el(id));
     });
@@ -582,7 +568,15 @@
         showBanner('查询失败（HTTP ' + response.status + '）。');
         return;
       }
-      var payload = parseBody(await response.text());
+      var payload;
+      try {
+        // 解析失败一律报错退出：绝不用部分/退化的数字冒充账务数据。
+        payload = parseBody(await response.text());
+      } catch (err) {
+        if (isStale(myEpoch)) return;
+        showBanner('查询响应无法解析，请稍后重试。');
+        return;
+      }
       if (isStale(myEpoch)) return;
       renderUsage(payload);
       hideBanner();
@@ -709,6 +703,15 @@
   }
 
   function renderUsage(data) {
+    state.payload = data;
+    renderAll();
+  }
+
+  // 单位/货币/汇率只影响展示：整页按保留的最新响应重绘，避免只有图表换了货币
+  // 而额度、汇总与明细仍是旧口径。
+  function renderAll() {
+    var data = state.payload;
+    if (!data) return;
     var key = data.key || {};
     var summary = data.summary || {};
 
@@ -719,7 +722,6 @@
 
     renderQuotas(key);
     renderTokenLimits(key);
-    state.summary = summary;
     renderStats(summary);
 
     state.trend = data.trend || [];
@@ -727,57 +729,19 @@
     renderRecent(data.items || [], data.total || 0, data.page || 1, data.page_size || PAGE_SIZE);
   }
 
-  // 共享图表组件负责请求数 / Token / 费用三条趋势；缺席时降级为内置条形。
+  // 趋势图只由共享组件绘制（随包发布的必需资源）。
   //
   // 关键：共享渲染器按容器复用 ECharts 实例，因此在这里绝不清空容器——
   // 一旦移除已有 canvas/svg，实例就与 DOM 脱钩，重新渲染只会得到空白图。
   function renderTrend() {
     var containers = { requests: el('trend-requests'), tokens: el('trend-tokens'), cost: el('trend-cost') };
-    var shared = charts();
     el('trend-empty').hidden = state.trend.length > 0;
-
-    if (shared && typeof shared.render === 'function') {
-      shared.render(containers, state.trend, {
-        bucket: state.grain,
-        tokenUnit: state.tokenUnit,
-        currency: state.currency,
-        rate: state.rate,
-      });
-      return;
-    }
-    Object.keys(containers).forEach(function (name) { clear(containers[name]); });
-    renderTrendFallback(containers);
-  }
-
-  function renderTrendFallback(containers) {
-    if (!state.trend.length) return;
-    var max = 0;
-    state.trend.forEach(function (point) {
-      max = Math.max(max, trendValue(point, 'tokens'), trendValue(point, 'requests'), trendValue(point, 'cost'));
+    charts().render(containers, state.trend, {
+      bucket: state.grain,
+      tokenUnit: state.tokenUnit,
+      currency: state.currency,
+      rate: state.rate,
     });
-    state.trend.forEach(function (point) {
-      containers.requests.appendChild(fallbackBar(bucketText(point.time, state.grain), trendValue(point, 'requests'), max, function (value) { return formatInt(value); }));
-      containers.tokens.appendChild(fallbackBar(bucketText(point.time, state.grain), trendValue(point, 'tokens'), max, function (value) { return formatToken(value, state.tokenUnit); }));
-      containers.cost.appendChild(fallbackBar(bucketText(point.time, state.grain), trendValue(point, 'cost'), max, function (value) { return formatMoney(value, state.currency, state.rate); }));
-    });
-  }
-
-  function trendValue(point, metric) {
-    if (metric === 'tokens') return Number(intText(point.tokens ? point.tokens.total : 0)) || 0;
-    if (metric === 'requests') return Number(intText(point.requests)) || 0;
-    return Number(intText(point.cost_micro_usd)) || 0;
-  }
-
-  function fallbackBar(label, value, max, format) {
-    var row = text('div', 'bar-row');
-    row.appendChild(text('span', 'bar-label', label));
-    var track = text('span', 'bar-track');
-    var fill = text('span', 'bar-fill');
-    fill.style.width = (max > 0 ? Math.round((value / max) * 100) : 0) + '%';
-    track.appendChild(fill);
-    row.appendChild(track);
-    row.appendChild(text('span', 'bar-value', format(value)));
-    return row;
   }
 
   function renderRecent(items, total, page, pageSize) {
@@ -917,8 +881,7 @@
     });
   }
 
-  function submitForm(event) {
-    event.preventDefault();
+  function submitForm() {
     var token = el('key').value.trim();
     if (!token) {
       showBanner('请输入密钥。');
@@ -936,27 +899,31 @@
   }
 
   function bind() {
-    el('lookup-form').addEventListener('submit', submitForm);
+    // 提交永远先 preventDefault：即使脚本不全，密钥也绝不会被浏览器原生提交进 URL。
+    el('lookup-form').addEventListener('submit', function (event) {
+      event.preventDefault();
+      submitForm();
+    });
     el('switch-key').addEventListener('click', switchKey);
     el('refresh').addEventListener('click', function () { state.page = 1; loadUsage(); });
     el('range').addEventListener('change', function () { state.range = el('range').value; state.page = 1; loadUsage(); });
+    // 单位/货币/汇率改变展示口径，整页（额度、汇总、明细、趋势）一起重绘。
     el('token-unit').addEventListener('change', function () {
       state.tokenUnit = normalizeTokenUnit(el('token-unit').value);
       persistUnitPreferences();
-      renderTrend();
-      if (state.summary) renderStats(state.summary);
+      renderAll();
     });
     el('currency').addEventListener('change', function () {
       state.currency = normalizeCurrency(el('currency').value);
       persistUnitPreferences();
       syncUnitControls();
-      renderTrend();
+      renderAll();
     });
     el('rate').addEventListener('change', function () {
       state.rate = normalizeRate(el('rate').value);
       persistUnitPreferences();
       syncUnitControls();
-      renderTrend();
+      renderAll();
     });
     el('grain-switch').addEventListener('click', function (event) {
       var target = event.target.closest('[data-grain]');
@@ -1000,6 +967,25 @@
   }
 
   function boot() {
+    // 先绑定提交处理（含 preventDefault），再做任何其它判断。
+    el('lookup-form').addEventListener('submit', function (event) {
+      event.preventDefault();
+      if (!modulesReady()) {
+        showBanner(MODULE_ERROR);
+        return;
+      }
+      submitForm();
+    });
+    if (!modulesReady()) {
+      // 必需共享资源缺失：明确报错并阻断，绝不用退化数字冒充账务数据。
+      el('dashboard').hidden = true;
+      el('switch-key').hidden = true;
+      el('login-gate').hidden = false;
+      el('submit').disabled = true;
+      showBanner(MODULE_ERROR);
+      markReady();
+      return;
+    }
     bind();
     applyTheme();
     readUnitPreferences();

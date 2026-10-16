@@ -158,6 +158,9 @@ function captureFor(key, id) {
 
 const hits = [];
 
+// 允许验收临时关闭共享模块资源，验证"模块缺失时 fail closed"。
+let serveModules = true;
+
 function startMock() {
   const server = http.createServer((req, res) => {
     const url = new URL(req.url, 'http://127.0.0.1');
@@ -179,6 +182,9 @@ function startMock() {
     if (url.pathname.startsWith(`${PLUGIN_BASE}/`)) {
       const relative = url.pathname.slice(PLUGIN_BASE.length + 1);
       if (!relative.includes('/') && STATIC[relative]) {
+        if (!serveModules && (relative === 'charts.js' || relative === 'numbers.js')) {
+          return send(404, '{"error":"module unavailable"}');
+        }
         try {
           return send(200, fs.readFileSync(path.join(ASSETS, relative)), STATIC[relative]);
         } catch (err) {
@@ -412,7 +418,12 @@ async function main() {
     check('无效密钥提示且停留门禁', (await cdp.text('#banner')).includes('无效'), await cdp.text('#banner'));
     check('无效密钥后主视图仍隐藏', await cdp.evaluate("document.querySelector('#dashboard').hidden === true"));
     check('无效密钥不写入存储', await cdp.evaluate("Object.keys(localStorage).concat(Object.keys(sessionStorage)).filter((k) => k.indexOf('credit-manager.lookup') === 0).length === 0"));
-    check('无效密钥请求只发往 lookup/data', hitsSince(beforeBad, '/lookup/data').length === 1);
+    const badHits = hitsSince(beforeBad, '/lookup/');
+    check(
+      '无效密钥只请求 lookup/data',
+      badHits.length >= 1 && badHits.every((h) => h.path.endsWith('/lookup/data')),
+      JSON.stringify(badHits.map((h) => h.path + h.query))
+    );
 
     /* --- 2. 有效密钥与精确账务 --- */
     await login(ALPHA);
@@ -452,15 +463,50 @@ async function main() {
     const expectedRowCost = await cdp.evaluate("window.CMCharts.formatMoneyMicro('4503599627370497','USD',7.2)");
     check('最近请求的成本精确合计', rows.includes(expectedRowCost), expectedRowCost);
     check('请求状态按契约显示结果与结算状态', rows.includes('成功 · 已结算') && rows.includes('待定'), rows.replace(/\n/g, ' ').slice(0, 200));
+    // 金额必须带且只带一次货币后缀（共享格式化的精确文本）。
+    check(
+      '金额文本只带一次货币后缀',
+      !/USD\s+USD/.test(quotas) && !/USD\s+USD/.test(await cdp.text('#stats')) && / USD/.test(quotas),
+      quotas.slice(0, 120)
+    );
     await cdp.screenshot('01-dashboard.png', { fullPage: true });
 
-    /* --- 3. 趋势图与维度 --- */
-    await cdp.waitFor("document.querySelectorAll('#trend-requests svg, #trend-requests canvas').length > 0", 10000, '趋势图渲染');
+    // 图表容器状态：记录 ECharts 实例是否仍然挂在容器上。
     const chartNode = () => cdp.evaluate(`(() => {
       const size = (id) => { const n = document.querySelector('#trend-' + id); const s = n.querySelector('svg, canvas');
         return s ? { w: n.getBoundingClientRect().width, h: n.getBoundingClientRect().height, children: n.children.length } : null; };
       return { requests: size('requests'), tokens: size('tokens'), cost: size('cost') };
     })()`);
+
+    /* --- 2b. 展示口径切换必须整页生效（额度/汇总/明细/趋势） --- */
+    const usdQuotas = await cdp.text('#quotas');
+    const usdStats = await cdp.text('#stats');
+    await cdp.setValue('#currency', 'CNY');
+    await sleep(200);
+    const cnyQuotas = await cdp.text('#quotas');
+    const cnyStats = await cdp.text('#stats');
+    const cnyRows = await cdp.text('#recent-body');
+    check('切到 CNY 后额度卡片换成人民币', cnyQuotas !== usdQuotas && cnyQuotas.includes('CNY'), cnyQuotas.slice(0, 120));
+    check('切到 CNY 后汇总换成人民币', cnyStats !== usdStats && cnyStats.includes('CNY'), cnyStats.slice(0, 160));
+    check('切到 CNY 后明细换成人民币', cnyRows.includes('CNY') && !cnyRows.includes('USD'), cnyRows.slice(0, 160));
+    check('切 CNY 后汇率输入可见', await cdp.evaluate("document.querySelector('#rate').hidden === false"));
+    check(
+      'CNY 口径不重复货币后缀',
+      !/CNY\s+CNY/.test(cnyQuotas) && !/CNY\s+CNY/.test(cnyStats) && !/CNY\s+CNY/.test(cnyRows)
+    );
+    const cnyChart = await chartNode();
+    check('切货币后趋势图仍可见（无渲染异常）', !!cnyChart.cost && cnyChart.cost.children > 0, JSON.stringify(cnyChart));
+    await cdp.setValue('#currency', 'USD');
+    await sleep(200);
+    check(
+      '切回 USD 后整页精确恢复同一口径',
+      (await cdp.text('#quotas')) === usdQuotas && (await cdp.text('#stats')) === usdStats,
+      await cdp.text('#stats')
+    );
+    check('展示偏好写入共享存储键', await cdp.evaluate("localStorage.getItem('credit_manager_currency') === 'USD'"));
+
+    /* --- 3. 趋势图与维度 --- */
+    await cdp.waitFor("document.querySelectorAll('#trend-requests svg, #trend-requests canvas').length > 0", 10000, '趋势图渲染');
     const first = await chartNode();
     check('三张趋势图都由共享组件渲染', !!first.requests && !!first.tokens && !!first.cost, JSON.stringify(first));
     check('趋势图容器有可见尺寸', first.tokens.w > 200 && first.tokens.h >= 200, JSON.stringify(first.tokens));
@@ -592,12 +638,33 @@ async function main() {
     const foreignHits = hits.filter((h) => h.path.endsWith('/lookup/capture'));
     check('快照请求携带的是当前登录密钥', foreignHits.length > 0 && foreignHits[foreignHits.length - 1].key === BETA, JSON.stringify(foreignHits.slice(-1)));
     const dataKeys = [...new Set(hits.filter((h) => h.path.endsWith('/lookup/data')).map((h) => h.key))].sort();
-    check(
-      '数据请求只使用页面提交过的客户密钥',
+    check('数据请求只使用页面提交过的客户密钥',
       dataKeys.length === 5 && dataKeys.every((k) => [ALPHA, BETA, EMPTY, EXPIRED, BAD].includes(k)),
-      JSON.stringify(dataKeys)
-    );
+      JSON.stringify(dataKeys));
     await cdp.screenshot('05-beta.png', { fullPage: true });
+
+    /* --- 10. 必需共享模块缺失时 fail closed --- */
+    serveModules = false;
+    await cdp.send('Page.navigate', { url: pageUrl });
+    await waitForApp(cdp);
+    check('模块缺失时给出可见错误', (await cdp.text('#banner')).includes('页面资源加载不完整'), await cdp.text('#banner'));
+    check('模块缺失时禁用查询按钮', await cdp.evaluate("document.querySelector('#submit').disabled === true"));
+    const beforeBroken = hitCount();
+    const prevented = await cdp.evaluate(
+      "(() => { document.querySelector('#key').value = 'cm-should-not-leak';" +
+        " const form = document.querySelector('#lookup-form'); const event = new Event('submit', { bubbles: true, cancelable: true });" +
+        " form.dispatchEvent(event); return event.defaultPrevented; })()"
+    );
+    await sleep(300);
+    check('模块缺失时提交被阻止（密钥不会进 URL）', prevented === true && (await cdp.evaluate("location.search === ''")));
+    check('模块缺失时按回车也不触发原生提交', await cdp.evaluate("document.documentElement.dataset.lookupReady === '1' && location.href.indexOf('cm-should-not-leak') < 0"));
+    check('模块缺失时任何数据请求都不发出', hitsSince(beforeBroken, '/lookup/data').length === 0);
+    check('模块缺失时主视图保持隐藏', await cdp.evaluate("document.querySelector('#dashboard').hidden === true"));
+    await cdp.screenshot('06-modules-missing.png', { fullPage: true });
+    serveModules = true;
+
+    const pageErrors = await cdp.evaluate('window.__cmErrors || []');
+    check('整轮验收页面无运行期异常', pageErrors.length === 0, JSON.stringify(pageErrors));
   } finally {
     try {
       const pageErrors = await cdp.evaluate('window.__cmErrors || []');

@@ -264,26 +264,6 @@ input:focus, select:focus, button:focus-visible {
 /* 图表容器：ECharts 需要显式高度才能绘制，固定高度对降级条形同样适用。 */
 .chart { height: 220px; min-height: 220px; overflow: auto; }
 
-.bar-row {
-  display: grid;
-  grid-template-columns: 92px 1fr auto;
-  align-items: center;
-  gap: 10px;
-  font-size: 12px;
-}
-
-.bar-label { color: var(--text-dim); font-family: var(--mono); }
-.bar-track {
-  display: block;
-  height: 12px;
-  background: var(--bg-raised);
-  border: 1px solid var(--border);
-  border-radius: 999px;
-  overflow: hidden;
-}
-.bar-fill { display: block; height: 100%; background: var(--accent); }
-.bar-value { color: var(--text-dim); font-family: var(--mono); white-space: nowrap; }
-
 /* ---------- 表格 ---------- */
 
 .table-wrap { overflow-x: auto; }
@@ -348,6 +328,4 @@ pre.body {
 @media (max-width: 720px) {
   .app { padding: 10px; }
   .gate { padding: 16px; }
-  .bar-row { grid-template-columns: 72px 1fr; }
-  .bar-value { grid-column: 2; text-align: right; }
 }

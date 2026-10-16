@@ -181,6 +181,27 @@ test('响应体解析走无损解析，绝不使用会丢精度的 response.json
   assert.equal(parsed.summary.cost_micro_usd.cmIntText, BIG);
 });
 
+test('只调用共享模块真实导出的 API，且必需模块在页面内全部就位', () => {
+  // 实际 charts 模块（不是测试替身）：越界调用会在页面上变成 undefined/异常。
+  const used = [...new Set([...readAsset('lookup.js').matchAll(/charts\(\)\.([A-Za-z]+)/g)].map((m) => m[1]))];
+  assert.ok(used.length >= 4, `页面应通过 charts() 调用共享图表 API：${used}`);
+  for (const name of used) {
+    assert.equal(typeof CMCharts[name], 'function', `共享图表模块必须导出 ${name}`);
+  }
+  const numbersUsed = [...new Set([...readAsset('lookup.js').matchAll(/numbers\(\)\.([A-Za-z]+)/g)].map((m) => m[1]))];
+  for (const name of numbersUsed) {
+    assert.equal(typeof CMNumbers[name], 'function', `共享无损数字模块必须导出 ${name}`);
+  }
+  // 页面依赖的格式化必须输出带一次货币后缀的精确文本（>2^53 不失真、不重复货币）。
+  const money = CMCharts.formatMoneyMicro(BIG, 'USD', 7.2);
+  assert.ok(money.endsWith(' USD'), `金额应带一次货币后缀：${money}`);
+  assert.ok(!/USD\s+USD/.test(money), `金额不得重复货币：${money}`);
+  assert.ok(money.includes('9007199254.740993'), `金额必须精确：${money}`);
+  assert.equal(CMCharts.tokenText(BIG, 'raw'), '9,007,199,254,740,993');
+  assert.notEqual(CMCharts.tokenText(BIG, 'k'), CMCharts.tokenText(BIG, 'raw'), '非原始单位必须改变展示文本');
+  assert.equal(CMLookup.modulesReady(), true);
+});
+
 test('主题与计量偏好自带读取，跟随 CPA 键且容忍不可用存储', () => {
   function fakeStore(initial) {
     const data = Object.assign({}, initial || {});
@@ -216,12 +237,38 @@ const html = readAsset('lookup.html');
 
 test('趋势重绘不在共享渲染前清空容器，并复用共享图表与无损数字', () => {
   const start = js.indexOf('function renderTrend()');
-  const cut = js.indexOf('shared.render(', start);
+  const cut = js.indexOf('charts().render(', start);
   assert.ok(start >= 0 && cut > start, 'renderTrend 必须调用共享渲染器');
   assert.equal(js.slice(start, cut).includes('clear('), false, '清空容器会让 ECharts 实例脱钩');
   assert.ok(js.includes('CMCharts') && js.includes('CMNumbers'));
   assert.equal(js.includes('response.json()'), false, 'response.json() 会丢失 64 位精度');
   assert.ok(js.includes('refreshTheme'), '主题切换后必须重新上色');
+  // 共享模块是必需资源：不得保留自绘趋势图或退化数字分支。
+  for (const gone of ['renderTrendFallback', 'fallbackBar', 'bar-fill', 'JSON.parse(text)']) {
+    assert.equal(js.includes(gone), false, `必须删除降级实现 ${gone}`);
+  }
+  assert.ok(js.includes('页面资源加载不完整'), '缺少必需模块时必须给出可见错误');
+  assert.ok(js.includes("el('submit').disabled = true"), '缺少必需模块时必须阻断提交');
+});
+
+test('展示偏好改变时整页重绘：额度/汇总/明细/趋势口径一致', () => {
+  // 三个偏好控件都必须调用 renderAll()，而不是只重画图表。
+  const handlers = ['token-unit', 'currency', 'rate'].map((id) => {
+    const at = js.indexOf(`el('${id}').addEventListener('change'`);
+    assert.ok(at >= 0, `缺少 ${id} 的偏好处理`);
+    return js.slice(at, js.indexOf('});', at));
+  });
+  for (const body of handlers) {
+    assert.ok(body.includes('renderAll()'), '偏好改变必须整页重绘');
+  }
+  const at = js.indexOf('function renderAll()');
+  const body = js.slice(at, js.indexOf('function renderTrend()', at));
+  for (const call of ['renderQuotas(', 'renderTokenLimits(', 'renderStats(', 'renderTrend()', 'renderRecent(']) {
+    assert.ok(body.includes(call), `renderAll 必须重绘 ${call}`);
+  }
+  assert.ok(body.includes('state.payload'), '整页重绘必须基于保留的最新响应');
+  assert.ok(js.slice(js.indexOf('function resetPrivateUI()'), js.indexOf('function dropSession(')).includes('state.payload = null'),
+    '退出/切换密钥必须清掉保留的账务响应');
 });
 
 test('生命周期：切换密钥/401 会取消在途请求并清空私有数据', () => {
