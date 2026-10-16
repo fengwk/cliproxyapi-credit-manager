@@ -20,12 +20,28 @@
 
 安装步骤（主机上执行）：
 
+#### 方式 A：通过 CPA 插件商店（推荐）
+
+在 CPA 的 `config.yaml` 的 `plugins` 下添加自定义源：
+
+```yaml
+plugins:
+  enabled: true
+  dir: "./plugins"
+  store-sources:
+    - "https://raw.githubusercontent.com/fengwk/cliproxyapi-credit-manager/main/registry.json"
+```
+
+随后在 CPA Web 控制面板的「插件商店」中即可直接发现并安装本插件。
+
+#### 方式 B：手动下载安装
+
 ```sh
 # 1. 校验下载物
 sha256sum -c checksums.txt --ignore-missing   # 需要与 zip 同目录
 
 # 2. 解压，只复制动态库
-unzip -o cliproxyapi-credit-manager_0.1.0_linux_amd64.zip cliproxyapi-credit-manager.so
+unzip -o cliproxyapi-credit-manager_0.1.2_linux_amd64.zip cliproxyapi-credit-manager.so
 mkdir -p "$CPA_DIR/plugins/linux/amd64"
 cp cliproxyapi-credit-manager.so "$CPA_DIR/plugins/linux/amd64/"
 

@@ -38,6 +38,9 @@ routing:
 plugins:
   enabled: true
   dir: "./plugins"
+  # 自定义插件市场源列表（可选）。配置后可在 CPA 控制面板的插件商店直接发现并安装本插件。
+  store-sources:
+    - "https://raw.githubusercontent.com/fengwk/cliproxyapi-credit-manager/main/registry.json"
   configs:
     # 键名 = 宿主加载的动态库 id，也就是库文件名去掉扩展名。
     # 发布归档中的库文件名为 cliproxyapi-credit-manager.so（darwin 为 .dylib），

@@ -20,6 +20,22 @@ CLIProxyAPI v8 的**原生插件**：用插件自建的客户端 Key 做前端�
 
 ## 快速开始
 
+### 方式 A：通过 CPA 插件商店（推荐）
+
+在 CPA 的 `config.yaml` 中配置自定义插件源：
+
+```yaml
+plugins:
+  enabled: true
+  dir: "./plugins"
+  store-sources:
+    - "https://raw.githubusercontent.com/fengwk/cliproxyapi-credit-manager/main/registry.json"
+```
+
+保存后即可在 CPA Web 控制面板的「插件商店」中一键安装本插件。
+
+### 方式 B：手动下载安装
+
 **1. 下载归档**：从 [Releases](https://github.com/fengwk/cliproxyapi-credit-manager/releases)
 取对应平台的 zip（`linux/amd64`、`linux/arm64`、`darwin/arm64`），并用同页的
 `checksums.txt` 校验 SHA256。
