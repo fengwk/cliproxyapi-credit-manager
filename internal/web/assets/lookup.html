@@ -1,0 +1,142 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>密钥自助查询</title>
+<link rel="stylesheet" href="./lookup.css">
+</head>
+<body>
+<main class="app">
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true">CM</span>
+      <span class="brand-text">
+        <span class="brand-title">Credit Manager</span>
+        <span class="brand-sub">密钥自助查询</span>
+      </span>
+    </div>
+    <div class="topbar-actions">
+      <button type="button" id="switch-key" class="ghost" hidden>更换密钥</button>
+    </div>
+  </header>
+
+  <div id="banner" class="banner" role="alert" hidden></div>
+
+  <section id="login-gate" class="gate">
+    <h2>查询密钥额度</h2>
+    <p class="hint">密钥只用于本次查询请求，不会写进页面地址栏；勾选“记住密钥”后才会保存在本机浏览器，方便下次自动填入。</p>
+    <form id="lookup-form" class="login-form">
+      <label class="field" for="key">密钥
+        <input id="key" name="key" type="password" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="粘贴你的密钥" required>
+      </label>
+      <label class="remember"><input id="remember-key" type="checkbox">记住密钥</label>
+      <button id="submit" type="submit">查询</button>
+    </form>
+  </section>
+
+  <section id="dashboard" hidden>
+    <div class="section">
+      <div class="section-head">
+        <h2 id="key-label">密钥概览</h2>
+        <span id="key-state" class="muted"></span>
+      </div>
+      <div id="quotas" class="cards"></div>
+    </div>
+
+    <div class="section">
+      <div class="section-head">
+        <h2>使用统计</h2>
+        <span id="retention" class="muted"></span>
+      </div>
+      <div class="filter-bar">
+        <label class="inline" for="range">时间范围</label>
+        <select id="range">
+          <option value="today" selected>今日</option>
+          <option value="7">最近 7 天</option>
+          <option value="30">最近 30 天</option>
+          <option value="90">最近 90 天</option>
+          <option value="all">全部保留期</option>
+        </select>
+        <button id="refresh" type="button">刷新</button>
+      </div>
+      <div id="stats" class="cards"></div>
+    </div>
+
+    <div class="section">
+      <div class="section-head">
+        <h2>用量趋势</h2>
+        <div class="trend-controls">
+          <div class="switch-group" id="grain-switch" role="group" aria-label="趋势时间维度">
+            <button type="button" data-grain="hour">时</button>
+            <button type="button" data-grain="day" class="active">日</button>
+            <button type="button" data-grain="month">月</button>
+          </div>
+          <label class="inline" for="token-unit">Token 单位</label>
+          <select id="token-unit">
+            <option value="raw" selected>原始数量</option>
+            <option value="k">千 (k)</option>
+            <option value="wan">万 (w)</option>
+            <option value="m">百万 (m)</option>
+          </select>
+        </div>
+      </div>
+      <div class="chart-grid">
+        <div class="chart-card">
+          <h3>请求数</h3>
+          <div id="trend-requests" class="chart" aria-label="请求数趋势图"></div>
+        </div>
+        <div class="chart-card">
+          <h3>Token 趋势</h3>
+          <div id="trend-tokens" class="chart" aria-label="Token 趋势图"></div>
+        </div>
+        <div class="chart-card">
+          <h3>费用趋势</h3>
+          <div id="trend-cost" class="chart" aria-label="费用趋势图"></div>
+        </div>
+      </div>
+      <p id="trend-empty" class="muted" hidden>当前时间范围内暂无用量记录。</p>
+    </div>
+
+    <div class="section">
+      <div class="section-head">
+        <h2>最近请求</h2>
+        <span id="recent-state" class="muted"></span>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th scope="col">时间</th>
+              <th scope="col">模型</th>
+              <th scope="col">状态</th>
+              <th scope="col" class="num">Token</th>
+              <th scope="col" class="num">成本</th>
+              <th scope="col">快照</th>
+            </tr>
+          </thead>
+          <tbody id="recent-body"></tbody>
+        </table>
+      </div>
+      <div class="pager">
+        <button id="prev" type="button">上一页</button>
+        <span id="page-info" class="muted"></span>
+        <button id="next" type="button">下一页</button>
+      </div>
+    </div>
+  </section>
+</main>
+
+<dialog id="capture-modal">
+  <div class="modal-head">
+    <h2 id="capture-title">请求快照</h2>
+    <button type="button" id="capture-close">关闭</button>
+  </div>
+  <div id="capture-body" class="modal-body"></div>
+</dialog>
+
+<script src="./vendor/echarts-5.6.0.min.js" defer></script>
+<script src="./charts.js" defer></script>
+<script src="./lookup.js" defer></script>
+</body>
+</html>

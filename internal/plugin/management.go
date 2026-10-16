@@ -3,6 +3,7 @@ package plugin
 import (
 	"encoding/json"
 	"net/http"
+	"path"
 	"strings"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
@@ -23,10 +24,17 @@ var managementRouteSuffixes = map[string][]string{
 	"/api/health":  {http.MethodGet},
 }
 
-// resourceAssets are the only public static files this plugin serves. The set is
-// a strict allow list: the public resource base must never reach the financial
-// API, and assets are embedded, not read from disk.
-var resourceAssets = []string{"index.html", "app.js", "style.css"}
+// resourceAssets are the exact public static files this plugin serves. The list
+// is the web package's exact allow list, so the served set and the declared set
+// can never drift: the public resource base must never reach the financial API
+// and assets are embedded, not read from disk. Nested names are permitted so a
+// vendored dependency can be served, but every entry is matched exactly.
+var resourceAssets = web.AssetNames()
+
+// lookupRoutes are the only public dynamic routes. They are customer
+// self-service endpoints: unauthenticated at the host boundary, but each one
+// authenticates the caller's own ledger key through the financial handler.
+var lookupRoutes = []string{web.PublicLookupData, web.PublicLookupCapture}
 
 // managementRegistrationResponse mirrors the host's expected registration shape.
 type managementRegistrationResponse struct {
@@ -66,7 +74,7 @@ func (m *Manager) handleManagementRegister(request []byte) ([]byte, error) {
 			})
 		}
 	}
-	resources := make([]pluginapi.ResourceRoute, 0, len(resourceAssets))
+	resources := make([]pluginapi.ResourceRoute, 0, len(resourceAssets)+len(lookupRoutes))
 	for _, name := range resourceAssets {
 		route := pluginapi.ResourceRoute{Path: resourceBase + "/" + name}
 		if name == "index.html" {
@@ -74,6 +82,14 @@ func (m *Manager) handleManagementRegister(request []byte) ([]byte, error) {
 			route.Description = PluginName + " credit management dashboard."
 		}
 		resources = append(resources, route)
+	}
+	// Customer self-service endpoints are declared as explicit resource routes
+	// without a menu entry, so the sidebar keeps exactly one plugin menu.
+	for _, action := range lookupRoutes {
+		resources = append(resources, pluginapi.ResourceRoute{
+			Path:        resourceBase + "/" + action,
+			Description: PluginName + " customer self-service lookup.",
+		})
 	}
 	return okEnvelope(managementRegistrationResponse{Routes: routes, Resources: resources})
 }
@@ -149,27 +165,78 @@ func (m *Manager) handleManagement(request []byte) (resp []byte, err error) {
 	if strings.HasPrefix(path, web.BasePath+"/api/") {
 		return okEnvelope(deps.handler.Handle(req.ManagementRequest))
 	}
-	if name, okAsset := resourceAssetName(path); okAsset {
+	relative, ok := resourceRelativePath(path)
+	if !ok {
+		return okEnvelope(managementResponse(http.StatusNotFound, "not found"))
+	}
+	if name, okAsset := staticResourceAsset(relative); okAsset {
 		return okEnvelope(serveResource(name))
+	}
+	if action, okLookup := lookupRoute(relative); okLookup {
+		return okEnvelope(deps.handler.HandleLookup(action, req.ManagementRequest))
 	}
 	return okEnvelope(managementResponse(http.StatusNotFound, "not found"))
 }
 
-// resourceAssetName extracts the public asset name from a resource request path
-// and reports whether it is one of the declared static assets.
-func resourceAssetName(path string) (string, bool) {
-	if !strings.Contains(path, "/resource/plugins/") {
+// resourceMarker anchors a public resource path to its plugin directory. The
+// segment after the marker is the host-derived plugin id and must be one of this
+// plugin's own library ids; the remainder is then matched against the exact
+// allow list.
+const resourceMarker = "/resource/plugins/"
+
+// resourceRelativePath returns the exact path below the plugin resource
+// directory, or false when the request does not name a resource, does not name
+// this plugin's resource directory, names only the directory, or is not a clean
+// relative path (traversal or an aliasing spelling is rejected rather than
+// normalized).
+func resourceRelativePath(requestPath string) (string, bool) {
+	requestPath = strings.TrimSpace(requestPath)
+	marker := strings.Index(requestPath, resourceMarker)
+	if marker < 0 {
 		return "", false
 	}
-	trimmed := strings.TrimRight(strings.TrimSpace(path), "/")
-	if trimmed == "" || strings.HasSuffix(trimmed, "/") {
+	rest := requestPath[marker+len(resourceMarker):]
+	slash := strings.IndexByte(rest, '/')
+	if slash <= 0 {
 		return "", false
 	}
-	index := strings.LastIndex(trimmed, "/")
-	name := trimmed[index+1:]
+	// The plugin id segment must be this plugin's own resource directory: the
+	// segment is the host-derived library id, which is either the released name
+	// or the short legacy name. Any other plugin id is not this plugin's traffic.
+	pluginID := rest[:slash]
+	if pluginID != PluginID && pluginID != releasedPluginID {
+		return "", false
+	}
+	relative := rest[slash+1:]
+	if relative == "" || strings.HasSuffix(relative, "/") {
+		return "", false
+	}
+	if relative != path.Clean(relative) || strings.HasPrefix(relative, "/") {
+		return "", false
+	}
+	if strings.ContainsAny(relative, "\\\x00") {
+		return "", false
+	}
+	return relative, true
+}
+
+// staticResourceAsset reports whether the relative path is one of the declared
+// static assets.
+func staticResourceAsset(relative string) (string, bool) {
 	for _, allowed := range resourceAssets {
-		if name == allowed {
-			return name, true
+		if relative == allowed {
+			return allowed, true
+		}
+	}
+	return "", false
+}
+
+// lookupRoute reports whether the relative path is one of the declared public
+// self-service endpoints.
+func lookupRoute(relative string) (string, bool) {
+	for _, allowed := range lookupRoutes {
+		if relative == allowed {
+			return allowed, true
 		}
 	}
 	return "", false

@@ -51,6 +51,24 @@ SOFTWARE.
 | `gopkg.in/yaml.v3` | v3.0.1 | MIT 与 Apache License 2.0 双许可（含 NOTICE，Copyright 2011-2016 Canonical Ltd.） |
 | `modernc.org/sqlite` | v1.46.1 | BSD-3-Clause（Copyright (c) 2017 The Sqlite Authors）；另附 `SQLITE-LICENSE`，SQLite 本身属公有领域 |
 
+## 内嵌的第三方前端资源
+
+### Apache ECharts（Apache License 2.0）
+
+趋势图使用 Apache ECharts 5.6.0 渲染。该库以**未经修改的原始发行文件**内嵌在插件中，
+不使用任何 CDN、打包器或外部网络请求；界面资源全部由 `go:embed` 打进插件二进制。
+
+| 文件 | 说明 |
+| --- | --- |
+| `internal/web/assets/vendor/echarts-5.6.0.min.js` | 官方压缩发行文件（与上游逐字节一致） |
+| `internal/web/assets/vendor/echarts-LICENSE` | Apache License 2.0 全文 |
+| `internal/web/assets/vendor/echarts-NOTICE` | 上游 NOTICE |
+
+许可：Apache License 2.0，Copyright 2017-2024 The Apache Software Foundation。
+完整条款与归属见上述 `echarts-LICENSE` 与 `echarts-NOTICE`，本仓库未修改其条款。
+文件来源为原版 credit-manager 管理界面同版本发行文件
+（`credit-manager/internal/management/web/vendor/`），md5 与本仓库副本一致。
+
 ## 运行时宿主
 
 本插件是 CLIProxyAPI v8 的原生插件，由宿主进程以 `c-shared` 动态库形式加载
@@ -58,5 +76,6 @@ SOFTWARE.
 
 ## 字体、图标与前端资源
 
-管理界面为纯 HTML/CSS/JS，不引入任何 CDN、打包器、字体或第三方图标库；界面资源
-全部内嵌在插件二进制中。
+管理界面为纯 HTML/CSS/JS，不引入任何 CDN、打包器、字体或第三方图标库。唯一的第三方
+前端资源是上文内嵌的 Apache ECharts（本地 `vendor/` 副本，非 CDN）；界面资源全部内嵌
+在插件二进制中。

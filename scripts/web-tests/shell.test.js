@@ -41,8 +41,7 @@ test('结果筛选只提供契约枚举值', () => {
   assert.deepEqual(values, ['', 'succeeded', 'failed', 'rejected', 'canceled', 'active', 'pending']);
 });
 
-test('脚本不写入存储、不使用 innerHTML/eval、始终携带 Authorization', () => {
-  assert.ok(!/localStorage|sessionStorage/.test(js), '管理密钥不得落地存储');
+test('凭据与偏好按规范使用存储、不使用 Cookie、不使用 innerHTML/eval、始终携带 Authorization', () => {
   assert.ok(!/document\.cookie/.test(js), '不得使用 Cookie 保存密钥');
   assert.ok(!/innerHTML\s*=/.test(js), '不得用 innerHTML 写入服务端数据');
   assert.ok(!/insertAdjacentHTML|outerHTML\s*=|document\.write/.test(js));
@@ -50,6 +49,8 @@ test('脚本不写入存储、不使用 innerHTML/eval、始终携带 Authorizat
   assert.ok(js.includes("Authorization: 'Bearer ' + state.key"), '管理请求必须携带 Authorization');
   assert.ok(js.includes("credentials: 'same-origin'"));
   assert.ok(js.includes('cache: \'no-store\''));
+  assert.ok(js.includes('sessionStorage'), '会话凭据使用 sessionStorage 隔离在 tab 内');
+  assert.ok(js.includes('credit_manager_mgmt_token'), '存储键遵循契约前缀');
 });
 
 test('脚本与样式不含 emoji，避免华而不实的符号', () => {

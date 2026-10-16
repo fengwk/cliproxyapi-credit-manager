@@ -62,6 +62,10 @@ test('buildUsageQuery 缺省与非法分页/粒度回退', () => {
   assert.equal(params.get('page'), '1');
   assert.equal(params.get('page_size'), '20');
   assert.equal(params.get('bucket'), 'day');
+
+  // 支持 month 粒度
+  const monthQuery = CM.buildUsageQuery({ bucket: 'month' });
+  assert.equal(new URLSearchParams(monthQuery).get('bucket'), 'month');
 });
 
 test('分页切换保留其余过滤器', () => {
@@ -443,4 +447,39 @@ test('请求体解析失败时截断错误文本', () => {
   const long = 'x'.repeat(1000);
   assert.equal(CM.truncateText(long).length, 301);
   assert.equal(CM.truncateText('ok'), 'ok');
+});
+
+test('Token 单位、货币与费率规范化', () => {
+  assert.equal(CM.normalizeTokenUnit('k'), 'k');
+  assert.equal(CM.normalizeTokenUnit('wan'), 'wan');
+  assert.equal(CM.normalizeTokenUnit('m'), 'm');
+  assert.equal(CM.normalizeTokenUnit('raw'), 'raw');
+  assert.equal(CM.normalizeTokenUnit('invalid'), 'raw');
+
+  assert.equal(CM.normalizeCurrency('CNY'), 'CNY');
+  assert.equal(CM.normalizeCurrency('USD'), 'USD');
+  assert.equal(CM.normalizeCurrency('EUR'), 'USD');
+
+  assert.equal(CM.normalizeRate(7.2), 7.2);
+  assert.equal(CM.normalizeRate('7.25'), 7.25);
+  assert.equal(CM.normalizeRate(-1), 7.2);
+  assert.equal(CM.normalizeRate(0), 7.2);
+  assert.equal(CM.normalizeRate('abc'), 7.2);
+});
+
+test('formatTokens 支持不同单位换算', () => {
+  CM.state.tokenUnit = 'raw';
+  assert.equal(CM.formatTokens(1234567), '1,234,567');
+
+  CM.state.tokenUnit = 'k';
+  assert.equal(CM.formatTokens(1234567), '1,234.6k');
+
+  CM.state.tokenUnit = 'wan';
+  assert.equal(CM.formatTokens(1234567), '123.5万');
+
+  CM.state.tokenUnit = 'm';
+  assert.equal(CM.formatTokens(1234567), '1.23m');
+
+  // 恢复 raw
+  CM.state.tokenUnit = 'raw';
 });

@@ -26,19 +26,26 @@ func TestShellIsSelfContained(t *testing.T) {
 	html := readAsset(t, "index.html")
 
 	refs := regexp.MustCompile(`(?:href|src)="([^"]+)"`).FindAllStringSubmatch(html, -1)
-	if len(refs) != 2 {
-		t.Fatalf("index.html 应只引用 app.js 与 style.css，实际 %d 个引用", len(refs))
+	allowed := map[string]bool{
+		"./style.css":                   true,
+		"./lookup.html":                 true,
+		"./vendor/echarts-5.6.0.min.js": true,
+		"./charts.js":                   true,
+		"./app.js":                      true,
+	}
+	if len(refs) == 0 {
+		t.Fatal("index.html 未引用任何静态资源")
 	}
 	for _, match := range refs {
-		if match[1] != "./app.js" && match[1] != "./style.css" {
+		if !allowed[match[1]] {
 			t.Errorf("index.html 引用了非预期资源: %s", match[1])
 		}
 	}
 	if strings.Contains(html, "http://") || strings.Contains(html, "https://") {
 		t.Error("静态外壳不得引用外部 CDN 或外部地址")
 	}
-	if regexp.MustCompile(`localStorage\s*[.=\[]|sessionStorage\s*[.=\[]|document\.cookie\s*=`).MatchString(html) {
-		t.Error("静态外壳不得读写浏览器存储或 Cookie")
+	if regexp.MustCompile(`sessionStorage\s*[.=\[]|document\.cookie\s*=`).MatchString(html) {
+		t.Error("静态外壳不得读写 sessionStorage 或 Cookie")
 	}
 	if !strings.Contains(html, `lang="zh-CN"`) {
 		t.Error("界面语言应为简体中文")
