@@ -420,6 +420,78 @@
     };
   }
 
+  function defaultOverviewFilters(now) {
+    var current = now ? new Date(now) : new Date();
+    var startOfDay = new Date(current.getFullYear(), current.getMonth(), current.getDate(), 0, 0, 0, 0);
+    return {
+      quick: 'today',
+      from: localDatetimeValue(startOfDay),
+      to: localDatetimeValue(current),
+      key: '',
+      model: '',
+      source: '',
+      bucket: 'day',
+    };
+  }
+
+  function resolveQuickRange(quick, now) {
+    var current = now ? new Date(now) : new Date();
+    if (quick === 'today') {
+      var start = new Date(current.getFullYear(), current.getMonth(), current.getDate(), 0, 0, 0, 0);
+      return { from: localDatetimeValue(start), to: localDatetimeValue(current), quick: 'today' };
+    }
+    if (quick === '24h') {
+      return { from: localDatetimeValue(new Date(current.getTime() - 24 * 3600 * 1000)), to: localDatetimeValue(current), quick: '24h' };
+    }
+    if (quick === '7d') {
+      return { from: localDatetimeValue(new Date(current.getTime() - 7 * 24 * 3600 * 1000)), to: localDatetimeValue(current), quick: '7d' };
+    }
+    if (quick === '30d') {
+      return { from: localDatetimeValue(new Date(current.getTime() - 30 * 24 * 3600 * 1000)), to: localDatetimeValue(current), quick: '30d' };
+    }
+    if (quick === '90d') {
+      return { from: localDatetimeValue(new Date(current.getTime() - 90 * 24 * 3600 * 1000)), to: localDatetimeValue(current), quick: '90d' };
+    }
+    if (quick === 'all') {
+      return { from: '', to: '', quick: 'all' };
+    }
+    return null;
+  }
+
+  function buildOverviewQuery(filters) {
+    var input = filters || {};
+    var pairs = [];
+    var push = function (name, value) {
+      if (value === undefined || value === null) return;
+      var text = String(value).trim();
+      if (text === '') return;
+      pairs.push([name, text]);
+    };
+    var fromVal = input.from;
+    var toVal = input.to;
+    if (input.quick && input.quick !== 'custom' && input.quick !== 'all') {
+      var qRange = resolveQuickRange(input.quick);
+      if (qRange) {
+        fromVal = qRange.from;
+        toVal = qRange.to;
+      }
+    } else if (input.quick === 'all') {
+      fromVal = '';
+      toVal = '';
+    }
+    push('from', toISOFromLocal(fromVal));
+    push('to', toISOFromLocal(toVal));
+    push('key_id', input.key);
+    push('model', input.model);
+    push('source', input.source);
+    push('bucket', USAGE_BUCKETS.indexOf(input.bucket) >= 0 ? input.bucket : 'day');
+    return pairs
+      .map(function (pair) {
+        return encodeURIComponent(pair[0]) + '=' + encodeURIComponent(pair[1]);
+      })
+      .join('&');
+  }
+
   function normalizePageSize(value) {
     var size = Number(intString(value));
     if (!isFinite(size) || size <= 0) return 20;
@@ -700,6 +772,9 @@
       max_concurrent: intVal(input.maxConcurrent),
       allowed_models: (input.allowedModels || []).slice(),
     };
+    if (input.callerId !== undefined && input.callerId !== null) {
+      spec.caller_id = String(input.callerId).trim();
+    }
     // 自定义密钥材料只在显式提供非空值时下发，且原样（不裁剪）：留空表示由服务端生成，
     // 首尾空白由服务端校验拒绝，避免界面悄悄把调用方的密钥改写成另一个值。
     if (input.key !== undefined && input.key !== null && input.key !== '') {
@@ -802,12 +877,23 @@
     // 会话纪元：登录尝试、登出与会话失效时递增。请求在发起时捕获纪元，
     // 纪元变化后到达的任何响应（含失败）都被判定为过期，不得写回状态、渲染或触发登出。
     sessionEpoch: 0,
-    tab: 'usage',
+    tab: 'overview',
     tokenUnit: 'raw',
     currency: 'USD',
     currencyRate: DEFAULT_USD_CNY_RATE,
     theme: 'auto',
     palette: 'white',
+    overview: {
+      filters: defaultOverviewFilters(),
+      data: null,
+      loading: false,
+      error: '',
+      requestedQuery: '',
+      loadedAt: null,
+      loadSeq: 0,
+      modelShareMetric: 'requests',
+      modelRankMetric: 'value',
+    },
     usage: {
       filters: defaultUsageFilters(),
       report: null,
@@ -818,7 +904,18 @@
       loadSeq: 0,
     },
     keys: { items: null, loading: false, error: '', loadSeq: 0 },
+    callers: { items: null, loading: false, error: '', loadSeq: 0 },
     prices: { items: null, loading: false, error: '', loadSeq: 0 },
+    audit: {
+      items: null,
+      total: 0,
+      page: 1,
+      pageSize: 20,
+      filters: { keyId: '', callerId: '' },
+      loading: false,
+      error: '',
+      loadSeq: 0,
+    },
     credentials: { items: null, loading: false, error: '', quota: {}, loadSeq: 0 },
     health: { data: null, loading: false, error: '', loadSeq: 0 },
   };
@@ -1131,6 +1228,9 @@
   }
 
   var api = {
+    overview: function (query) {
+      return request(managerPath('/api/overview') + (query ? '?' + query : ''));
+    },
     listKeys: function () {
       return request(managerPath('/api/keys'));
     },
@@ -1144,6 +1244,27 @@
       var body = { id: id };
       if (customKey) body.key = customKey;
       return request(managerPath('/api/rotate'), { method: 'POST', body: body });
+    },
+    revealKey: function (id) {
+      return request(managerPath('/api/reveal'), { method: 'POST', body: { id: id } });
+    },
+    deleteKey: function (id, reason) {
+      return request(managerPath('/api/delete-key'), { method: 'POST', body: { id: id, reason: reason } });
+    },
+    resetSpend: function (spec) {
+      return request(managerPath('/api/reset-spend'), { method: 'POST', body: spec });
+    },
+    listCallers: function () {
+      return request(managerPath('/api/callers'));
+    },
+    createCaller: function (spec) {
+      return request(managerPath('/api/callers'), { method: 'POST', body: spec });
+    },
+    updateCaller: function (spec) {
+      return request(managerPath('/api/callers'), { method: 'PUT', body: spec });
+    },
+    audit: function (query) {
+      return request(managerPath('/api/audit') + (query ? '?' + query : ''));
     },
     listPrices: function () {
       return request(managerPath('/api/prices'));
@@ -1171,6 +1292,9 @@
         method: 'POST',
         body: { auth_index: authIndex },
       });
+    },
+    exchangeRate: function () {
+      return request(managerPath('/api/exchange-rate'));
     },
   };
 
@@ -1804,10 +1928,10 @@
         if (box) box.checked = Boolean(wasRemembered);
         persistCredential(savedToken, Boolean(wasRemembered));
         showMainView();
-        activateTab('usage', false);
-        state.usage.filters = defaultUsageFilters();
-        applyUsageFiltersToForm(state.usage.filters);
-        loadUsage(true);
+        activateTab('overview', false);
+        state.overview.filters = defaultOverviewFilters();
+        applyOverviewFiltersToForm(state.overview.filters);
+        loadOverview(true);
         loadKeys(true);
       },
       function (error) {
@@ -1862,10 +1986,10 @@
         if (input) input.value = '';
         persistCredential(key, remember);
         showMainView();
-        activateTab('usage', false);
-        state.usage.filters = defaultUsageFilters();
-        applyUsageFiltersToForm(state.usage.filters);
-        loadUsage(true);
+        activateTab('overview', false);
+        state.overview.filters = defaultOverviewFilters();
+        applyOverviewFiltersToForm(state.overview.filters);
+        loadOverview(true);
         loadKeys(true);
       },
       function (error) {
@@ -1894,6 +2018,9 @@
     clearSessionState();
     clearRenderedPrivateContent();
     closeDialog();
+    if (global.CMAdminPricing && typeof global.CMAdminPricing.dispose === 'function') {
+      global.CMAdminPricing.dispose();
+    }
     showLoginView();
     var keyInput = $('management-key');
     if (keyInput) keyInput.value = '';
@@ -1903,12 +2030,23 @@
   /* ---------------- 标签页 ---------------- */
 
   var TAB_LOADERS = {
-    usage: function () {},
+    overview: function () {
+      loadOverview(false);
+    },
+    usage: function () {
+      loadUsage(false);
+    },
     keys: function () {
       loadKeys(false);
     },
+    callers: function () {
+      loadCallers(false);
+    },
     prices: function () {
       loadPrices(false);
+    },
+    audit: function () {
+      loadAudit(false);
     },
     credentials: function () {
       loadCredentials(false);
@@ -1955,6 +2093,443 @@
         });
       })(tabs[i]);
     }
+  }
+
+  /* ================================================================== *
+   * 概览 (Overview)
+   * ================================================================== */
+
+  function applyOverviewFiltersToForm(filters) {
+    var f = filters || {};
+    var set = function (id, value) {
+      var node = $(id);
+      if (node) node.value = value === undefined || value === null ? '' : String(value);
+    };
+    set('overview-quick', f.quick || 'today');
+    set('overview-from', f.from || '');
+    set('overview-to', f.to || '');
+    set('overview-key', f.key || '');
+    set('overview-model', f.model || '');
+    set('overview-source', f.source || '');
+    set('overview-bucket', f.bucket || 'day');
+
+    var fromWrap = $('overview-from-wrap');
+    var toWrap = $('overview-to-wrap');
+    var showCustom = f.quick === 'custom';
+    if (fromWrap) fromWrap.hidden = !showCustom;
+    if (toWrap) toWrap.hidden = !showCustom;
+  }
+
+  function overviewFiltersFromForm() {
+    var quick = $('overview-quick') ? $('overview-quick').value : 'today';
+    return {
+      quick: quick,
+      from: $('overview-from') ? $('overview-from').value : '',
+      to: $('overview-to') ? $('overview-to').value : '',
+      key: $('overview-key') ? $('overview-key').value : '',
+      model: $('overview-model') ? $('overview-model').value : '',
+      source: $('overview-source') ? $('overview-source').value : '',
+      bucket: $('overview-bucket') ? $('overview-bucket').value : 'day',
+    };
+  }
+
+  function wireOverviewForm() {
+    var form = $('overview-filters');
+    if (form) {
+      form.addEventListener('submit', function (event) {
+        event.preventDefault();
+        state.overview.filters = overviewFiltersFromForm();
+        loadOverview(true);
+      });
+    }
+    var resetBtn = $('overview-reset');
+    if (resetBtn) {
+      resetBtn.addEventListener('click', function () {
+        state.overview.filters = defaultOverviewFilters();
+        applyOverviewFiltersToForm(state.overview.filters);
+        loadOverview(true);
+      });
+    }
+    var quickSelect = $('overview-quick');
+    if (quickSelect) {
+      quickSelect.addEventListener('change', function () {
+        var val = quickSelect.value;
+        var fromWrap = $('overview-from-wrap');
+        var toWrap = $('overview-to-wrap');
+        if (val === 'custom') {
+          if (fromWrap) fromWrap.hidden = false;
+          if (toWrap) toWrap.hidden = false;
+        } else {
+          if (fromWrap) fromWrap.hidden = true;
+          if (toWrap) toWrap.hidden = true;
+          var range = resolveQuickRange(val);
+          if (range) {
+            if ($('overview-from')) $('overview-from').value = range.from;
+            if ($('overview-to')) $('overview-to').value = range.to;
+          }
+        }
+      });
+    }
+
+    var shareMetricGroup = $('model-share-metric');
+    if (shareMetricGroup) {
+      shareMetricGroup.addEventListener('click', function (event) {
+        var btn = event.target.closest('button[data-metric]');
+        if (!btn) return;
+        var metric = btn.getAttribute('data-metric');
+        state.overview.modelShareMetric = metric;
+        var buttons = shareMetricGroup.querySelectorAll('button');
+        for (var i = 0; i < buttons.length; i++) {
+          buttons[i].classList.toggle('active', buttons[i] === btn);
+        }
+        if (state.overview.data && state.overview.data.models) {
+          renderOverviewModelShare(state.overview.data.models, state.overview.data.summary);
+        }
+      });
+    }
+
+    var rankMetricGroup = $('model-rank-metric');
+    if (rankMetricGroup) {
+      rankMetricGroup.addEventListener('click', function (event) {
+        var btn = event.target.closest('button[data-metric]');
+        if (!btn) return;
+        var metric = btn.getAttribute('data-metric');
+        state.overview.modelRankMetric = metric;
+        var buttons = rankMetricGroup.querySelectorAll('button');
+        for (var j = 0; j < buttons.length; j++) {
+          buttons[j].classList.toggle('active', buttons[j] === btn);
+        }
+        if (state.overview.data && state.overview.data.models) {
+          renderOverviewModelRank(state.overview.data.models);
+        }
+      });
+    }
+  }
+
+  function loadOverview(force) {
+    if (!state.key) return;
+    var filters = state.overview.filters;
+    var query = buildOverviewQuery(filters);
+    var seq = ++state.overview.loadSeq;
+    if (!force && state.overview.requestedQuery === query && state.overview.data) {
+      state.overview.loading = false;
+      state.overview.error = '';
+      renderOverview();
+      return;
+    }
+    state.overview.loading = true;
+    state.overview.error = '';
+    renderOverviewStatus();
+    renderOverviewError();
+    api.overview(query).then(
+      function (data) {
+        if (seq !== state.overview.loadSeq) return;
+        state.overview.loading = false;
+        state.overview.data = data || {};
+        state.overview.requestedQuery = query;
+        state.overview.loadedAt = new Date();
+        renderOverview();
+      },
+      function (error) {
+        if (seq !== state.overview.loadSeq) return;
+        if (failRequest(error)) return;
+        state.overview.loading = false;
+        state.overview.error = describeError(error);
+        renderOverviewStatus();
+        renderOverviewError();
+      }
+    );
+  }
+
+  function renderOverviewStatus() {
+    var node = $('overview-status');
+    if (!node) return;
+    if (state.overview.loading) {
+      node.textContent = '正在读取概览指标…';
+      return;
+    }
+    var parts = [];
+    if (state.overview.requestedQuery !== undefined && state.overview.data) {
+      parts.push('接口：GET ' + MANAGER_BASE + '/api/overview');
+    }
+    if (state.overview.loadedAt) parts.push('数据时间：' + formatDateTime(state.overview.loadedAt.toISOString()));
+    if (state.overview.data && state.overview.requestedQuery) parts.push('查询：' + state.overview.requestedQuery);
+    node.textContent = parts.join('　·　');
+  }
+
+  function renderOverviewError() {
+    renderErrorBox($('overview-error'), state.overview.error, function () {
+      loadOverview(true);
+    });
+  }
+
+  function renderOverviewSummary(summary) {
+    var container = $('overview-summary');
+    if (!container) return;
+    if (!summary) {
+      container.textContent = '';
+      return;
+    }
+    var cards = [
+      el('div', { class: 'card stat-card metric-card' }, [
+        el('div', { class: 'stat-label metric-label', text: '总请求数' }),
+        el('div', { class: 'stat-value mono', text: formatInt(summary.requests || 0) }),
+        el('div', { class: 'stat-sub muted', text: '执行 ' + formatInt(summary.executions || 0) + ' 次' }),
+      ]),
+      el('div', { class: 'card stat-card metric-card' }, [
+        el('div', { class: 'stat-label metric-label', text: '总消耗 Token' }),
+        el('div', { class: 'stat-value mono', text: formatTokens(summary.tokens && summary.tokens.total !== undefined ? summary.tokens.total : summary.tokens, state.tokenUnit) }),
+        el('div', { class: 'stat-sub muted', text: '输入 ' + formatTokens(summary.tokens && summary.tokens.input !== undefined ? summary.tokens.input : 0, state.tokenUnit) + ' · 输出 ' + formatTokens(summary.tokens && summary.tokens.output !== undefined ? summary.tokens.output : 0, state.tokenUnit) }),
+      ]),
+      el('div', { class: 'card stat-card metric-card' }, [
+        el('div', { class: 'stat-label metric-label', text: '总费用支出（总成本）' }),
+        el('div', { class: 'stat-value mono', text: formatMicroUSD(summary.cost_micro_usd || 0) }),
+        el('div', { class: 'stat-sub muted', text: (summary.adjustment_micro_usd && intString(summary.adjustment_micro_usd) !== '0') ? '含人工补记 ' + formatMicroUSD(summary.adjustment_micro_usd) : '法币折合 ' + formatMoneyMicro(summary.cost_micro_usd || 0, state.currency, state.currencyRate) }),
+      ]),
+      el('div', { class: 'card stat-card metric-card' }, [
+        el('div', { class: 'stat-label metric-label', text: '缓存读取率' }),
+        el('div', { class: 'stat-value mono', text: (summary.cache_read_ratio !== null && summary.cache_read_ratio !== undefined) ? (Number(summary.cache_read_ratio) * 100).toFixed(1) + '%' : '—' }),
+        el('div', { class: 'stat-sub muted', text: '完成执行 ' + formatInt(summary.complete_executions || 0) + ' 次' }),
+      ]),
+      el('div', { class: 'card stat-card metric-card' }, [
+        el('div', { class: 'stat-label metric-label', text: '异常请求' }),
+        el('div', { class: 'stat-value mono' + ((summary.failed || summary.pending) ? ' text-warn' : ''), text: formatInt((summary.failed || 0) + (summary.pending || 0)) }),
+        el('div', { class: 'stat-sub muted', text: '失败 ' + formatInt(summary.failed || 0) + ' · 待定 ' + formatInt(summary.pending || 0) }),
+      ]),
+    ];
+    replace(container, cards);
+  }
+
+  function renderOverviewCharts(trend) {
+    var tokenChart = $('overview-token-chart');
+    var costChart = $('overview-cost-chart');
+    var points = trend || [];
+    if (!tokenChart || !costChart) return;
+
+    if (global.CMCharts && typeof global.CMCharts.render === 'function') {
+      global.CMCharts.render(
+        { tokens: tokenChart, cost: costChart },
+        points,
+        {
+          bucket: state.overview.filters.bucket || 'day',
+          tokenUnit: state.tokenUnit,
+          currency: state.currency,
+          rate: state.currencyRate,
+          theme: state.theme,
+          palette: state.palette,
+        }
+      );
+    }
+  }
+
+  function renderOverviewModelShare(models, summary) {
+    var chartContainer = $('overview-model-share');
+    var legendContainer = $('overview-model-share-legend');
+    var countNode = $('overview-model-count');
+    if (countNode) countNode.textContent = '共 ' + (models ? models.length : 0) + ' 个模型';
+    if (!chartContainer) return;
+    if (!models || models.length === 0) {
+      if (global.CMCharts && typeof global.CMCharts.renderDonut === 'function') {
+        global.CMCharts.renderDonut(chartContainer, [], {});
+      }
+      if (legendContainer) legendContainer.textContent = '暂无模型调用数据';
+      return;
+    }
+
+    var metric = state.overview.modelShareMetric || 'requests';
+    var items = [];
+    var centerTitle = '总调用';
+    var centerTotal = formatInt(summary && summary.requests ? summary.requests : 0);
+
+    if (metric === 'tokens') {
+      centerTitle = '总 Token';
+      var sumTokens = summary && summary.tokens && summary.tokens.total !== undefined ? summary.tokens.total : (summary && summary.tokens ? summary.tokens : 0);
+      centerTotal = formatTokens(sumTokens, state.tokenUnit);
+    } else if (metric === 'cost') {
+      centerTitle = '总费用';
+      centerTotal = formatMicroUSD(summary && summary.cost_micro_usd ? summary.cost_micro_usd : 0);
+    }
+
+    models.forEach(function (m) {
+      var val = 0;
+      var disp = '';
+      if (metric === 'requests') {
+        val = Number(intString(m.requests || 0));
+        disp = formatInt(m.requests || 0) + ' 次';
+      } else if (metric === 'tokens') {
+        var tVal = m.tokens && m.tokens.total !== undefined ? m.tokens.total : m.tokens;
+        val = Number(intString(tVal || 0));
+        disp = formatTokens(tVal || 0, state.tokenUnit);
+      } else if (metric === 'cost') {
+        val = Number(intString(m.cost_micro_usd || 0));
+        disp = formatMicroUSD(m.cost_micro_usd || 0);
+      }
+      items.push({
+        name: m.model || 'unknown',
+        value: val,
+        displayValue: disp,
+      });
+    });
+
+    if (global.CMCharts && typeof global.CMCharts.renderDonut === 'function') {
+      global.CMCharts.renderDonut(chartContainer, items, {
+        centerTitle: centerTitle,
+        centerTotal: centerTotal,
+        metric: metric,
+        theme: state.theme,
+        palette: state.palette,
+      });
+    }
+
+    if (legendContainer) {
+      legendContainer.textContent = '';
+      var colors = (global.CMCharts && global.CMCharts.DONUT_COLORS) || ['#2563eb', '#10b981', '#f59e0b', '#ec4899', '#8b5cf6', '#06b6d4', '#64748b'];
+      var totalSum = items.reduce(function (acc, it) { return acc + (it.value > 0 ? it.value : 0); }, 0);
+      items.forEach(function (it, idx) {
+        var color = colors[idx % colors.length];
+        var pct = totalSum > 0 ? ((it.value / totalSum) * 100).toFixed(1) + '%' : '0%';
+        var itemEl = el('div', { class: 'share-legend-item' }, [
+          el('span', { class: 'share-swatch', style: 'background-color:' + color }),
+          el('span', { class: 'share-name', text: it.name }),
+          el('span', { class: 'share-pct', text: pct }),
+          el('span', { class: 'share-val muted', text: it.displayValue }),
+        ]);
+        legendContainer.appendChild(itemEl);
+      });
+    }
+  }
+
+  function renderOverviewModelRank(models) {
+    var container = $('overview-model-rank');
+    var hint = $('overview-rank-hint');
+    var countNode = $('overview-rank-count');
+    if (countNode) countNode.textContent = '共 ' + (models ? models.length : 0) + ' 个模型';
+    if (!container) return;
+    if (!models || models.length === 0) {
+      container.textContent = '暂无模型排行数据';
+      return;
+    }
+
+    var metric = state.overview.modelRankMetric || 'value';
+    var hintMap = {
+      value: '按每美元产出 Token 排序，越高越省',
+      unit: '按单次调用平均成本排序，越低越轻量',
+      cache: '按缓存读取占比排序，越高缓存效率越好',
+      tps: '按每秒生成 Token 吞吐率排序，越高生成越快',
+      latency: '按平均响应延迟排序，越低响应越快',
+    };
+    if (hint) hint.textContent = hintMap[metric] || '';
+
+    var list = models.map(function (m) {
+      var score = null;
+      var display = '—';
+      var requests = Number(intString(m.requests || 0));
+      var executions = Number(intString(m.complete_executions || m.executions || 0));
+      var costMicro = Number(intString(m.cost_micro_usd || 0));
+      var tokens = Number(intString(m.tokens && m.tokens.total !== undefined ? m.tokens.total : m.tokens || 0));
+      var outputTokens = Number(intString(m.output_tokens || 0));
+      var latencyMs = Number(intString(m.latency_ms || 0));
+      var latencySamples = Number(intString(m.latency_samples || 0));
+
+      if (metric === 'value') {
+        if (costMicro > 0) {
+          var costUSD = costMicro / 1000000;
+          score = tokens / costUSD;
+          display = formatTokens(Math.round(score), state.tokenUnit) + ' / USD';
+        } else if (tokens > 0) {
+          score = Infinity;
+          display = '∞ (免费)';
+        } else {
+          score = null;
+          display = '—';
+        }
+      } else if (metric === 'unit') {
+        var count = executions > 0 ? executions : requests;
+        if (count > 0 && costMicro >= 0) {
+          score = costMicro / count;
+          display = formatMicroUSD(Math.round(score)) + ' / 次';
+        } else {
+          score = null;
+          display = '—';
+        }
+      } else if (metric === 'cache') {
+        if (m.cache_read_ratio !== undefined && m.cache_read_ratio !== null) {
+          score = Number(m.cache_read_ratio);
+          display = (score * 100).toFixed(1) + '%';
+        } else {
+          score = null;
+          display = '—';
+        }
+      } else if (metric === 'tps') {
+        if (latencyMs > 0 && outputTokens > 0) {
+          score = outputTokens / (latencyMs / 1000);
+          display = score.toFixed(1) + ' tokens/s';
+        } else {
+          score = null;
+          display = '—';
+        }
+      } else if (metric === 'latency') {
+        if (latencySamples > 0 && latencyMs > 0) {
+          score = latencyMs / latencySamples;
+          display = score >= 1000 ? (score / 1000).toFixed(2) + ' s' : Math.round(score) + ' ms';
+        } else {
+          score = null;
+          display = '—';
+        }
+      }
+
+      return {
+        model: m.model || 'unknown',
+        score: score,
+        display: display,
+        requests: requests,
+        tokens: tokens,
+        costMicro: costMicro,
+      };
+    });
+
+    list.sort(function (a, b) {
+      if (a.score === null && b.score === null) return 0;
+      if (a.score === null) return 1;
+      if (b.score === null) return -1;
+      if (metric === 'unit' || metric === 'latency') {
+        return a.score - b.score;
+      }
+      return b.score - a.score;
+    });
+
+    container.textContent = '';
+    list.forEach(function (item, idx) {
+      var row = el('div', { class: 'model-rank-item' }, [
+        el('div', { class: 'rank-index' + (idx < 3 ? ' top-rank' : ''), text: String(idx + 1) }),
+        el('div', { class: 'rank-info' }, [
+          el('div', { class: 'rank-header' }, [
+            el('span', { class: 'rank-model mono', text: item.model }),
+            el('span', { class: 'rank-value mono', text: item.display }),
+          ]),
+          el('div', { class: 'rank-meta muted' }, [
+            el('span', { text: formatInt(item.requests) + ' 次调用' }),
+            el('span', { text: formatTokens(item.tokens, state.tokenUnit) + ' tokens' }),
+            el('span', { text: formatMicroUSD(item.costMicro) }),
+          ]),
+        ]),
+      ]);
+      container.appendChild(row);
+    });
+  }
+
+  function renderOverview() {
+    var data = state.overview.data || {};
+    renderOverviewStatus();
+    renderOverviewError();
+    renderOverviewSummary(data.summary);
+    var retNode = $('overview-retention');
+    if (retNode) {
+      retNode.textContent = data.retention_from ? '数据保留自 ' + formatDateTime(data.retention_from) : '';
+    }
+    renderOverviewCharts(data.trend);
+    renderOverviewModelShare(data.models || [], data.summary);
+    renderOverviewModelRank(data.models || []);
   }
 
   /* ================================================================== *
@@ -2813,22 +3388,33 @@
 
   function renderUsageKeyOptions() {
     var select = $('usage-key');
-    if (!select) return;
-    var current = select.value;
-    var options = [el('option', { value: '', text: '全部' })];
+    var overviewSelect = $('overview-key');
     var items = state.keys.items || [];
-    items.forEach(function (key) {
-      var label = (key.spec && key.spec.label) || '';
-      options.push(
-        el('option', {
-          value: key.id,
-          text: (label ? label + ' · ' : '') + (key.fingerprint || shortId(key.id)),
-        })
-      );
-    });
-    replace(select, options);
-    select.value = current || '';
-    if (!select.value) select.value = '';
+    var buildOptions = function () {
+      var opts = [el('option', { value: '', text: '全部' })];
+      items.forEach(function (key) {
+        var label = (key.spec && key.spec.label) || '';
+        opts.push(
+          el('option', {
+            value: key.id,
+            text: (label ? label + ' · ' : '') + (key.fingerprint || shortId(key.id)),
+          })
+        );
+      });
+      return opts;
+    };
+    if (select) {
+      var current = select.value;
+      replace(select, buildOptions());
+      select.value = current || '';
+      if (!select.value) select.value = '';
+    }
+    if (overviewSelect) {
+      var currentOv = overviewSelect.value;
+      replace(overviewSelect, buildOptions());
+      overviewSelect.value = currentOv || '';
+      if (!overviewSelect.value) overviewSelect.value = '';
+    }
   }
 
   function limitLine(label, value) {
@@ -2894,20 +3480,45 @@
       var spec = key.spec || {};
       var allowed = spec.allowed_models || [];
       var limits = spec.model_token_limits || [];
-      return el('tr', { class: 'row-main' }, [
+      var isDeleted = Boolean(key.deleted_at);
+      var callerName = (function () {
+        if (!spec.caller_id) return '—';
+        var callers = state.callers.items || [];
+        for (var c = 0; c < callers.length; c++) {
+          if (callers[c].id === spec.caller_id) {
+            return (callers[c].display_name ? callers[c].display_name + ' ' : '') + '（' + callers[c].id + '）';
+          }
+        }
+        return spec.caller_id;
+      })();
+
+      var statusBadges = [];
+      if (isDeleted) {
+        statusBadges.push(badge('已软删除', 'warn'));
+        statusBadges.push(el('div', { class: 'pill-note', text: '删除时间 ' + formatDateTime(key.deleted_at) }));
+      } else {
+        statusBadges.push(badge(spec.enabled ? '已启用' : '已禁用', spec.enabled ? 'ok' : 'warn'));
+        if (spec.expires_at) {
+          statusBadges.push(el('div', { class: 'pill-note', text: '过期 ' + formatDateTime(spec.expires_at) }));
+        }
+      }
+
+      var effectiveSpent = key.quota_used_micro_usd !== undefined ? key.quota_used_micro_usd : key.spent_micro_usd;
+
+      return el('tr', { class: 'row-main' + (isDeleted ? ' is-deleted' : '') }, [
         el('td', {}, [
           el('div', { text: spec.label || '（未命名）' }),
           el('div', { class: 'pill-note mono-break', text: key.id || '—' }),
         ]),
         el('td', {}, [
-          badge(spec.enabled ? '已启用' : '已禁用', spec.enabled ? 'ok' : 'warn'),
-          spec.expires_at ? el('div', { class: 'pill-note', text: '过期 ' + formatDateTime(spec.expires_at) }) : null,
+          el('div', { text: callerName }),
         ]),
+        el('td', {}, statusBadges),
         el('td', {}, [el('div', { class: 'mono-break', text: key.fingerprint || '—' })]),
         el('td', {}, [el('div', { class: 'mono-break', text: key.principal || '—' })]),
         el('td', { class: 'num' }, [
-          el('div', { text: formatMicroUSD(key.spent_micro_usd) }),
-          el('div', { class: 'pill-note', text: formatInt(key.spent_micro_usd) + ' µUSD' }),
+          el('div', { text: formatMicroUSD(effectiveSpent) }),
+          el('div', { class: 'pill-note', text: '累积 ' + formatMicroUSD(key.spent_micro_usd) }),
           key.held_micro_usd && intString(key.held_micro_usd) !== '0'
             ? el('div', { class: 'pill-note', text: '持有 ' + formatMicroUSD(key.held_micro_usd) })
             : null,
@@ -2933,7 +3544,16 @@
             el('button', {
               class: 'btn btn-small',
               type: 'button',
+              text: '查看密钥',
+              onclick: function () {
+                openRevealKeyDialog(key);
+              },
+            }),
+            el('button', {
+              class: 'btn btn-small',
+              type: 'button',
               text: '编辑',
+              disabled: isDeleted ? true : undefined,
               onclick: function () {
                 openKeyEditor(key);
               },
@@ -2942,6 +3562,7 @@
               class: 'btn btn-small',
               type: 'button',
               text: spec.enabled ? '禁用' : '启用',
+              disabled: isDeleted ? true : undefined,
               onclick: function () {
                 toggleKeyEnabled(key);
               },
@@ -2950,8 +3571,27 @@
               class: 'btn btn-small',
               type: 'button',
               text: '轮换密钥',
+              disabled: isDeleted ? true : undefined,
               onclick: function () {
                 openRotateDialog(key);
+              },
+            }),
+            el('button', {
+              class: 'btn btn-small',
+              type: 'button',
+              text: '重置额度',
+              disabled: isDeleted ? true : undefined,
+              onclick: function () {
+                openResetSpendDialog(key);
+              },
+            }),
+            el('button', {
+              class: 'btn btn-small btn-danger',
+              type: 'button',
+              text: '删除',
+              disabled: isDeleted ? true : undefined,
+              onclick: function () {
+                openDeleteKeyDialog(key);
               },
             }),
           ]),
@@ -2961,10 +3601,11 @@
 
     var head = el('tr', {}, [
       el('th', { text: '标签 / Key ID' }),
+      el('th', { text: '调用方' }),
       el('th', { text: '状态' }),
       el('th', { text: '指纹' }),
       el('th', { text: 'Principal' }),
-      el('th', { class: 'num', text: '已消费 / 持有' }),
+      el('th', { class: 'num', text: '有效已用 / 累积支出' }),
       el('th', { class: 'num', text: '额度' }),
       el('th', { class: 'num', text: '并发' }),
       el('th', { text: '允许模型 / token 限额' }),
@@ -3251,13 +3892,512 @@
     });
   }
 
+  function openRevealKeyDialog(key) {
+    if (!key || !key.id) return;
+    var dialog = openDialog({
+      title: '查看密钥明文 · ' + shortId(key.id),
+      wide: false,
+    });
+    dialog.setBody([
+      el('p', { class: 'muted', text: '正在向后端安全检索密文封存材料…' }),
+    ]);
+
+    api.revealKey(key.id).then(
+      function (res) {
+        var material = (res && res.key) || '';
+        dialog.setBody([
+          el('p', { class: 'hint hint-warn', text: '请妥善保管该明文密钥，该明文仅在弹窗内一次性显示，关闭后不在浏览器留存。' }),
+          el('div', { class: 'field' }, [
+            el('label', { text: 'Key 明文' }),
+            el('div', { class: 'input-row' }, [
+              el('input', { type: 'text', class: 'mono', value: material, readonly: true }),
+              copyButton(function () { return material; }, '复制密钥'),
+            ]),
+          ]),
+        ]);
+        dialog.setFooter([
+          el('button', { class: 'btn btn-primary', type: 'button', text: '已复制并关闭', onclick: dialog.close }),
+        ]);
+      },
+      function (err) {
+        if (err && (err.status === 409 || (err.message && err.message.indexOf('legacy') >= 0))) {
+          dialog.setBody([
+            el('p', { class: 'hint hint-warn', text: '该密钥为历史旧版创建的 Key，未在安全密封区加密存储，无法直接恢复明文。' }),
+            el('p', { class: 'note', text: '若需要获取可用明文，请使用“轮换密钥”功能重新生成具备安全加密保护的新密钥。' }),
+          ]);
+        } else {
+          dialog.setError('读取密钥失败：' + describeError(err));
+        }
+        dialog.setFooter([
+          el('button', { class: 'btn btn-ghost', type: 'button', text: '关闭', onclick: dialog.close }),
+        ]);
+      }
+    );
+  }
+
+  function openDeleteKeyDialog(key) {
+    if (!key || !key.id) return;
+    var reasonInput = el('input', { type: 'text', id: 'delete-key-reason', placeholder: '请输入软删除原因（必填）' });
+    var confirmCheckbox = el('input', { type: 'checkbox', id: 'delete-key-confirm' });
+    var dialog = openDialog({
+      title: '删除客户端 Key · ' + shortId(key.id),
+      wide: false,
+    });
+
+    var submitBtn = el('button', {
+      class: 'btn btn-danger',
+      type: 'button',
+      text: '确认软删除',
+      onclick: function () {
+        var reason = reasonInput.value.trim();
+        if (!reason) {
+          dialog.setError('请输入删除原因');
+          return;
+        }
+        if (!confirmCheckbox.checked) {
+          dialog.setError('请勾选确认复选框');
+          return;
+        }
+        submitBtn.disabled = true;
+        dialog.setError('');
+        api.deleteKey(key.id, reason).then(
+          function () {
+            notify('客户端 Key 已成功软删除');
+            dialog.close();
+            loadKeys(true);
+          },
+          function (err) {
+            submitBtn.disabled = false;
+            dialog.setError(describeError(err));
+          }
+        );
+      },
+    });
+
+    dialog.setBody([
+      el('p', { class: 'hint hint-danger', text: '此操作将软删除并永久禁用该 Key。禁用后无法再用于发起任何 API 调用，但在该 Key 下产生的所有历史账单与使用记录均完整保留。' }),
+      el('div', { class: 'form-grid' }, [
+        el('div', { class: 'field' }, [
+          el('label', { for: 'delete-key-reason', text: '删除原因（必填）' }),
+          reasonInput,
+        ]),
+        el('div', { class: 'field' }, [
+          el('label', { class: 'checkbox-label' }, [
+            confirmCheckbox,
+            document.createTextNode(' 我已知晓删除后无法撤销并确认软删除该 Key'),
+          ]),
+        ]),
+      ]),
+    ]);
+    dialog.setFooter([
+      submitBtn,
+      el('button', { class: 'btn btn-ghost', type: 'button', text: '取消', onclick: dialog.close }),
+    ]);
+  }
+
+  function openResetSpendDialog(key) {
+    var isBatch = !key;
+    var reasonInput = el('input', { type: 'text', id: 'reset-reason', placeholder: '例如: 月度账期刷新' });
+    var chkTotal = el('input', { type: 'checkbox', checked: true });
+    var chkDaily = el('input', { type: 'checkbox', checked: true });
+    var chkWeekly = el('input', { type: 'checkbox', checked: true });
+    var chkMonthly = el('input', { type: 'checkbox', checked: true });
+    var confirmCheckbox = el('input', { type: 'checkbox' });
+
+    var dialog = openDialog({
+      title: isBatch ? '批量重置额度基线' : ('重置 Key 额度基线 · ' + shortId(key.id)),
+      wide: false,
+    });
+
+    var submitBtn = el('button', {
+      class: 'btn btn-primary',
+      type: 'button',
+      text: '执行额度重置',
+      onclick: function () {
+        var reason = reasonInput.value.trim();
+        if (!confirmCheckbox.checked) {
+          dialog.setError('请勾选确认重置复选框');
+          return;
+        }
+        submitBtn.disabled = true;
+        dialog.setError('');
+        var spec = {
+          reason: reason || '额度周期重置',
+          total: chkTotal.checked,
+          daily: chkDaily.checked,
+          weekly: chkWeekly.checked,
+          monthly: chkMonthly.checked,
+        };
+        if (key && key.id) {
+          spec.id = key.id;
+        } else {
+          spec.all = true;
+        }
+
+        api.resetSpend(spec).then(
+          function (res) {
+            notify('额度基线已成功重置（影响 ' + (res && res.keys ? res.keys : 1) + ' 个 Key）');
+            dialog.close();
+            loadKeys(true);
+          },
+          function (err) {
+            submitBtn.disabled = false;
+            dialog.setError(describeError(err));
+          }
+        );
+      },
+    });
+
+    dialog.setBody([
+      el('p', { class: 'hint hint-warn', text: '额度重置通过在账本记录新基线快照生效，不会抹除或篡改已入账历史。未结清的预扣款与挂起请求不受影响。' }),
+      el('div', { class: 'form-grid' }, [
+        el('div', { class: 'field' }, [
+          el('label', { text: '重置周期选择' }),
+          el('div', { class: 'checkbox-group' }, [
+            el('label', { class: 'checkbox-label' }, [chkTotal, document.createTextNode(' 总计额度 (total)')]),
+            el('label', { class: 'checkbox-label' }, [chkDaily, document.createTextNode(' 日度周期 (daily)')]),
+            el('label', { class: 'checkbox-label' }, [chkWeekly, document.createTextNode(' 周度周期 (weekly)')]),
+            el('label', { class: 'checkbox-label' }, [chkMonthly, document.createTextNode(' 月度周期 (monthly)')]),
+          ]),
+        ]),
+        el('div', { class: 'field' }, [
+          el('label', { for: 'reset-reason', text: '重置原因备注' }),
+          reasonInput,
+        ]),
+        el('div', { class: 'field' }, [
+          el('label', { class: 'checkbox-label' }, [
+            confirmCheckbox,
+            document.createTextNode(' 确认执行额度基线重置'),
+          ]),
+        ]),
+      ]),
+    ]);
+    dialog.setFooter([
+      submitBtn,
+      el('button', { class: 'btn btn-ghost', type: 'button', text: '取消', onclick: dialog.close }),
+    ]);
+  }
+
+  /* ================================================================== *
+   * 调用方 (Callers)
+   * ================================================================== */
+
+  function loadCallers(force) {
+    if (!state.key) return Promise.resolve();
+    if (!force && state.callers.items) return Promise.resolve();
+    var seq = ++state.callers.loadSeq;
+    state.callers.loading = true;
+    state.callers.error = '';
+    renderCallers();
+    return api.listCallers().then(
+      function (data) {
+        if (seq !== state.callers.loadSeq) return;
+        state.callers.loading = false;
+        state.callers.items = (data && data.items) || [];
+        renderCallers();
+        if (state.keys && state.keys.items) renderKeys();
+      },
+      function (error) {
+        if (seq !== state.callers.loadSeq) return;
+        if (failRequest(error)) return;
+        state.callers.loading = false;
+        state.callers.error = describeError(error);
+        renderCallers();
+      }
+    );
+  }
+
+  function renderCallers() {
+    var container = $('callers-list');
+    if (!container) return;
+    var status = $('callers-status');
+    if (status) {
+      status.textContent = state.callers.loading ? '正在读取调用方列表…' : ('共 ' + (state.callers.items ? state.callers.items.length : 0) + ' 个调用方');
+    }
+    renderErrorBox($('callers-error'), state.callers.error, function () {
+      loadCallers(true);
+    });
+    if (state.callers.loading && !state.callers.items) {
+      renderEmpty(container, '正在读取调用方…');
+      return;
+    }
+    if (!state.callers.items || state.callers.items.length === 0) {
+      renderEmpty(container, '暂无调用方数据。点击上方“新建调用方”添加团队或使用者。');
+      return;
+    }
+
+    var table = el('table', { class: 'table data' }, [
+      el('thead', {}, [
+        el('tr', {}, [
+          el('th', { text: '调用方 ID' }),
+          el('th', { text: '显示名称 / 部门' }),
+          el('th', { text: '状态' }),
+          el('th', { text: '创建时间' }),
+          el('th', { text: '操作' }),
+        ]),
+      ]),
+      el('tbody', {}, state.callers.items.map(function (caller) {
+        return el('tr', { class: 'row-main' }, [
+          el('td', { class: 'mono', text: caller.id || '—' }),
+          el('td', { text: caller.display_name || '（未命名）' }),
+          el('td', {}, [
+            badge(caller.enabled ? '已启用' : '已禁用', caller.enabled ? 'ok' : 'warn')
+          ]),
+          el('td', { class: 'muted', text: formatDateTime(caller.created_at) }),
+          el('td', {}, [
+            el('button', {
+              class: 'btn btn-small',
+              type: 'button',
+              text: '编辑',
+              onclick: function () {
+                openCallerEditor(caller);
+              },
+            }),
+          ]),
+        ]);
+      })),
+    ]);
+    replace(container, [tableScroll(table)]);
+  }
+
+  function openCallerEditor(caller) {
+    var isEdit = Boolean(caller);
+    var idInput = el('input', {
+      type: 'text',
+      id: 'caller-id',
+      value: (caller && caller.id) || '',
+      disabled: isEdit ? true : undefined,
+      required: true,
+      placeholder: '例如: team-alpha',
+    });
+    var nameInput = el('input', {
+      type: 'text',
+      id: 'caller-name',
+      value: (caller && caller.display_name) || '',
+      required: true,
+      placeholder: '例如: 核心算法部',
+    });
+    var enabledInput = el('input', {
+      type: 'checkbox',
+      id: 'caller-enabled',
+      checked: caller ? Boolean(caller.enabled) : true,
+    });
+
+    var dialog = openDialog({
+      title: isEdit ? '编辑调用方 · ' + caller.id : '新建调用方',
+      wide: false,
+    });
+
+    var form = el('form', { class: 'form-grid' }, [
+      el('div', { class: 'field' }, [
+        el('label', { for: 'caller-id', text: '调用方唯一 ID（创建后不可更改）' }),
+        idInput,
+      ]),
+      el('div', { class: 'field' }, [
+        el('label', { for: 'caller-name', text: '显示名称 / 团队部门' }),
+        nameInput,
+      ]),
+      el('div', { class: 'field' }, [
+        el('label', { class: 'checkbox-label' }, [
+          enabledInput,
+          document.createTextNode(' 启用该调用方'),
+        ]),
+      ]),
+    ]);
+
+    var saveBtn = el('button', {
+      class: 'btn btn-primary',
+      type: 'button',
+      text: isEdit ? '保存修改' : '创建调用方',
+      onclick: function () {
+        var id = idInput.value.trim();
+        var displayName = nameInput.value.trim();
+        var enabled = enabledInput.checked;
+        if (!id) {
+          dialog.setError('调用方 ID 不能为空');
+          return;
+        }
+        saveBtn.disabled = true;
+        dialog.setError('');
+        var promise = isEdit
+          ? api.updateCaller({ id: id, display_name: displayName, enabled: enabled })
+          : api.createCaller({ id: id, display_name: displayName, enabled: enabled });
+        promise.then(
+          function () {
+            notify(isEdit ? '调用方已更新' : '调用方创建成功');
+            dialog.close();
+            loadCallers(true);
+          },
+          function (err) {
+            saveBtn.disabled = false;
+            dialog.setError(describeError(err));
+          }
+        );
+      },
+    });
+
+    dialog.setBody([form]);
+    dialog.setFooter([
+      saveBtn,
+      el('button', { class: 'btn btn-ghost', type: 'button', text: '取消', onclick: dialog.close }),
+    ]);
+  }
+
+  /* ================================================================== *
+   * 审计日志 (Audit)
+   * ================================================================== */
+
+  function loadAudit(force) {
+    if (!state.key) return Promise.resolve();
+    var f = state.audit.filters;
+    var query = 'page=' + state.audit.page + '&page_size=' + state.audit.pageSize;
+    if (f.keyId) query += '&key_id=' + encodeURIComponent(f.keyId);
+    if (f.callerId) query += '&caller_id=' + encodeURIComponent(f.callerId);
+
+    var seq = ++state.audit.loadSeq;
+    state.audit.loading = true;
+    state.audit.error = '';
+    renderAudit();
+
+    return api.audit(query).then(
+      function (data) {
+        if (seq !== state.audit.loadSeq) return;
+        state.audit.loading = false;
+        state.audit.items = (data && data.items) || [];
+        state.audit.total = (data && data.total !== undefined) ? data.total : 0;
+        renderAudit();
+      },
+      function (error) {
+        if (seq !== state.audit.loadSeq) return;
+        if (failRequest(error)) return;
+        state.audit.loading = false;
+        state.audit.error = describeError(error);
+        renderAudit();
+      }
+    );
+  }
+
+  function renderAudit() {
+    var container = $('audit-list');
+    var pagination = $('audit-pagination');
+    var status = $('audit-status');
+    if (!container) return;
+    if (status) {
+      status.textContent = state.audit.loading ? '正在查询审计日志…' : ('共 ' + formatInt(state.audit.total) + ' 条审计记录');
+    }
+    renderErrorBox($('audit-error'), state.audit.error, function () {
+      loadAudit(true);
+    });
+
+    if (state.audit.loading && !state.audit.items) {
+      renderEmpty(container, '正在查询日志…');
+      return;
+    }
+    if (!state.audit.items || state.audit.items.length === 0) {
+      renderEmpty(container, '当前筛选条件下暂无审计记录。');
+      if (pagination) pagination.textContent = '';
+      return;
+    }
+
+    var table = el('table', { class: 'table data' }, [
+      el('thead', {}, [
+        el('tr', {}, [
+          el('th', { text: '序号' }),
+          el('th', { text: '时间' }),
+          el('th', { text: '操作动作' }),
+          el('th', { text: 'Key ID' }),
+          el('th', { text: '调用方 ID' }),
+          el('th', { text: '原因' }),
+          el('th', { text: '操作详情' }),
+        ]),
+      ]),
+      el('tbody', {}, state.audit.items.map(function (ev) {
+        return el('tr', { class: 'row-main' }, [
+          el('td', { class: 'mono', text: String(ev.seq || '—') }),
+          el('td', { class: 'muted', text: formatDateTime(ev.at) }),
+          el('td', {}, [badge(ev.action || 'unknown', 'info')]),
+          el('td', { class: 'mono', text: ev.key_id || '—' }),
+          el('td', { class: 'mono', text: ev.caller_id || '—' }),
+          el('td', { text: ev.reason || '—' }),
+          el('td', { class: 'muted', text: ev.detail || '—' }),
+        ]);
+      })),
+    ]);
+    replace(container, [tableScroll(table)]);
+
+    if (pagination) {
+      var total = state.audit.total || 0;
+      var pageSize = state.audit.pageSize || 20;
+      var pages = Math.max(1, Math.ceil(Number(intString(total)) / pageSize));
+      var page = state.audit.page;
+
+      replace(pagination, [
+        el('button', {
+          class: 'btn btn-small',
+          type: 'button',
+          text: '上一页',
+          disabled: page <= 1 ? true : undefined,
+          onclick: function () {
+            if (state.audit.page > 1) {
+              state.audit.page -= 1;
+              loadAudit(true);
+            }
+          },
+        }),
+        el('button', {
+          class: 'btn btn-small',
+          type: 'button',
+          text: '下一页',
+          disabled: page >= pages ? true : undefined,
+          onclick: function () {
+            if (state.audit.page < pages) {
+              state.audit.page += 1;
+              loadAudit(true);
+            }
+          },
+        }),
+        el('span', { class: 'muted', text: '第 ' + page + ' / ' + pages + ' 页 · 共 ' + formatInt(total) + ' 条' }),
+      ]);
+    }
+  }
+
+  function wireAuditForm() {
+    var form = $('audit-filters');
+    if (form) {
+      form.addEventListener('submit', function (event) {
+        event.preventDefault();
+        state.audit.page = 1;
+        state.audit.filters.keyId = $('audit-key-id') ? $('audit-key-id').value.trim() : '';
+        state.audit.filters.callerId = $('audit-caller-id') ? $('audit-caller-id').value.trim() : '';
+        state.audit.pageSize = $('audit-page-size') ? parseInt($('audit-page-size').value, 10) || 20 : 20;
+        loadAudit(true);
+      });
+    }
+    var resetBtn = $('audit-reset');
+    if (resetBtn) {
+      resetBtn.addEventListener('click', function () {
+        if ($('audit-key-id')) $('audit-key-id').value = '';
+        if ($('audit-caller-id')) $('audit-caller-id').value = '';
+        state.audit.page = 1;
+        state.audit.filters.keyId = '';
+        state.audit.filters.callerId = '';
+        loadAudit(true);
+      });
+    }
+  }
+
   /* ================================================================== *
    * 价格
    * ================================================================== */
 
   function loadPrices(force) {
     if (!state.key) return Promise.resolve();
-    if (!force && state.prices.items) return Promise.resolve();
+    if (!force && state.prices.items) {
+      if (global.CMAdminPricing && typeof global.CMAdminPricing.load === 'function') {
+        global.CMAdminPricing.load();
+      }
+      return Promise.resolve();
+    }
     var seq = ++state.prices.loadSeq;
     state.prices.loading = true;
     state.prices.error = '';
@@ -3268,6 +4408,9 @@
         state.prices.loading = false;
         state.prices.items = (data && data.items) || [];
         renderPrices();
+        if (global.CMAdminPricing && typeof global.CMAdminPricing.load === 'function') {
+          global.CMAdminPricing.load();
+        }
       },
       function (error) {
         if (seq !== state.prices.loadSeq) return;
@@ -3293,6 +4436,7 @@
     var container = $('prices-list');
     if (!container) return;
     var status = $('prices-status');
+    var countNode = $('prices-count');
     renderErrorBox($('prices-error'), state.prices.error, function () {
       loadPrices(true);
     });
@@ -3307,6 +4451,7 @@
       return;
     }
     setStatusLine(status, '共 ' + formatInt(state.prices.items.length) + ' 条价格（接口：GET ' + MANAGER_BASE + '/api/prices）');
+    if (countNode) countNode.textContent = '共 ' + formatInt(state.prices.items.length) + ' 条精确价格';
     if (!state.prices.items.length) {
       renderEmpty(container, '还没有价格记录。缺失价格的模型会被拒绝计费，不会被当作免费。');
       return;
@@ -3897,6 +5042,55 @@
         loadKeys(true);
       });
     }
+    var batchResetBtn = $('btn-batch-reset-spend');
+    if (batchResetBtn) {
+      batchResetBtn.addEventListener('click', function () {
+        openResetSpendDialog(null);
+      });
+    }
+    var callersCreate = $('callers-create');
+    if (callersCreate) {
+      callersCreate.addEventListener('click', function () {
+        openCallerEditor(null);
+      });
+    }
+    var callersRefresh = $('callers-refresh');
+    if (callersRefresh) {
+      callersRefresh.addEventListener('click', function () {
+        loadCallers(true);
+      });
+    }
+    var fxBtn = $('btn-refresh-exchange-rate');
+    if (fxBtn) {
+      fxBtn.addEventListener('click', function () {
+        fxBtn.disabled = true;
+        api.exchangeRate()
+          .then(function (res) {
+            fxBtn.disabled = false;
+            if (res && res.rate) {
+              state.currencyRate = Number(res.rate);
+              var cr = $('currency-rate');
+              if (cr) cr.value = String(res.rate);
+              notify('实时汇率已刷新：1 USD = ' + res.rate + ' ' + (res.currency || 'CNY'), 'ok');
+              rerenderAfterUnitChange();
+            }
+          })
+          .catch(function () {
+            fxBtn.disabled = false;
+            var custom = prompt('无法自动获取最新汇率，请输入自定义 USD/CNY 汇率：', String(state.currencyRate));
+            if (custom) {
+              var num = Number(custom);
+              if (num > 0 && isFinite(num)) {
+                state.currencyRate = num;
+                var cr = $('currency-rate');
+                if (cr) cr.value = String(num);
+                notify('已设置汇率：1 USD = ' + num + ' CNY', 'ok');
+                rerenderAfterUnitChange();
+              }
+            }
+          });
+      });
+    }
     var pricesCreate = $('prices-create');
     if (pricesCreate) {
       pricesCreate.addEventListener('click', function () {
@@ -3939,10 +5133,30 @@
     initThemeSync();
     wireUnitControls();
     wireTabs();
+    wireOverviewForm();
     wireUsageForm();
+    wireAuditForm();
     wireButtons();
+    applyOverviewFiltersToForm(state.overview.filters);
     applyUsageFiltersToForm(state.usage.filters);
     renderUsageStatus();
+
+    if (global.CMAdminPricing && typeof global.CMAdminPricing.init === 'function') {
+      global.CMAdminPricing.init({
+        api: function (path, opts) {
+          var options = opts || {};
+          var url = path.indexOf('/') === 0 ? managerPath(path) : managerPath('/' + path);
+          return request(url, options);
+        },
+        el: el,
+        toast: notify,
+        showModal: openDialog,
+        closeModal: closeDialog,
+        onExactApplied: function () {
+          loadPrices(false);
+        },
+      });
+    }
 
     var saved = readStoredCredential();
     var rememberBox = $('remember-management-key');

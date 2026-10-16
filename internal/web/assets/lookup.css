@@ -325,7 +325,78 @@ pre.body {
   overflow: auto;
 }
 
+.lookup-models-grid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.model-rank-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.model-rank-item {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 10px;
+  border-radius: var(--radius);
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+}
+
+.rank-index {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  font-size: 12px;
+  font-weight: 700;
+  background: var(--bg-soft);
+  color: var(--text-dim);
+}
+
+.rank-index.top-rank {
+  background: var(--accent);
+  color: #fff;
+}
+
+.rank-info {
+  flex: 1;
+  min-width: 0;
+}
+
+.rank-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 8px;
+  font-size: 13px;
+}
+
+.rank-model {
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.rank-value {
+  font-weight: 600;
+  color: var(--accent);
+}
+
+.rank-meta {
+  display: flex;
+  gap: 10px;
+  font-size: 11px;
+  margin-top: 2px;
+}
+
 @media (max-width: 720px) {
   .app { padding: 10px; }
   .gate { padding: 16px; }
+  .lookup-models-grid { grid-template-columns: 1fr; }
 }

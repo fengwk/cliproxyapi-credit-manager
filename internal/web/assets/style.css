@@ -1372,3 +1372,224 @@ pre.code {
     overflow-x: auto;
   }
 }
+
+/* ================================================================== *
+ * 概览面板 (Overview) 与增强组件
+ * ================================================================== */
+
+.overview-summary-grid {
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  margin: 16px 0 8px;
+}
+
+.overview-charts-grid {
+  margin: 16px 0;
+}
+
+.overview-analytics-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px;
+  margin: 16px 0;
+}
+
+.overview-share-body {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.chart-donut {
+  width: 100%;
+  height: 260px;
+  min-height: 260px;
+}
+
+.share-legend {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 180px;
+  overflow-y: auto;
+  padding-right: 4px;
+}
+
+.share-legend-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+}
+
+.share-swatch {
+  width: 10px;
+  height: 10px;
+  border-radius: 2px;
+  flex-shrink: 0;
+}
+
+.share-name {
+  flex: 1;
+  font-family: var(--mono);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.share-pct {
+  font-weight: 600;
+  min-width: 44px;
+  text-align: right;
+}
+
+.share-val {
+  min-width: 70px;
+  text-align: right;
+  font-family: var(--mono);
+}
+
+.model-rank-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: 420px;
+  overflow-y: auto;
+  padding-right: 4px;
+}
+
+.model-rank-item {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 12px;
+  border-radius: var(--radius);
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+}
+
+.rank-index {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  font-size: 12px;
+  font-weight: 700;
+  background: var(--panel);
+  color: var(--muted);
+  flex-shrink: 0;
+}
+
+.rank-index.top-rank {
+  background: var(--accent);
+  color: #fff;
+}
+
+.rank-info {
+  flex: 1;
+  min-width: 0;
+}
+
+.rank-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.rank-model {
+  font-weight: 600;
+  font-size: 13px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.rank-value {
+  font-weight: 600;
+  color: var(--accent);
+  font-size: 13px;
+}
+
+.rank-meta {
+  display: flex;
+  gap: 12px;
+  font-size: 11px;
+  margin-top: 2px;
+}
+
+.unit-switch {
+  display: inline-flex;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+
+.unit-switch button {
+  padding: 4px 10px;
+  font-size: 12px;
+  background: var(--panel);
+  color: var(--text);
+  border: none;
+  border-right: 1px solid var(--border);
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+}
+
+.unit-switch button:last-child {
+  border-right: none;
+}
+
+.unit-switch button.active {
+  background: var(--accent);
+  color: #fff;
+  font-weight: 600;
+}
+
+/* ---------- 更多筛选折叠卡 ---------- */
+
+.filter-more {
+  width: 100%;
+  margin-top: 6px;
+}
+
+.filter-more summary {
+  cursor: pointer;
+  user-select: none;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--accent);
+  padding: 4px 0;
+}
+
+.filter-more-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px 14px;
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px dashed var(--border);
+}
+
+.filter-main-fields {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px 14px;
+  width: 100%;
+}
+
+/* ---------- 定价两段式布局 ---------- */
+
+.pricing-sections {
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+  margin-top: 16px;
+}
+
+@media (max-width: 900px) {
+  .overview-analytics-grid {
+    grid-template-columns: 1fr;
+  }
+}

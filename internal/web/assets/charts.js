@@ -44,6 +44,12 @@
   var MAX_ZOOM_POINTS = 10; // 与视觉稿一致：超过 10 个点才显示 dataZoom
   var MAX_SYMBOL_POINTS = 24;
 
+  var DONUT_COLORS = [
+    '#1eb787', '#7968ee', '#f0a04b', '#3f9ad6', '#e56b8a',
+    '#58be91', '#b5a5e9', '#efb860', '#6fb3e0', '#ef8779',
+    '#4c8dff', '#e5a12d', '#36b37e', '#ffab00', '#ff5630',
+  ];
+
   // Token 桶 = 互不重叠的规范计量。契约见 internal/plugin/accounting/accounting.go：
   // Tokens.Output = breakdown.Output.NonReasoningTokens（已剔除 reasoning），
   // Tokens.Reasoning = breakdown.Output.ReasoningTokens；即 output 与 reasoning 是
@@ -946,6 +952,129 @@
     return result;
   }
 
+  function buildDonutOption(items, options) {
+    var palette = resolvePalette(options);
+    var centerTitle = (options && options.centerTitle) || '';
+    var centerTotal = (options && options.centerTotal) || '';
+    var colors = (options && options.colors) || DONUT_COLORS;
+    var isDark = palette.panel === '#1d1b18';
+    var totalColor = isDark ? '#f6f4f1' : '#1f2922';
+
+    if (!items || !items.length) {
+      return { empty: true };
+    }
+
+    return {
+      empty: false,
+      color: colors,
+      animationDuration: 300,
+      legend: { show: false },
+      tooltip: {
+        trigger: 'item',
+        renderMode: 'richText',
+        backgroundColor: palette.tooltipBg,
+        borderColor: palette.axisLine,
+        textStyle: { color: palette.tooltipText, fontSize: 12 },
+        formatter: function (param) {
+          if (!param) return '';
+          var name = param.name || '';
+          var percent = typeof param.percent === 'number' ? param.percent.toFixed(1) + '%' : '';
+          var rawVal = param.data && param.data.displayValue ? param.data.displayValue : (param.value !== undefined ? formatInt(param.value) : '');
+          return name + '\n' + (centerTitle ? centerTitle + ': ' : '') + rawVal + (percent ? ' (' + percent + ')' : '');
+        }
+      },
+      series: [{
+        name: centerTitle,
+        type: 'pie',
+        radius: ['45%', '70%'],
+        center: ['50%', '50%'],
+        minAngle: 3,
+        avoidLabelOverlap: true,
+        itemStyle: {
+          borderColor: palette.panel,
+          borderWidth: 2,
+          borderRadius: 4
+        },
+        label: {
+          show: true,
+          position: 'center',
+          formatter: '{total|' + centerTotal + '}\n{caption|' + centerTitle + '}',
+          rich: {
+            total: { color: totalColor, fontSize: 16, fontWeight: 700, lineHeight: 22 },
+            caption: { color: palette.axis, fontSize: 11, fontWeight: 600, lineHeight: 15 }
+          }
+        },
+        labelLine: { show: false },
+        emphasis: {
+          scale: true,
+          scaleSize: 6,
+          itemStyle: {
+            shadowBlur: 10,
+            shadowColor: isDark ? 'rgba(0,0,0,.5)' : 'rgba(31,41,34,.16)'
+          }
+        },
+        data: items
+      }]
+    };
+  }
+
+  function renderDonut(container, items, options) {
+    var opts = Object.assign({}, options);
+    if (!opts.reference) opts.reference = container;
+    var result = {
+      empty: false,
+      missingEcharts: false,
+      rendered: false,
+      chart: null,
+    };
+    if (!container) return result;
+    if (!items || !items.length) {
+      result.empty = true;
+      dispose(container);
+      showEmpty(container, opts.emptyText || '当前暂无数据');
+      return result;
+    }
+    var model = buildDonutOption(items, opts);
+    if (model.empty) {
+      result.empty = true;
+      dispose(container);
+      showEmpty(container, opts.emptyText || '当前暂无数据');
+      return result;
+    }
+    var obtained = obtainChart(container, opts);
+    if (!obtained) {
+      result.missingEcharts = true;
+      dispose(container);
+      if (typeof opts.missingText === 'string') showEmpty(container, opts.missingText);
+      return result;
+    }
+    obtained.chart.setOption(model, true);
+    if (typeof opts.onItemClick === 'function') {
+      try {
+        obtained.chart.off('click');
+        obtained.chart.on('click', function (params) {
+          if (params && params.data && params.data.item) {
+            opts.onItemClick(params.data.item);
+          }
+        });
+      } catch (_) {}
+    }
+    if (obtained.created) {
+      records.set(container, { chart: obtained.chart, slot: 'donut', items: items, options: opts });
+      attachResize(container, opts);
+    } else {
+      var record = records.get(container);
+      if (record) {
+        record.slot = 'donut';
+        record.items = items;
+        record.options = opts;
+      }
+    }
+    result.rendered = true;
+    result.chart = obtained.chart;
+    return result;
+  }
+
   // 优先显式 palette，否则重新读取元素当前 data-palette，重上色避免主题切不动。
   function refreshTheme(palette) {
     Array.from(records.entries()).forEach(function (entry) {
@@ -954,6 +1083,12 @@
       var opts = Object.assign({}, record.options, { reference: el });
       if (palette) opts.palette = palette;
       else delete opts.palette;
+      if (record.slot === 'donut') {
+        var donutOpt = buildDonutOption(record.items || [], opts);
+        if (!donutOpt.empty) record.chart.setOption(donutOpt, true);
+        record.options = opts;
+        return;
+      }
       var model = buildChartOptions(record.points, opts);
       if (model.empty || !model[record.slot]) return;
       record.chart.setOption(model[record.slot], true);
@@ -975,16 +1110,20 @@
   return {
     version: VERSION,
     PALETTES: PALETTES,
+    DONUT_COLORS: DONUT_COLORS,
     intText: intText,
     formatInt: formatInt,
     multiplyDecimal: multiplyDecimal,
+    normalizeCurrency: normalizeCurrency,
     formatMoneyMicro: formatMoneyMicro,
     normalizeBucket: normalizeBucket,
     formatTokenCount: formatTokenCount,
     tokenText: tokenText,
     bucketLabel: bucketLabel,
     buildChartOptions: buildChartOptions,
+    buildDonutOption: buildDonutOption,
     render: render,
+    renderDonut: renderDonut,
     resize: resize,
     refreshTheme: refreshTheme,
     dispose: dispose,

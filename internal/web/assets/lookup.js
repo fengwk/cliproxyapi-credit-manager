@@ -727,6 +727,76 @@
     state.trend = data.trend || [];
     renderTrend();
     renderRecent(data.items || [], data.total || 0, data.page || 1, data.page_size || PAGE_SIZE);
+    renderModelAnalytics(data.models);
+  }
+
+  function renderModelAnalytics(models) {
+    var section = el('lookup-models-section');
+    if (!section) return;
+    if (!models || !models.length) {
+      section.hidden = true;
+      return;
+    }
+    section.hidden = false;
+    var countEl = el('lookup-models-count');
+    if (countEl) countEl.textContent = '共 ' + models.length + ' 个模型';
+
+    var shareContainer = el('lookup-model-share');
+    if (shareContainer && charts().renderDonut) {
+      var items = models.map(function (m) {
+        var req = Number(intString(m.requests || 0));
+        return {
+          name: m.model || 'unknown',
+          value: req,
+          displayValue: formatInt(req) + ' 次',
+        };
+      });
+      var totalReq = items.reduce(function (a, b) { return a + b.value; }, 0);
+      charts().renderDonut(shareContainer, items, {
+        centerTitle: '总调用',
+        centerTotal: formatInt(totalReq),
+        metric: 'requests',
+      });
+    }
+
+    var rankContainer = el('lookup-model-rank');
+    if (rankContainer) {
+      clear(rankContainer);
+      models.forEach(function (m, idx) {
+        var row = document.createElement('div');
+        row.className = 'model-rank-item';
+        var idxEl = document.createElement('div');
+        idxEl.className = 'rank-index' + (idx < 3 ? ' top-rank' : '');
+        idxEl.textContent = String(idx + 1);
+        var infoEl = document.createElement('div');
+        infoEl.className = 'rank-info';
+        var headEl = document.createElement('div');
+        headEl.className = 'rank-header';
+        var nameSpan = document.createElement('span');
+        nameSpan.className = 'rank-model mono';
+        nameSpan.textContent = m.model || 'unknown';
+        var valSpan = document.createElement('span');
+        valSpan.className = 'rank-value mono';
+        var costMicro = Number(intString(m.cost_micro_usd || 0));
+        valSpan.textContent = formatMicroUSD(costMicro);
+        headEl.appendChild(nameSpan);
+        headEl.appendChild(valSpan);
+        var metaEl = document.createElement('div');
+        metaEl.className = 'rank-meta muted';
+        var reqSpan = document.createElement('span');
+        reqSpan.textContent = formatInt(m.requests || 0) + ' 次调用';
+        var tokSpan = document.createElement('span');
+        var tokVal = m.tokens && m.tokens.total !== undefined ? m.tokens.total : m.tokens;
+        tokSpan.textContent = formatTokens(tokVal || 0, state.tokenUnit) + ' ' + state.tokenUnit;
+        metaEl.appendChild(reqSpan);
+        metaEl.appendChild(tokSpan);
+        infoEl.appendChild(headEl);
+        infoEl.appendChild(metaEl);
+        row.appendChild(idxEl);
+        row.appendChild(infoEl);
+        rankContainer.appendChild(row);
+      });
+    }
   }
 
   // 趋势图只由共享组件绘制（随包发布的必需资源）。

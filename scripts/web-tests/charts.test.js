@@ -532,3 +532,23 @@ test('render 对冻结的 options 不报错（无副作用式入参）', () => {
   assert.equal(result.rendered.tokens, true);
   CMCharts.disposeAll();
 });
+
+test('renderDonut 初始化环形图并使用 svg 渲染器，支持空数据清空与复用', () => {
+  const echarts = fakeEcharts();
+  const container = fakeElement('model-share');
+  const items = [
+    { name: 'gpt-5', value: 10, displayValue: '10' },
+    { name: 'glm-5', value: 20, displayValue: '20' }
+  ];
+  const env = { echarts };
+  const res = CMCharts.renderDonut(container, items, { env, centerTitle: '调用次数', centerTotal: '30' });
+  assert.equal(res.rendered, true);
+  assert.equal(echarts.__count('init'), 1);
+  assert.equal(echarts.__count('setOption'), 1);
+
+  // 空数据 dispose
+  const resEmpty = CMCharts.renderDonut(container, [], { env });
+  assert.equal(resEmpty.empty, true);
+  assert.equal(echarts.__count('dispose'), 1);
+  CMCharts.disposeAll();
+});

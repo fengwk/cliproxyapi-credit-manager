@@ -64,6 +64,7 @@
         <div class="rate-field" id="currency-rate-wrap">
           <label for="currency-rate" class="rate-label">汇率（手动设定）</label>
           <input id="currency-rate" type="number" min="0.0001" step="0.0001" value="7.2" placeholder="7.2" aria-label="美元兑人民币汇率（手动设定）">
+          <button id="btn-refresh-exchange-rate" class="btn btn-ghost btn-sm" type="button" title="从接口刷新汇率">刷新</button>
         </div>
       </div>
       <div class="topbar-actions">
@@ -109,83 +110,211 @@
   <div id="main-view" hidden>
 
     <nav class="tabs" id="tabs" role="tablist" aria-label="管理功能">
-      <button class="tab" type="button" role="tab" id="tab-usage" data-tab="usage" aria-controls="panel-usage" aria-selected="true" tabindex="0">使用统计</button>
+      <button class="tab" type="button" role="tab" id="tab-overview" data-tab="overview" aria-controls="panel-overview" aria-selected="true" tabindex="0">概览</button>
+      <button class="tab" type="button" role="tab" id="tab-usage" data-tab="usage" aria-controls="panel-usage" aria-selected="false" tabindex="-1">使用统计</button>
       <button class="tab" type="button" role="tab" id="tab-keys" data-tab="keys" aria-controls="panel-keys" aria-selected="false" tabindex="-1">客户端 Key</button>
+      <button class="tab" type="button" role="tab" id="tab-callers" data-tab="callers" aria-controls="panel-callers" aria-selected="false" tabindex="-1">调用方</button>
       <button class="tab" type="button" role="tab" id="tab-prices" data-tab="prices" aria-controls="panel-prices" aria-selected="false" tabindex="-1">价格规则</button>
+      <button class="tab" type="button" role="tab" id="tab-audit" data-tab="audit" aria-controls="panel-audit" aria-selected="false" tabindex="-1">审计日志</button>
       <button class="tab" type="button" role="tab" id="tab-credentials" data-tab="credentials" aria-controls="panel-credentials" aria-selected="false" tabindex="-1">上游凭据与额度</button>
       <button class="tab" type="button" role="tab" id="tab-health" data-tab="health" aria-controls="panel-health" aria-selected="false" tabindex="-1">运行状态</button>
     </nav>
 
     <main class="panels">
 
-      <section id="panel-usage" class="panel" role="tabpanel" aria-labelledby="tab-usage" tabindex="0">
-        <form id="usage-filters" class="filter-bar" autocomplete="off">
+      <section id="panel-overview" class="panel" role="tabpanel" aria-labelledby="tab-overview" tabindex="0">
+        <form id="overview-filters" class="filter-bar overview-filter-bar" autocomplete="off">
           <div class="field">
-            <label for="usage-from">开始时间</label>
-            <input id="usage-from" type="datetime-local">
-          </div>
-          <div class="field">
-            <label for="usage-to">结束时间</label>
-            <input id="usage-to" type="datetime-local">
-          </div>
-          <div class="field">
-            <label for="usage-quick">快捷范围</label>
-            <select id="usage-quick">
-              <option value="">自定义</option>
-              <option value="1h">最近 1 小时</option>
-              <option value="24h" selected>最近 24 小时</option>
+            <label for="overview-quick">时间范围</label>
+            <select id="overview-quick">
+              <option value="today" selected>今日</option>
+              <option value="24h">最近 24 小时</option>
               <option value="7d">最近 7 天</option>
               <option value="30d">最近 30 天</option>
+              <option value="90d">最近 90 天</option>
+              <option value="all">全部时间</option>
+              <option value="custom">自定义范围</option>
+            </select>
+          </div>
+          <div class="field overview-custom-date" id="overview-from-wrap" hidden>
+            <label for="overview-from">开始时间</label>
+            <input id="overview-from" type="datetime-local">
+          </div>
+          <div class="field overview-custom-date" id="overview-to-wrap" hidden>
+            <label for="overview-to">结束时间</label>
+            <input id="overview-to" type="datetime-local">
+          </div>
+          <div class="field">
+            <label for="overview-key">客户端 Key</label>
+            <select id="overview-key"><option value="">全部</option></select>
+          </div>
+          <div class="field">
+            <label for="overview-model">模型</label>
+            <input id="overview-model" type="text" placeholder="精确模型名 / 留空全部" spellcheck="false">
+          </div>
+          <div class="field">
+            <label for="overview-source">来源</label>
+            <select id="overview-source">
+              <option value="">全部来源</option>
+              <option value="openai">openai</option>
+              <option value="claude">claude</option>
+              <option value="gemini">gemini</option>
+              <option value="responses">responses</option>
+              <option value="reserved_fallback">reserved_fallback</option>
             </select>
           </div>
           <div class="field">
-            <label for="usage-key">客户端 Key</label>
-            <select id="usage-key"><option value="">全部</option></select>
-          </div>
-          <div class="field">
-            <label for="usage-model">模型</label>
-            <input id="usage-model" type="text" placeholder="精确模型名" spellcheck="false">
-          </div>
-          <div class="field">
-            <label for="usage-provider">上游 Provider</label>
-            <input id="usage-provider" type="text" spellcheck="false">
-          </div>
-          <div class="field">
-            <label for="usage-auth">上游凭据 (auth_id)</label>
-            <input id="usage-auth" type="text" spellcheck="false">
-          </div>
-          <div class="field">
-            <label for="usage-result">结果</label>
-            <select id="usage-result">
-              <option value="">全部</option>
-              <option value="succeeded">成功（已结算）</option>
-              <option value="failed">失败</option>
-              <option value="rejected">拒绝</option>
-              <option value="canceled">取消</option>
-              <option value="active">仅进行中</option>
-              <option value="pending">未结算（进行中或待定）</option>
-            </select>
-          </div>
-          <div class="field">
-            <label for="usage-search">关键词</label>
-            <input id="usage-search" type="search" placeholder="ID / trace / 模型等" spellcheck="false">
-          </div>
-          <div class="field">
-            <label for="usage-bucket">趋势粒度</label>
-            <select id="usage-bucket">
+            <label for="overview-bucket">趋势粒度</label>
+            <select id="overview-bucket">
               <option value="day" selected>按天</option>
               <option value="hour">按小时</option>
               <option value="month">按月</option>
             </select>
           </div>
-          <div class="field">
-            <label for="usage-page-size">每页条数</label>
-            <select id="usage-page-size">
-              <option value="20" selected>20</option>
-              <option value="50">50</option>
-              <option value="100">100</option>
-            </select>
+          <div class="filter-actions">
+            <button id="overview-apply" class="btn btn-primary" type="submit">刷新概览</button>
+            <button id="overview-reset" class="btn btn-ghost" type="button">重置</button>
           </div>
+        </form>
+
+        <p id="overview-status" class="status-line" role="status"></p>
+        <div id="overview-error" class="error-box" role="alert" hidden></div>
+
+        <div id="overview-summary" class="card-grid overview-summary-grid" aria-label="概览指标"></div>
+        <p id="overview-retention" class="note"></p>
+
+        <div class="usage-charts-grid overview-charts-grid">
+          <section class="card chart-card chart-card-tokens" aria-labelledby="overview-token-chart-title">
+            <div class="card-head">
+              <h3 id="overview-token-chart-title">Token 趋势</h3>
+              <div id="overview-token-legend" class="legend"></div>
+            </div>
+            <div id="overview-token-chart" class="chart"></div>
+          </section>
+
+          <section class="card chart-card chart-card-cost" aria-labelledby="overview-cost-chart-title">
+            <div class="card-head">
+              <h3 id="overview-cost-chart-title">费用趋势</h3>
+              <div id="overview-cost-legend" class="legend"></div>
+            </div>
+            <div id="overview-cost-chart" class="chart"></div>
+          </section>
+        </div>
+
+        <div class="overview-analytics-grid">
+          <section class="card overview-share-card" id="overview-share-card" aria-labelledby="overview-share-title">
+            <div class="card-head">
+              <div>
+                <h3 id="overview-share-title">模型调用占比</h3>
+                <span class="muted" id="overview-model-count"></span>
+              </div>
+              <div class="unit-switch" id="model-share-metric" role="group" aria-label="模型占比指标">
+                <button type="button" data-metric="requests" class="active">调用次数</button>
+                <button type="button" data-metric="tokens">Token</button>
+                <button type="button" data-metric="cost">费用</button>
+              </div>
+            </div>
+            <div class="overview-share-body">
+              <div id="overview-model-share" class="chart chart-donut"></div>
+              <div id="overview-model-share-legend" class="share-legend"></div>
+            </div>
+          </section>
+
+          <section class="card overview-rank-card" id="overview-rank-card" aria-labelledby="overview-rank-title">
+            <div class="card-head">
+              <div>
+                <h3 id="overview-rank-title">模型效率排行</h3>
+                <span class="muted" id="overview-rank-count"></span>
+              </div>
+              <div class="unit-switch" id="model-rank-metric" role="group" aria-label="模型效率指标">
+                <button type="button" data-metric="value" class="active">性价比</button>
+                <button type="button" data-metric="unit">单次</button>
+                <button type="button" data-metric="cache">缓存</button>
+                <button type="button" data-metric="tps">吞吐</button>
+                <button type="button" data-metric="latency">延迟</button>
+              </div>
+            </div>
+            <p class="hint" id="overview-rank-hint">按每美元产出 Token 排序，越高越省</p>
+            <div id="overview-model-rank" class="model-rank-list"></div>
+          </section>
+        </div>
+      </section>
+
+      <section id="panel-usage" class="panel" role="tabpanel" aria-labelledby="tab-usage" tabindex="0" hidden>
+        <form id="usage-filters" class="filter-bar" autocomplete="off">
+          <div class="filter-main-fields">
+            <div class="field">
+              <label for="usage-from">开始时间</label>
+              <input id="usage-from" type="datetime-local">
+            </div>
+            <div class="field">
+              <label for="usage-to">结束时间</label>
+              <input id="usage-to" type="datetime-local">
+            </div>
+            <div class="field">
+              <label for="usage-quick">快捷范围</label>
+              <select id="usage-quick">
+                <option value="">自定义</option>
+                <option value="1h">最近 1 小时</option>
+                <option value="24h" selected>最近 24 小时</option>
+                <option value="7d">最近 7 天</option>
+                <option value="30d">最近 30 天</option>
+              </select>
+            </div>
+            <div class="field">
+              <label for="usage-key">客户端 Key</label>
+              <select id="usage-key"><option value="">全部</option></select>
+            </div>
+            <div class="field">
+              <label for="usage-model">模型</label>
+              <input id="usage-model" type="text" placeholder="精确模型名" spellcheck="false">
+            </div>
+          </div>
+          <details class="filter-more" id="usage-more-filters">
+            <summary>更多筛选</summary>
+            <div class="filter-more-grid">
+              <div class="field">
+                <label for="usage-provider">上游 Provider</label>
+                <input id="usage-provider" type="text" spellcheck="false">
+              </div>
+              <div class="field">
+                <label for="usage-auth">上游凭据 (auth_id)</label>
+                <input id="usage-auth" type="text" spellcheck="false">
+              </div>
+              <div class="field">
+                <label for="usage-result">结果</label>
+                <select id="usage-result">
+                  <option value="">全部</option>
+                  <option value="succeeded">成功（已结算）</option>
+                  <option value="failed">失败</option>
+                  <option value="rejected">拒绝</option>
+                  <option value="canceled">取消</option>
+                  <option value="active">仅进行中</option>
+                  <option value="pending">未结算（进行中或待定）</option>
+                </select>
+              </div>
+              <div class="field">
+                <label for="usage-search">关键词</label>
+                <input id="usage-search" type="search" placeholder="ID / trace / 模型等" spellcheck="false">
+              </div>
+              <div class="field">
+                <label for="usage-bucket">趋势粒度</label>
+                <select id="usage-bucket">
+                  <option value="day" selected>按天</option>
+                  <option value="hour">按小时</option>
+                  <option value="month">按月</option>
+                </select>
+              </div>
+              <div class="field">
+                <label for="usage-page-size">每页条数</label>
+                <select id="usage-page-size">
+                  <option value="20" selected>20</option>
+                  <option value="50">50</option>
+                  <option value="100">100</option>
+                </select>
+              </div>
+            </div>
+          </details>
           <div class="filter-actions">
             <button id="usage-apply" class="btn btn-primary" type="submit">查询</button>
             <button id="usage-reset" class="btn btn-ghost" type="button">重置</button>
@@ -238,6 +367,7 @@
       <section id="panel-keys" class="panel" role="tabpanel" aria-labelledby="tab-keys" tabindex="0" hidden>
         <div class="toolbar">
           <button id="keys-create" class="btn btn-primary" type="button">新建 Key</button>
+          <button id="btn-batch-reset-spend" class="btn btn-ghost" type="button">重置额度</button>
           <button id="keys-refresh" class="btn btn-ghost" type="button">刷新</button>
         </div>
         <p id="keys-status" class="status-line" role="status"></p>
@@ -245,17 +375,76 @@
         <div id="keys-list"></div>
       </section>
 
+      <section id="panel-callers" class="panel" role="tabpanel" aria-labelledby="tab-callers" tabindex="0" hidden>
+        <div class="toolbar">
+          <button id="callers-create" class="btn btn-primary" type="button">新建调用方</button>
+          <button id="callers-refresh" class="btn btn-ghost" type="button">刷新</button>
+        </div>
+        <p class="hint">调用方（Caller）用于标识系统使用者或部门团队，支持启用/禁用状态与密钥归属关联。</p>
+        <p id="callers-status" class="status-line" role="status"></p>
+        <div id="callers-error" class="error-box" role="alert" hidden></div>
+        <div id="callers-list"></div>
+      </section>
+
       <section id="panel-prices" class="panel" role="tabpanel" aria-labelledby="tab-prices" tabindex="0" hidden>
         <div class="toolbar">
           <button id="prices-create" class="btn btn-primary" type="button">新增价格</button>
+          <button id="rules-create" class="btn btn-soft" type="button">新增高级规则</button>
+          <button id="btn-load-model-catalog" class="btn btn-ghost" type="button">从模型库导入</button>
           <button id="prices-refresh" class="btn btn-ghost" type="button">刷新</button>
         </div>
         <p class="hint">
-          价格一律以「微美元 / 每 100 万 tokens」的整数保存（1 USD = 1,000,000 微美元），界面同时给出等值美元换算供核对，不做浮点换算。
+          精确模型价格以微美元整数保存（1 USD = 1,000,000 微美元）。高级定价规则支持通配符与上下文梯队（tiers）。
         </p>
         <p id="prices-status" class="status-line" role="status"></p>
         <div id="prices-error" class="error-box" role="alert" hidden></div>
-        <div id="prices-list"></div>
+
+        <div class="pricing-sections">
+          <section class="card" aria-labelledby="exact-prices-title">
+            <div class="card-head">
+              <h3 id="exact-prices-title">精确模型价格</h3>
+              <span id="prices-count" class="muted"></span>
+            </div>
+            <div id="prices-list"></div>
+          </section>
+
+          <section class="card" aria-labelledby="advanced-rules-title">
+            <div class="card-head">
+              <h3 id="advanced-rules-title">高级定价规则</h3>
+              <span id="rules-count" class="muted"></span>
+            </div>
+            <div id="pricing-rules-list"></div>
+          </section>
+        </div>
+      </section>
+
+      <section id="panel-audit" class="panel" role="tabpanel" aria-labelledby="tab-audit" tabindex="0" hidden>
+        <form id="audit-filters" class="filter-bar" autocomplete="off">
+          <div class="field">
+            <label for="audit-key-id">按 Key ID 过滤</label>
+            <input id="audit-key-id" type="text" placeholder="留空为全部 Key" spellcheck="false">
+          </div>
+          <div class="field">
+            <label for="audit-caller-id">按调用方 ID 过滤</label>
+            <input id="audit-caller-id" type="text" placeholder="留空为全部调用方" spellcheck="false">
+          </div>
+          <div class="field">
+            <label for="audit-page-size">每页条数</label>
+            <select id="audit-page-size">
+              <option value="20" selected>20</option>
+              <option value="50">50</option>
+              <option value="100">100</option>
+            </select>
+          </div>
+          <div class="filter-actions">
+            <button id="audit-apply" class="btn btn-primary" type="submit">查询日志</button>
+            <button id="audit-reset" class="btn btn-ghost" type="button">重置</button>
+          </div>
+        </form>
+        <p id="audit-status" class="status-line" role="status"></p>
+        <div id="audit-error" class="error-box" role="alert" hidden></div>
+        <div id="audit-list"></div>
+        <div id="audit-pagination" class="pagination"></div>
       </section>
 
       <section id="panel-credentials" class="panel" role="tabpanel" aria-labelledby="tab-credentials" tabindex="0" hidden>
@@ -299,6 +488,7 @@
 <script src="./vendor/echarts-5.6.0.min.js"></script>
 <script src="./charts.js"></script>
 <script src="./numbers.js"></script>
+<script src="./admin-pricing.js"></script>
 <script src="./app.js" defer></script>
 </body>
 </html>

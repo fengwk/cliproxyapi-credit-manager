@@ -52,12 +52,13 @@ test('使用统计提供按月粒度与三组独立趋势图表', () => {
   assert.ok(html.includes('id="usage-cost-chart"'), '缺少费用趋势图容器 usage-cost-chart');
 });
 
-test('脚本按正确顺序加载 vendor echarts、charts.js 与 app.js', () => {
+test('脚本按正确顺序加载 vendor echarts、charts.js、admin-pricing.js 与 app.js', () => {
   const scripts = [...html.matchAll(/<script\s+src="([^"]+)"[^>]*><\/script>/g)].map((m) => m[1]);
   assert.deepEqual(scripts, [
     './vendor/echarts-5.6.0.min.js',
     './charts.js',
     './numbers.js',
+    './admin-pricing.js',
     './app.js'
   ]);
 });
