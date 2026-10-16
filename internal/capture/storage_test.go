@@ -189,3 +189,99 @@ func TestBudgetEvictionReclaimsDisk(t *testing.T) {
 		t.Fatalf("%d rows survived cleanup", rows)
 	}
 }
+
+// TestCleanupKeepsAccurateExpiryMetadata verifies that removing an expired
+// snapshot does not rewrite its lifetime: the retained evidence still reports
+// the snapshot's original At and ExpiresAt, so an expired snapshot never claims
+// a future ExpiresAt, and the evidence still ages out to unavailable.
+func TestCleanupKeepsAccurateExpiryMetadata(t *testing.T) {
+	clock := newTestClock()
+	store, _ := openTestStore(t, testConfig(1<<20, 1<<30), clock, nil)
+	enqueue(store, "ttl", []byte("expiring"))
+	flush(t, store)
+
+	live, err := store.Get("ttl")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if live.Status != StatusCaptured {
+		t.Fatalf("status = %q, want %q", live.Status, StatusCaptured)
+	}
+
+	clock.advance(time.Hour + time.Minute)
+	expired, err := store.Get("ttl")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if expired.Status != StatusExpired {
+		t.Fatalf("status = %q, want %q", expired.Status, StatusExpired)
+	}
+	if !expired.ExpiresAt.Before(clock.Now()) {
+		t.Fatalf("expired detail reports a future ExpiresAt %v (now %v)", expired.ExpiresAt, clock.Now())
+	}
+	if !expired.At.Equal(live.At) || !expired.ExpiresAt.Equal(live.ExpiresAt) {
+		t.Fatalf("lazy expiry changed metadata: %+v -> %+v", live, expired)
+	}
+
+	if err := store.Cleanup(); err != nil {
+		t.Fatalf("Cleanup: %v", err)
+	}
+	after, err := store.Get("ttl")
+	if err != nil {
+		t.Fatalf("Get after cleanup: %v", err)
+	}
+	if after.Status != StatusExpired {
+		t.Fatalf("status after cleanup = %q, want %q", after.Status, StatusExpired)
+	}
+	if !after.At.Equal(live.At) || !after.ExpiresAt.Equal(live.ExpiresAt) {
+		t.Fatalf("cleanup rewrote metadata: %+v -> %+v", live, after)
+	}
+
+	clock.advance(2 * time.Hour)
+	if got := statusOf(t, store, "ttl"); got != StatusUnavailable {
+		t.Fatalf("status after evidence aged out = %q, want %q", got, StatusUnavailable)
+	}
+}
+
+// TestEvictionKeepsAccurateExpiryMetadata verifies the same invariant on the
+// eviction path under storage pressure: an evicted snapshot is reported as
+// dropped while still reporting its original lifetime, not the later evidence
+// time used to remember the eviction.
+func TestEvictionKeepsAccurateExpiryMetadata(t *testing.T) {
+	clock := newTestClock()
+	const budget = 256 << 10
+	store, _ := openTestStore(t, testConfig(64<<10, budget), clock, nil)
+
+	enqueue(store, "victim", randomBody(t, 32<<10, 1))
+	flush(t, store)
+	live, err := store.Get("victim")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if live.Status != StatusCaptured {
+		t.Fatalf("victim status = %q, want %q", live.Status, StatusCaptured)
+	}
+
+	// Advance the clock before triggering eviction, so the evidence time
+	// (now + retention) differs from the victim's original expiry (At +
+	// retention): a rewrite would be observable.
+	clock.advance(30 * time.Minute)
+	for i := 0; i < 16; i++ {
+		enqueue(store, fmt.Sprintf("filler-%02d", i), randomBody(t, 32<<10, int64(i+2)))
+		flush(t, store)
+		if statusOf(t, store, "victim") == StatusDropped {
+			break
+		}
+	}
+
+	evicted, err := store.Get("victim")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if evicted.Status != StatusDropped {
+		t.Fatalf("victim status = %q, want %q", evicted.Status, StatusDropped)
+	}
+	if !evicted.At.Equal(live.At) || !evicted.ExpiresAt.Equal(live.ExpiresAt) {
+		t.Fatalf("eviction rewrote metadata: %+v -> %+v", live, evicted)
+	}
+}

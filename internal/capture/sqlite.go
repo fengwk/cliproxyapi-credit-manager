@@ -424,12 +424,13 @@ func (s *Store) expireSnapshots(now int64, maxRows int) error {
 		}
 		// Evidence of expiry outlives the snapshot itself by one retention
 		// period, so a later lookup reports StatusExpired instead of pretending
-		// the request was never seen.
+		// the request was never seen. The entry keeps the snapshot's original
+		// expiresAt: only the evidence lifetime is extended.
 		evidence := s.now().Add(s.cfg.Retention)
 		s.mu.Lock()
 		for _, entry := range entries {
 			entry.status = StatusExpired
-			entry.expiresAt = evidence
+			entry.evidenceUntil = evidence
 			s.ring.push(entry, s.now())
 		}
 		s.mu.Unlock()
@@ -473,12 +474,14 @@ func (s *Store) evictOldest(limit int) (int, int64, error) {
 	}
 	// Keep the explanation of the eviction for one retention period, so a lookup
 	// reports StatusDropped instead of pretending the snapshot was never seen.
+	// The entry keeps the snapshot's original expiresAt: only the evidence
+	// lifetime is extended.
 	evidence := s.now().Add(s.cfg.Retention)
 	s.mu.Lock()
 	s.dropped += int64(len(entries))
 	for _, entry := range entries {
 		entry.status = StatusDropped
-		entry.expiresAt = evidence
+		entry.evidenceUntil = evidence
 		s.ring.push(entry, s.now())
 	}
 	s.mu.Unlock()

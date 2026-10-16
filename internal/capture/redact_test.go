@@ -192,6 +192,30 @@ func TestRedactJSONBodyRefusesIncompleteDocuments(t *testing.T) {
 	}
 }
 
+// TestRedactJSONBodyAcceptsModerateNesting verifies that the bounded preflight
+// only refuses genuinely excessive documents: moderately nested JSON (well
+// below maxJSONDepth) is still decoded and its secrets redacted, so tightening
+// the depth bound never silently drops ordinary deep payloads.
+func TestRedactJSONBodyAcceptsModerateNesting(t *testing.T) {
+	const depth = 64
+	raw := append(bytes.Repeat([]byte("["), depth), []byte(`{"secret":"leak","keep":"me"}`)...)
+	raw = append(raw, bytes.Repeat([]byte("]"), depth)...)
+
+	out, changed, err := redactJSONBody(raw)
+	if err != nil {
+		t.Fatalf("redactJSONBody error: %v", err)
+	}
+	if !changed {
+		t.Fatal("changed = false, want true")
+	}
+	if bytes.Contains(out, []byte("leak")) {
+		t.Fatalf("secret survived redaction: %s", out)
+	}
+	if !bytes.Contains(out, []byte(redactedValue)) {
+		t.Fatalf("redacted body has no marker: %s", out)
+	}
+}
+
 // TestRedactJSONBodyExtendedSecretKeys verifies that obvious secret fields are
 // recognized in snake_case, kebab-case and camelCase spellings, recursively
 // through arrays and objects, without losing 64-bit integer text.
