@@ -392,6 +392,10 @@ async function main() {
     const costTooltip = await cdp.evaluate("(() => { const cst = window.echarts.getInstanceByDom(document.querySelector('#usage-cost-chart')); return cst ? cst.getOption().tooltip[0].formatter([{ dataIndex: 0 }]) : ''; })()");
     check('费用趋势图 Tooltip 标注执行成本与人工补记', costTooltip.includes('执行成本') && costTooltip.includes('人工补记'), costTooltip);
 
+    check('请求明细默认收起', await cdp.evaluate("[...document.querySelectorAll('#usage-items .request-detail')].every(n => !n.open)"));
+    const collapsedHeight = await cdp.evaluate("Math.max(...[...document.querySelectorAll('#usage-items > .card')].map(n => n.getBoundingClientRect().height))");
+    check('桌面请求概要紧凑且操作始终可见', collapsedHeight < 220, 'maxHeight=' + collapsedHeight);
+    await cdp.evaluate("document.querySelectorAll('#usage-items .request-detail').forEach(n => { n.open = true; })");
     const itemsText = await cdp.text('#usage-items');
     check('明细标注请求/执行/响应模型', itemsText.includes('请求模型') && itemsText.includes('执行模型') && itemsText.includes('响应模型'));
     const requestLayout = () => cdp.evaluate(`(() => {
@@ -456,6 +460,7 @@ async function main() {
         tokenCell.join('|').includes('输入 12,000'),
       JSON.stringify(tokenCell).slice(0, 200)
     );
+    await cdp.evaluate("document.querySelectorAll('#usage-items .request-detail').forEach(n => { n.open = false; })");
     await cdp.screenshot('02-usage.png', { fullPage: true });
 
     /* --- 3. 过滤与分页查询一致性 --- */
@@ -1010,6 +1015,9 @@ async function main() {
     await cdp.click('#logout-button');
     check('清除密钥后回到登录界面', await cdp.evaluate("!document.querySelector('#login-view').hidden && document.querySelector('#main-view').hidden"));
     check('清除后输入框为空', (await cdp.evaluate("document.querySelector('#management-key').value")) === '');
+    check('登出清空新增概览/调用方/审计私有数据和环形图', await cdp.evaluate(
+      "['overview-summary','overview-model-share','overview-model-rank','callers-list','audit-list','pricing-rules-list'].every(id => document.getElementById(id).textContent === '')"
+    ));
     check(
       '登出后清除凭据存储',
       (await cdp.evaluate("sessionStorage.getItem('credit_manager_mgmt_token') === null && localStorage.getItem('credit_manager_mgmt_token') === null")) === true
@@ -1020,15 +1028,26 @@ async function main() {
     await cdp.setValue('#management-key', MANAGEMENT_KEY);
     await cdp.click('#login-button');
     await cdp.waitFor("!document.querySelector('#main-view').hidden", 10000, '再次登录');
+    await cdp.click('#tab-audit');
+    await cdp.waitFor("document.querySelector('#audit-list').textContent.includes('audit-1') || document.querySelector('#audit-list table')", 10000, '重登审计可用');
+    check('重登后审计筛选器重新初始化', await cdp.evaluate("!!document.querySelector('#audit-list table')"));
+    await cdp.click('#tab-prices');
+    await cdp.waitFor("document.querySelector('#pricing-rules-list table')", 10000, '重登高级规则可用');
+    await cdp.click('#rules-create');
+    await cdp.waitFor("document.querySelector('.modal #rule-id')", 10000, '重登后新增规则可打开');
+    check('重登后高级定价模块重新绑定', await cdp.evaluate("!!document.querySelector('.modal #rule-id')"));
+    await cdp.clickText('.modal button', '取消');
     await cdp.click('#tab-usage');
     await cdp.waitFor("document.querySelectorAll('#usage-items .row-title').length > 0", 10000, '移动端使用统计');
     await cdp.send('Emulation.setDeviceMetricsOverride', { width: 390, height: 844, deviceScaleFactor: 2, mobile: true });
     await sleep(300);
     const overflow = await cdp.evaluate('document.documentElement.scrollWidth - window.innerWidth');
     check('移动端页面无横向溢出', overflow <= 1, 'overflow=' + overflow);
+    await cdp.evaluate("document.querySelectorAll('#usage-items .request-detail').forEach(n => { n.open = true; })");
     const mobileLayout = await requestLayout();
     check('移动端请求字段保留可读宽度', mobileLayout.fields > 0 && mobileLayout.minValueWidth >= 80, JSON.stringify(mobileLayout));
     check('移动端长文本卡片高度有界', mobileLayout.maxCardHeight < 1000, JSON.stringify(mobileLayout));
+    await cdp.evaluate("document.querySelectorAll('#usage-items .request-detail').forEach(n => { n.open = false; })");
     await cdp.evaluate("document.querySelector('#usage-items > .card').scrollIntoView({block: 'start'})");
     await cdp.screenshot('12b-mobile-request.png');
     await cdp.evaluate("window.scrollTo(0, 0)");
@@ -1576,6 +1595,10 @@ async function main() {
       check('暗色主题生效', (await cdp.evaluate("document.documentElement.dataset.theme")) === 'dark');
       check('暗色色板生效', (await cdp.evaluate("document.documentElement.dataset.palette")) === 'dark');
       await cdp.screenshot('15-desktop-dark.png', { fullPage: true });
+      await cdp.click('#tab-overview');
+      await cdp.waitFor("document.querySelector('#overview-model-share svg')", 10000, '暗色概览真实图表');
+      await cdp.evaluate("window.scrollTo(0, 0)");
+      await cdp.screenshot('18-overview-desktop-dark.png', { fullPage: true });
 
       // 切换纯白/明亮
       await cdp.evaluate(`(() => {
@@ -1585,18 +1608,27 @@ async function main() {
       await sleep(100);
       check('纯白主题生效', (await cdp.evaluate("document.documentElement.dataset.theme")) === 'white');
       check('纯白色板生效', (await cdp.evaluate("document.documentElement.dataset.palette")) === 'white');
+      await cdp.screenshot('19-overview-desktop-light.png', { fullPage: true });
+      await cdp.click('#tab-usage');
+      await cdp.evaluate("document.querySelectorAll('#usage-items .request-detail').forEach(n => { n.open = false; }); document.querySelector('#usage-more-filters').open = false; window.scrollTo(0, 0)");
       await cdp.screenshot('14-desktop-light.png', { fullPage: true });
 
       // 移动端明暗截图
       await cdp.send('Emulation.setDeviceMetricsOverride', { width: 390, height: 844, deviceScaleFactor: 2, mobile: true });
       await sleep(200);
       await cdp.screenshot('16-mobile-light.png');
+      await cdp.click('#tab-overview');
+      await cdp.evaluate("window.scrollTo(0, 0)");
+      await cdp.screenshot('20-overview-mobile-light.png', { fullPage: true });
 
       await cdp.evaluate(`(() => {
         localStorage.setItem('cli-proxy-theme', 'dark');
         window.dispatchEvent(new StorageEvent('storage', { key: 'cli-proxy-theme' }));
       })()`);
       await sleep(100);
+      await cdp.screenshot('21-overview-mobile-dark.png', { fullPage: true });
+      await cdp.click('#tab-usage');
+      await cdp.evaluate("window.scrollTo(0, 0)");
       await cdp.screenshot('17-mobile-dark.png');
       await cdp.send('Emulation.clearDeviceMetricsOverride');
 

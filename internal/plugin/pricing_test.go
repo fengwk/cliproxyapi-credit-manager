@@ -3,6 +3,7 @@ package plugin
 import (
 	"context"
 	"net/http"
+	"strings"
 	"testing"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
@@ -13,6 +14,21 @@ import (
 // pricingStore is the optional advanced-pricing capability of the live store.
 type pricingStore interface {
 	PutPricingRule(ctx context.Context, rule credit.PricingRule) error
+}
+
+// Reject exponential expansion before allocating large integers, while
+// retaining ordinary exact JSON integer spellings.
+func TestImageCountNumericParsingIsBounded(t *testing.T) {
+	for _, raw := range []string{"1e999999999", "1e-999999999", strings.Repeat("9", 4096), `"3"`, "3.2"} {
+		if _, ok := integralInt64([]byte(raw)); ok {
+			t.Fatalf("accepted unsupported image count %q", raw[:min(len(raw), 40)])
+		}
+	}
+	for _, raw := range []string{"3", "3.0", "3e0", "0.3e1"} {
+		if got, ok := integralInt64([]byte(raw)); !ok || got != 3 {
+			t.Fatalf("%s = %d,%v, want 3,true", raw, got, ok)
+		}
+	}
 }
 
 // interceptBody admits one request with a caller-supplied body.

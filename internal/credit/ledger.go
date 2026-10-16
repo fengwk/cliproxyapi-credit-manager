@@ -100,7 +100,7 @@ func (r *reqRow) toRequest(executions []Usage, adjustment int64) Request {
 	if executions == nil {
 		executions = []Usage{}
 	}
-	return Request{
+	out := Request{
 		ID:                 r.id,
 		TraceID:            r.traceID,
 		KeyID:              r.keyID,
@@ -114,6 +114,13 @@ func (r *reqRow) toRequest(executions []Usage, adjustment int64) Request {
 		Price:              r.price,
 		Executions:         executions,
 	}
+	if r.snapshot != nil {
+		out.PricingRuleID = r.snapshot.RuleID
+		out.PriceTiers = r.snapshot.Tiers
+		out.ServiceTier = r.snapshot.ServiceTier
+		out.ImageCount = r.snapshot.ImageCount
+	}
+	return out
 }
 
 const requestColumns = `id, trace_id, key_id, model, state, outcome, status_code, started_at,

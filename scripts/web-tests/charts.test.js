@@ -610,7 +610,7 @@ test('computeModelRankings 支持 BigInt 精度、单次成本完整性判定与
   // 1. unit 单次成本排行：仅完全计量且 pending=0 的模型才计算，其余显示 —（计量未完整），绝不误标为免费 0
   const unitRank = CMCharts.computeModelRankings(models, 'unit', { currency: 'USD' });
   const completeItem = unitRank.find((it) => it.model === 'm-complete');
-  assert.equal(completeItem.display, '2 USD / 次');
+  assert.equal(completeItem.display, '2 USD / 请求');
   const incItem = unitRank.find((it) => it.model === 'm-incomplete');
   assert.equal(incItem.display, '—（计量未完整）');
   const pendItem = unitRank.find((it) => it.model === 'm-pending');
@@ -618,8 +618,8 @@ test('computeModelRankings 支持 BigInt 精度、单次成本完整性判定与
 
   // 2. value 性价比排行：大整数无损比较，超精度 token 保持精确
   const valueRank = CMCharts.computeModelRankings(models, 'value', { tokenUnit: 'raw' });
-  assert.equal(valueRank[0].model, 'm-pending'); // 免费模型优先排在前列
-  assert.equal(valueRank[0].display, '∞ (免费)');
+  assert.notEqual(valueRank[0].model, 'm-pending');
+  assert.equal(valueRank.find((it) => it.model === 'm-pending').display, '—（计量未完整）');
   const compValItem = valueRank.find((it) => it.model === 'm-complete');
   assert.ok(compValItem.display.includes('/ USD'));
   assert.equal(compValItem.tokensText, '900719925474099300');
@@ -628,5 +628,24 @@ test('computeModelRankings 支持 BigInt 精度、单次成本完整性判定与
   const tpsRank = CMCharts.computeModelRankings(models, 'tps');
   const tpsItem = tpsRank.find((it) => it.model === 'm-complete');
   // 15000 / 5s = 3000.0 tokens/s
-  assert.equal(tpsItem.display, '3000.0 tokens/s (累计吞吐)');
+  assert.equal(tpsItem.display, '3,000 tokens/s (累计吞吐)');
+});
+
+test('效率榜不将未知用量当作免费，按客户端请求数计算平均成本', () => {
+  const models = [
+    { model: 'unknown', requests: 1, executions: 1, complete_executions: 0, pending: 0, cost_micro_usd: 0, tokens: { total: 100 } },
+    { model: 'free', requests: 1, executions: 1, complete_executions: 1, pending: 0, cost_micro_usd: 0, tokens: { total: 100 } },
+    { model: 'retried', requests: 2, executions: 4, complete_executions: 4, pending: 0, cost_micro_usd: '9007199254740993', tokens: { total: 100 },
+      latency_ms: 1000, latency_samples: 1, output_tokens: '9007199254740993' },
+  ];
+  const ranked = CMCharts.computeModelRankings(models, 'value');
+  assert.equal(ranked[0].model, 'free');
+  assert.equal(ranked[0].display, '∞ (免费)');
+  assert.equal(ranked.find(m => m.model === 'unknown').display, '—（计量未完整）');
+  const unit = CMCharts.computeModelRankings(models, 'unit').find(m => m.model === 'retried');
+  assert.equal(unit.rational.den, 2n);
+  assert.equal(unit.rational.num, 9007199254740993n);
+  assert.equal(unit.display, '4503599627.370497 USD / 请求');
+  // Legacy total output without a paired measurement is not a throughput sample.
+  assert.equal(CMCharts.computeModelRankings(models, 'tps').find(m => m.model === 'retried').display, '—');
 });

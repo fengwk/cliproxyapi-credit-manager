@@ -1849,7 +1849,7 @@
       modelRankMetric: 'value',
     };
     state.callers = { items: null, loading: false, error: '', loadSeq: 0 };
-    state.audit = { items: null, total: 0, loading: false, error: '', loadSeq: 0, requestedQuery: '', loadedAt: null };
+    state.audit = { items: null, total: 0, page: 1, pageSize: 20, filters: { keyId: '', callerId: '' }, loading: false, error: '', loadSeq: 0 };
     state.keys = { items: null, loading: false, error: '', loadSeq: 0 };
     state.prices = { items: null, loading: false, error: '', loadSeq: 0 };
     state.credentials = { items: null, loading: false, error: '', quota: {}, loadSeq: 0 };
@@ -2946,8 +2946,13 @@
 
   function requestPriceText(request) {
     if (priceMissing(request.price)) return '无价格记录（拒绝计费，不按 0 计价）';
+    if (request.price.billing_mode === 'per_image') {
+      return '按图计费 ' + formatMicroUSD(request.price.per_image_micro_usd) + '/张 · 请求数量 ' +
+        formatInt(request.image_count || 1) + '；成功计费一次，不按执行次数重复扣费';
+    }
     var summary = ratesSummaryText(request.price.rates);
-    if (summary) return summary;
+    if (summary) return summary + (request.price_tiers && request.price_tiers.length
+      ? ' · 基础价格含 ' + formatInt(request.price_tiers.length) + ' 个冻结档位，按实际输入与服务等级结算' : '');
     var rates = request.price.rates || {};
     var parts = [
       '输入 ' + formatInt(rates.input) + ' µUSD/1M',
@@ -2976,21 +2981,27 @@
     var adjustmentNonZero = intString(adjustmentMicro) !== '0';
 
     var head = el('div', { class: 'row-title' }, [
+      el('span', { class: 'request-model mono', text: request.model || '—' }),
       el('span', { class: 'key-label mono', text: '请求 ' + shortId(request.id), title: String(request.id || '') }),
       badge(outcomeLabel(request.outcome), outcomeTone(request.outcome)),
       badge(stateLabel(request.state), isPendingRequest(request) ? 'warn' : ''),
-      el('span', { class: 'pill-note', text: 'trace ' + (request.trace_id || '—') }),
       el('span', { class: 'pill-note', text: 'Key ' + keyLabel }),
       el('span', { class: 'pill-note', text: '开始 ' + formatDateTime(request.started_at) }),
+    ]);
+    var knownCosts = executions.filter(function (e) {
+      return e.cost_micro_usd !== undefined && e.cost_micro_usd !== null;
+    });
+    var executionCost = global.CMNumbers.sumIntTexts(knownCosts.map(function (e) { return e.cost_micro_usd; }));
+    var costLine = el('div', { class: 'request-totals' }, [
+      el('span', { text: '执行 ' + formatInt(executions.length) + ' 次' }),
       el('span', {
-        class: 'pill-note',
-        text: request.completed_at ? '完成 ' + formatDateTime(request.completed_at) : '尚未完成',
+        class: 'mono',
+        text: knownCosts.length ? '执行成本 ' + formatMicroUSD(executionCost) +
+          (knownCosts.length < executions.length ? '（已知部分）' : '') : '执行成本 未结算',
       }),
-      el('span', { class: 'pill-note', text: '执行 ' + formatInt(executions.length) + ' 次' }),
-      el('span', { class: 'pill-note', text: '持有 ' + formatMicroUSD(request.held_micro_usd) }),
-      // 人工补记必须始终可见，不能藏在执行列表里与执行成本混算。
+      el('span', { text: '持有 ' + formatMicroUSD(request.held_micro_usd) }),
       el('span', {
-        class: 'pill-note' + (adjustmentNonZero ? ' is-warn' : ''),
+        class: adjustmentNonZero ? 'is-warn' : '',
         text: '人工补记 ' + formatMicroUSD(adjustmentMicro),
       }),
     ]);
@@ -3042,6 +3053,10 @@
         el('span', { class: 'kv-k', text: '价格' }),
         el('span', { class: 'kv-v', text: requestPriceText(request) }),
       ]),
+      request.pricing_rule_id ? el('div', { class: 'kv kv-wide' }, [
+        el('span', { class: 'kv-k', text: '冻结定价规则' }),
+        el('span', { class: 'kv-v mono', text: request.pricing_rule_id + (request.service_tier ? ' · 请求服务 ' + request.service_tier : '') }),
+      ]) : null,
       el('div', { class: 'kv kv-wide' }, [
         el('span', { class: 'kv-k', text: '人工补记（adjustment_micro_usd）' }),
         el('span', { class: 'kv-v', text: formatMicroUSDPair(adjustmentMicro) + '（管理员 Resolve 记账，独立于执行成本）' }),
@@ -3050,9 +3065,22 @@
 
     var scoped = hasExecutionScope(state.usage.filters);
 
-    return el('div', { class: 'card' }, [
-      head,
+    var detail = el('details', { class: 'request-detail' }, [
+      el('summary', { text: '查看执行明细与计费依据' }),
+      el('p', { class: 'note mono', text: 'trace ' + (request.trace_id || '—') +
+        ' · ' + (request.completed_at ? '完成 ' + formatDateTime(request.completed_at) : '尚未完成') }),
       relation.namespaceOnly ? el('p', { class: 'note', text: relation.note }) : null,
+      meta,
+      executions.length ? executionTable(request) : el('p', {
+        class: 'note',
+        text: isPendingRequest(request)
+          ? '该请求尚无执行记录，状态为待定：已知用量照常入账，未知部分需要管理员在「处理待定」中释放或扣费。'
+          : '该请求尚无执行记录；进行中的请求只持有金额，等执行事件到达后才会计费。',
+      }),
+    ]);
+    return el('div', { class: 'card request-card' }, [
+      head,
+      el('div', { class: 'request-toolbar' }, [costLine, actions]),
       scoped
         ? el('p', {
             class: 'note',
@@ -3061,16 +3089,7 @@
               '而人工补记是该请求的全部人工记账，因此两者不能当作全 Key 账本的对账口径。',
           })
         : null,
-      meta,
-      actions,
-      executions.length
-        ? executionTable(request)
-        : el('p', {
-            class: 'note',
-            text: isPendingRequest(request)
-              ? '该请求尚无执行记录，状态为待定：已知用量照常入账，未知部分需要管理员在「处理待定」中释放或扣费。'
-              : '该请求尚无执行记录；进行中的请求只持有金额，等执行事件到达后才会计费。',
-          }),
+      detail,
     ]);
   }
 
@@ -3824,7 +3843,7 @@
     openDialog({
       title: title,
       body: [
-        el('p', { class: 'hint hint-warn', text: '明文密钥只显示这一次，关闭后无法再次获取。请复制并保存到安全位置。' }),
+        el('p', { class: 'hint hint-warn', text: '本弹窗只显示这一次，关闭后不在浏览器留存。新 Key 可经管理鉴权从「查看密钥」再次获取，每次查看均记审计。' }),
         el('div', { class: 'secret-box', text: keyText }),
         el('p', { class: 'note', text: note || '' }),
       ],
@@ -5097,7 +5116,7 @@
             fxBtn.disabled = false;
             if (res && res.rate) {
               var rateText = String(res.rate);
-              state.currencyRate = Number(res.rate);
+              state.currencyRate = normalizeRate(res.rate);
               var cr = $('currency-rate');
               if (cr) cr.value = rateText;
               var isStale = Boolean(res.stale);

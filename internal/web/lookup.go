@@ -90,22 +90,26 @@ type lookupExecution struct {
 	At            time.Time     `json:"at"`
 	LatencyMS     int64         `json:"latency_ms,omitempty"`
 	TTFTMS        int64         `json:"ttft_ms,omitempty"`
+	ServiceTier   string        `json:"service_tier,omitempty"`
 }
 
 // lookupRequest is the sanitized request view. It never groups requests of
 // other keys and drops the raw upstream usage payload.
 type lookupRequest struct {
-	ID                 string            `json:"id"`
-	TraceID            string            `json:"trace_id"`
-	Model              string            `json:"model"`
-	Outcome            string            `json:"outcome"`
-	State              string            `json:"state"`
-	StartedAt          time.Time         `json:"started_at"`
-	CompletedAt        *time.Time        `json:"completed_at,omitempty"`
-	HeldMicroUSD       int64             `json:"held_micro_usd"`
-	AdjustmentMicroUSD int64             `json:"adjustment_micro_usd"`
-	Price              credit.Price      `json:"price"`
-	Executions         []lookupExecution `json:"executions"`
+	ID                 string             `json:"id"`
+	TraceID            string             `json:"trace_id"`
+	Model              string             `json:"model"`
+	Outcome            string             `json:"outcome"`
+	State              string             `json:"state"`
+	StartedAt          time.Time          `json:"started_at"`
+	CompletedAt        *time.Time         `json:"completed_at,omitempty"`
+	HeldMicroUSD       int64              `json:"held_micro_usd"`
+	AdjustmentMicroUSD int64              `json:"adjustment_micro_usd"`
+	Price              credit.Price       `json:"price"`
+	Executions         []lookupExecution  `json:"executions"`
+	PriceTiers         []credit.PriceTier `json:"price_tiers,omitempty"`
+	ServiceTier        string             `json:"service_tier,omitempty"`
+	ImageCount         int64              `json:"image_count,omitempty"`
 }
 
 // lookupData is the self-service usage response: the authenticated key's own
@@ -295,6 +299,7 @@ func sanitizeLookupRequest(item credit.Request) lookupRequest {
 			At:            execution.At,
 			LatencyMS:     execution.LatencyMS,
 			TTFTMS:        execution.TTFTMS,
+			ServiceTier:   execution.ServiceTier,
 		})
 	}
 	return lookupRequest{
@@ -309,6 +314,9 @@ func sanitizeLookupRequest(item credit.Request) lookupRequest {
 		AdjustmentMicroUSD: item.AdjustmentMicroUSD,
 		Price:              item.Price,
 		Executions:         executions,
+		PriceTiers:         item.PriceTiers,
+		ServiceTier:        item.ServiceTier,
+		ImageCount:         item.ImageCount,
 	}
 }
 

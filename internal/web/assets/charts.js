@@ -459,9 +459,12 @@
       var completeExecText = intText(m.complete_executions || 0);
       var execText = intText(m.executions || 0);
       var pendingText = intText(m.pending || 0);
+      var execCount = BigInt(execText);
+      var requestCount = BigInt(reqText);
+      var isKnown = execCount > 0n && BigInt(completeExecText) === execCount && BigInt(pendingText) === 0n;
 
       // TPS 优先使用真实测得输出 token 字段 measured_output_tokens，fallback 至 output_tokens
-      var measuredOutText = intText(m.measured_output_tokens !== undefined ? m.measured_output_tokens : (m.output_tokens || 0));
+      var measuredOutText = intText(m.measured_output_tokens || 0);
       var latencyMsText = intText(m.latency_ms || 0);
       var latencySamplesText = intText(m.latency_samples || 0);
 
@@ -472,7 +475,9 @@
       if (selectedMetric === 'value') {
         var costMicro = BigInt(isIntText(costMicroText) ? costMicroText : '0');
         var tokens = BigInt(isIntText(tokText) ? tokText : '0');
-        if (costMicro > 0n) {
+        if (!isKnown) {
+          display = '—（计量未完整）';
+        } else if (costMicro > 0n) {
           rational = { num: tokens * 1000000n, den: costMicro };
           var tokensPerUSD = rational.num / costMicro;
           display = tokenText(tokensPerUSD.toString(), tokenUnit) + ' / USD';
@@ -484,15 +489,13 @@
           display = '—';
         }
       } else if (selectedMetric === 'unit') {
-        var execCount = BigInt(isIntText(execText) ? execText : '0');
-        var completeCount = BigInt(isIntText(completeExecText) ? completeExecText : '0');
-        var pendingCount = BigInt(isIntText(pendingText) ? pendingText : '0');
-        var isKnown = execCount > 0n && completeCount === execCount && pendingCount === 0n;
-        if (isKnown) {
+        if (isKnown && requestCount > 0n) {
           var costMicroVal = BigInt(isIntText(costMicroText) ? costMicroText : '0');
-          rational = { num: costMicroVal, den: execCount };
-          var unitMicro = costMicroVal / execCount;
-          display = formatMoneyMicro(unitMicro.toString(), currency, rate) + ' / 次';
+          rational = { num: costMicroVal, den: requestCount };
+          var unitMicro = (costMicroVal + requestCount / 2n) / requestCount;
+          display = unitMicro === 0n && costMicroVal > 0n
+            ? '<' + formatMoneyMicro('1', currency, rate) + ' / 请求'
+            : formatMoneyMicro(unitMicro.toString(), currency, rate) + ' / 请求';
         } else {
           score = null;
           display = '—（计量未完整）';
@@ -506,20 +509,17 @@
           }
         }
       } else if (selectedMetric === 'tps') {
-        var latMs = Number(latencyMsText);
-        var mOut = Number(measuredOutText);
-        if (latMs > 0 && mOut > 0) {
-          var tpsRate = mOut / (latMs / 1000);
-          score = tpsRate;
-          display = tpsRate.toFixed(1) + ' tokens/s (累计吞吐)';
+        var latMs = BigInt(latencyMsText);
+        if (latMs > 0n && m.measured_output_tokens !== undefined) {
+          rational = { num: BigInt(measuredOutText) * 1000n, den: latMs };
+          display = formatDecimalRatio(rational.num, rational.den, 1) + ' tokens/s (累计吞吐)';
         }
       } else if (selectedMetric === 'latency') {
-        var samples = Number(latencySamplesText);
-        var totalMs = Number(latencyMsText);
-        if (samples > 0 && totalMs > 0) {
-          var avgMs = totalMs / samples;
-          score = avgMs;
-          display = avgMs >= 1000 ? (avgMs / 1000).toFixed(2) + ' s' : Math.round(avgMs) + ' ms';
+        var samples = BigInt(latencySamplesText);
+        var totalMs = BigInt(latencyMsText);
+        if (samples > 0n && totalMs > 0n) {
+          rational = { num: totalMs, den: samples };
+          display = totalMs >= samples * 1000n ? formatDecimalRatio(totalMs, samples * 1000n, 2) + ' s' : formatDecimalRatio(totalMs, samples, 0) + ' ms';
         }
       }
 
@@ -547,17 +547,13 @@
         if (!b.rational) return -1;
         return compareBigIntRational(b.rational.num, b.rational.den, a.rational.num, a.rational.den);
       }
-      if (selectedMetric === 'unit') {
+      if (selectedMetric === 'unit' || selectedMetric === 'latency' || selectedMetric === 'tps') {
         if (!a.rational && !b.rational) return 0;
         if (!a.rational) return 1;
         if (!b.rational) return -1;
-        return compareBigIntRational(a.rational.num, a.rational.den, b.rational.num, b.rational.den);
-      }
-      if (selectedMetric === 'latency') {
-        if (a.score === null && b.score === null) return 0;
-        if (a.score === null) return 1;
-        if (b.score === null) return -1;
-        return a.score - b.score;
+        return selectedMetric === 'tps'
+          ? compareBigIntRational(b.rational.num, b.rational.den, a.rational.num, a.rational.den)
+          : compareBigIntRational(a.rational.num, a.rational.den, b.rational.num, b.rational.den);
       }
       if (a.score === null && b.score === null) return 0;
       if (a.score === null) return 1;

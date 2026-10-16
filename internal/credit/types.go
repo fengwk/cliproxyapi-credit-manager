@@ -185,9 +185,13 @@ type Request struct {
 	// AdjustmentMicroUSD totals manual Resolve charges booked against this
 	// request. It is reported next to the execution cost, never inside it, so
 	// manual ledger entries are neither hidden nor double counted.
-	AdjustmentMicroUSD int64   `json:"adjustment_micro_usd"`
-	Price              Price   `json:"price"`
-	Executions         []Usage `json:"executions"`
+	AdjustmentMicroUSD int64       `json:"adjustment_micro_usd"`
+	Price              Price       `json:"price"`
+	Executions         []Usage     `json:"executions"`
+	PricingRuleID      string      `json:"pricing_rule_id,omitempty"`
+	PriceTiers         []PriceTier `json:"price_tiers,omitempty"`
+	ServiceTier        string      `json:"service_tier,omitempty"`
+	ImageCount         int64       `json:"image_count,omitempty"`
 }
 
 type Completion struct {

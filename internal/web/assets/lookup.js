@@ -773,7 +773,7 @@
           displayValue: formatInt(m.requests || 0) + ' 次',
         };
       });
-      var totalReq = items.reduce(function (a, b) { return a + b.value; }, 0);
+      var totalReq = numbers().sumIntTexts(models.map(function (m) { return m.requests || 0; }));
       charts().renderDonut(shareContainer, items, {
         centerTitle: '总调用',
         centerTotal: formatInt(totalReq),
@@ -832,10 +832,9 @@
 
         var orig = (models || []).find(function (item) { return item.model === m.model; }) || {};
         var measuredOut = intText(orig.measured_output_tokens !== undefined ? orig.measured_output_tokens : (orig.output_tokens || 0));
-        var latMs = Number(intText(orig.latency_ms || 0));
-        var mOut = Number(measuredOut);
-        if (latMs > 0 && mOut > 0) {
-          var tpsVal = (mOut / (latMs / 1000)).toFixed(1);
+        var latMs = BigInt(intText(orig.latency_ms || 0));
+        if (latMs > 0n && orig.measured_output_tokens !== undefined) {
+          var tpsVal = charts().formatDecimalRatio(BigInt(measuredOut) * 1000n, latMs, 1);
           var tpsSpan = document.createElement('span');
           tpsSpan.textContent = tpsVal + ' tokens/s (累计吞吐)';
           metaEl.appendChild(tpsSpan);

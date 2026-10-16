@@ -7,6 +7,7 @@ import (
 	"errors"
 	"math/big"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -293,6 +294,17 @@ func requestImageCount(body []byte) (int64, bool) {
 // Exponent and trailing-zero forms are accepted only when they denote an exact
 // integer (2.0 and 1e2 are integers, 2.5 and 1e30 are not).
 func integralInt64(raw json.RawMessage) (int64, bool) {
+	raw = bytes.TrimSpace(raw)
+	if len(raw) > 64 {
+		return 0, false
+	}
+	// Bound exponent expansion before big.Rat sees untrusted request numbers.
+	if i := bytes.IndexAny(raw, "eE"); i >= 0 {
+		exponent, err := strconv.ParseInt(string(raw[i+1:]), 10, 16)
+		if err != nil || exponent < -64 || exponent > 64 {
+			return 0, false
+		}
+	}
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	decoder.UseNumber()
 	var decoded any
