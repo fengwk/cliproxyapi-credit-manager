@@ -53,6 +53,7 @@ var assetMIMEs = map[string]string{
 	"app.js":                      "text/javascript; charset=utf-8",
 	"style.css":                   "text/css; charset=utf-8",
 	"charts.js":                   "text/javascript; charset=utf-8",
+	"numbers.js":                  "text/javascript; charset=utf-8",
 	"vendor/echarts-5.6.0.min.js": "text/javascript; charset=utf-8",
 	"lookup.html":                 "text/html; charset=utf-8",
 	"lookup.css":                  "text/css; charset=utf-8",

@@ -1,24 +1,39 @@
 /*
  * credit-manager 密钥自助查询脚本。
  *
- * 纯原生 JS：无框架、无 bundler、无 CDN，且不使用 innerHTML 写入服务端数据。
+ * 纯原生 JS：无框架、无 bundler、无 CDN，且不使用 innerHTML/eval 写入服务端数据。
  * 页面只读自己的数据：密钥仅通过 Authorization 请求头发送，绝不写入 URL。
  * 除用户显式勾选“记住密钥”外不落盘；落盘时使用独立前缀 credit-manager.lookup.
  * 与财务控制台的管理密钥完全隔离。
  *
- * 趋势图复用共享图表组件 charts.js（全局 CMCharts，基于随包分发的
- * vendor/echarts-5.6.0.min.js）。组件缺席时降级为内置的文本条形，页面仍可用。
+ * 复用共享模块：
+ *   - numbers.js（CMNumbers）：无损 JSON 解析，超过 2^53 的账务整数保留精确文本；
+ *   - charts.js（CMCharts）：精确整数/金额/Token 文本与主题化趋势图（vendor/echarts）。
+ * 共享模块缺席时逐项降级，页面仍可用。主题/计量偏好使用本文件自带的读取与归一化
+ * 逻辑（不含额外的偏好模块依赖），沿用控制台的存储键，保证两个页面口径一致。
+ *
+ * 生命周期：所有查询都带 epoch + AbortController；切换密钥、退出或收到 401 时立刻
+ * 取消在途请求、清空私有 DOM 与凭据、关闭快照弹窗并释放图表实例，避免上一个密钥的
+ * 数据或图表残留在页面上。
  */
-(function () {
+(function (root, factory) {
+  'use strict';
+  var api = factory(root);
+  if (typeof module !== 'undefined' && module && module.exports) module.exports = api;
+  if (root && (typeof root === 'object' || typeof root === 'function')) root.CMLookup = api;
+  if (typeof document !== 'undefined' && typeof document.getElementById === 'function') {
+    if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', function () { api.boot(); });
+    else api.boot();
+  }
+})(typeof globalThis !== 'undefined' ? globalThis : (typeof self !== 'undefined' ? self : this), function (root) {
   'use strict';
 
   var STORAGE_PREFIX = 'credit-manager.lookup.';
   var REMEMBER_KEY = STORAGE_PREFIX + 'token';
+  var REMEMBER_ORIGIN_KEY = STORAGE_PREFIX + 'token-origin';
   var PAGE_SIZE = 10;
-  var USD_CNY_RATE = 7.2;
-
-  var DATA_URL = new URL('lookup/data', location.href).toString();
-  var CAPTURE_URL = new URL('lookup/capture', location.href).toString();
+  var DEFAULT_USD_CNY_RATE = 7.2;
+  var GRAINS = ['hour', 'day', 'month'];
 
   var OUTCOME_LABELS = { succeeded: '成功', failed: '失败', rejected: '拒绝', canceled: '取消' };
   var STATE_LABELS = { active: '进行中', pending: '待定', settled: '已结算' };
@@ -31,6 +46,349 @@
     unavailable: '快照不可用',
   };
 
+  /* ------------------------------------------------------------------ *
+   * 共享模块访问（缺失时逐项降级，绝不因为缺模块整体失败）
+   * ------------------------------------------------------------------ */
+
+  var preferences = (function () {
+    var CPA_THEME_KEY = 'cli-proxy-theme';
+    var THEMES = ['auto', 'light', 'white', 'dark'];
+    var TOKEN_UNIT_KEY = 'credit_manager_token_unit';
+    var CURRENCY_KEY = 'credit_manager_currency';
+    var USD_CNY_RATE_KEY = 'credit_manager_usd_cny_rate';
+
+    // CPA 把主题写成 JSON 或纯字符串，两种都要能读。
+    function parseStoredTheme(value) {
+      if (!value) return '';
+      try {
+        var parsed = JSON.parse(value);
+        return parsed && typeof parsed === 'object'
+          ? (parsed.theme || (parsed.state && parsed.state.theme) || parsed.language || '')
+          : parsed;
+      } catch (err) {
+        return value;
+      }
+    }
+
+    return {
+      CPA_THEME_KEY: CPA_THEME_KEY,
+      THEMES: THEMES,
+      TOKEN_UNIT_KEY: TOKEN_UNIT_KEY,
+      CURRENCY_KEY: CURRENCY_KEY,
+      USD_CNY_RATE_KEY: USD_CNY_RATE_KEY,
+      readTheme: function (store) {
+        if (!store) return 'auto';
+        try {
+          var candidate = String(parseStoredTheme(store.getItem(CPA_THEME_KEY)) || 'auto').toLowerCase();
+          return THEMES.indexOf(candidate) >= 0 ? candidate : 'auto';
+        } catch (err) {
+          return 'auto';
+        }
+      },
+      resolvePalette: function (theme, systemIsDark) {
+        var chosen = THEMES.indexOf(theme) >= 0 ? theme : 'auto';
+        if (chosen === 'auto') return systemIsDark ? 'dark' : 'white';
+        return chosen;
+      },
+      readUnits: function (store) {
+        var units = { tokenUnit: 'raw', currency: 'USD', currencyRate: DEFAULT_USD_CNY_RATE };
+        if (!store) return units;
+        try {
+          var unit = store.getItem(TOKEN_UNIT_KEY);
+          if (unit) units.tokenUnit = normalizeTokenUnit(unit);
+          var currency = store.getItem(CURRENCY_KEY);
+          if (currency) units.currency = normalizeCurrency(currency);
+          var rate = store.getItem(USD_CNY_RATE_KEY);
+          if (rate) units.currencyRate = normalizeRate(rate);
+        } catch (err) {
+          /* 存储被禁用时直接用默认值 */
+        }
+        return units;
+      },
+      writeUnits: function (store, units) {
+        if (!store || !units) return;
+        try {
+          store.setItem(TOKEN_UNIT_KEY, normalizeTokenUnit(units.tokenUnit));
+          store.setItem(CURRENCY_KEY, normalizeCurrency(units.currency));
+          store.setItem(USD_CNY_RATE_KEY, String(normalizeRate(units.currencyRate)));
+        } catch (err) {
+          /* 忽略不可写存储 */
+        }
+      },
+    };
+  })();
+
+  function numbers() {
+    return root && root.CMNumbers ? root.CMNumbers : null;
+  }
+
+  function charts() {
+    return root && root.CMCharts ? root.CMCharts : null;
+  }
+
+  function parseBody(text) {
+    var lossless = numbers();
+    return lossless && typeof lossless.parse === 'function' ? lossless.parse(text) : JSON.parse(text);
+  }
+
+  function intText(value) {
+    var lossless = numbers();
+    if (lossless && typeof lossless.intText === 'function') return lossless.intText(value);
+    if (value === null || value === undefined) return '';
+    if (typeof value === 'number' && !Number.isFinite(value)) return String(value);
+    return String(value).trim();
+  }
+
+  function formatInt(value) {
+    var shared = charts();
+    if (shared && typeof shared.formatInt === 'function') return shared.formatInt(value);
+    var text = intText(value);
+    return text === '' ? '—' : text;
+  }
+
+  function formatToken(value, unit) {
+    var shared = charts();
+    if (shared && typeof shared.tokenText === 'function') return shared.tokenText(value, unit);
+    return formatInt(value);
+  }
+
+  function formatMoney(micro, currency, rate) {
+    var shared = charts();
+    if (shared && typeof shared.formatMoneyMicro === 'function') {
+      return shared.formatMoneyMicro(micro, currency, rate) + ' ' + shared.normalizeCurrency(currency);
+    }
+    var text = intText(micro);
+    return (text === '' ? '—' : text) + ' µUSD';
+  }
+
+  function formatMoment(value) {
+    var shared = charts();
+    if (shared && typeof shared.formatDateTime === 'function') return shared.formatDateTime(value) || '—';
+    if (!value) return '—';
+    var date = new Date(value);
+    return isNaN(date.getTime()) ? String(value) : date.toLocaleString();
+  }
+
+  function bucketText(value, grain) {
+    var shared = charts();
+    if (shared && typeof shared.bucketLabel === 'function') return shared.bucketLabel(value, grain) || '—';
+    return formatMoment(value);
+  }
+
+  /* ------------------------------------------------------------------ *
+   * 纯逻辑（可独立测试）：范围、查询串、凭据存储、汇总
+   * ------------------------------------------------------------------ */
+
+  function normalizeGrain(value) {
+    var text = String(value == null ? '' : value).toLowerCase();
+    return GRAINS.indexOf(text) >= 0 ? text : 'day';
+  }
+
+  function normalizeTokenUnit(value) {
+    var shared = charts();
+    if (shared && typeof shared.normalizeTokenUnit === 'function') return shared.normalizeTokenUnit(value);
+    return ['raw', 'k', 'wan', 'm'].indexOf(value) >= 0 ? value : 'raw';
+  }
+
+  function normalizeCurrency(value) {
+    return value === 'CNY' ? 'CNY' : 'USD';
+  }
+
+  function normalizeRate(value) {
+    var n = Number(value);
+    return isFinite(n) && n > 0 ? n : DEFAULT_USD_CNY_RATE;
+  }
+
+  // 时间范围：全部使用浏览器本地自然日边界（today/7/30/90/all）。
+  function rangeBounds(mode, now) {
+    if (mode === 'all') return {};
+    var current = now instanceof Date ? new Date(now.getTime()) : new Date();
+    var start = new Date(current.getTime());
+    start.setHours(0, 0, 0, 0);
+    if (mode !== 'today') {
+      var days = Number(mode);
+      if (isFinite(days) && days > 1) start.setDate(start.getDate() - (days - 1));
+    }
+    return { from: start.toISOString(), to: current.toISOString() };
+  }
+
+  // 查询串：bucket 与服务端契约一致，用户选择的维度原样下发（时/日/月），
+  // 绝不在客户端把月降级成日再自行合并。
+  function buildDataQuery(state, now) {
+    var bounds = rangeBounds(state.range, now);
+    var params = [];
+    if (bounds.from) params.push(['from', bounds.from]);
+    if (bounds.to) params.push(['to', bounds.to]);
+    params.push(['bucket', normalizeGrain(state.grain)]);
+    params.push(['page', String(state.page)]);
+    params.push(['page_size', String(state.pageSize)]);
+    if (state.result) params.push(['result', state.result]);
+    if (state.model) params.push(['model', state.model]);
+    return params;
+  }
+
+  function buildDataURL(base, state, now) {
+    var url = new URL(base);
+    buildDataQuery(state, now).forEach(function (pair) { url.searchParams.set(pair[0], pair[1]); });
+    return url;
+  }
+
+  function buildCaptureURL(base, id) {
+    var url = new URL(base);
+    url.searchParams.set('id', id);
+    return url;
+  }
+
+  function originOf(fallback) {
+    try {
+      return String(root.location.origin || '');
+    } catch (err) {
+      return fallback || '';
+    }
+  }
+
+  // 会话优先、本地兜底，且两侧各自独立 try：任何一侧不可用都不影响另一侧。
+  // remembered 只表示“本地也持久化了同一个凭据”，与会话凭据的存在与否无关。
+  function readStoredToken(sessionStore, localStore, origin) {
+    var current = origin || originOf('');
+    var sessionToken = '';
+    var localToken = '';
+    if (sessionStore) {
+      try {
+        var sessionOrigin = sessionStore.getItem(REMEMBER_ORIGIN_KEY);
+        var sessionValue = String(sessionStore.getItem(REMEMBER_KEY) || '').trim();
+        if (sessionValue && (!sessionOrigin || sessionOrigin === current)) sessionToken = sessionValue;
+      } catch (err) {
+        /* 会话存储不可用：继续尝试本地存储 */
+      }
+    }
+    if (localStore) {
+      try {
+        var localOrigin = localStore.getItem(REMEMBER_ORIGIN_KEY);
+        var localValue = String(localStore.getItem(REMEMBER_KEY) || '').trim();
+        if (localValue && (!localOrigin || localOrigin === current)) localToken = localValue;
+      } catch (err) {
+        /* 本地存储不可用：本次会话内仍可手工输入 */
+      }
+    }
+    if (sessionToken) return { token: sessionToken, remembered: !!localToken && localToken === sessionToken };
+    if (localToken) return { token: localToken, remembered: true };
+    return { token: '', remembered: false };
+  }
+
+  function persistToken(sessionStore, localStore, origin, token, remember) {
+    var current = origin || originOf('');
+    var value = String(token || '').trim();
+    if (sessionStore) {
+      try {
+        if (value) {
+          sessionStore.setItem(REMEMBER_KEY, value);
+          sessionStore.setItem(REMEMBER_ORIGIN_KEY, current);
+        } else {
+          sessionStore.removeItem(REMEMBER_KEY);
+          sessionStore.removeItem(REMEMBER_ORIGIN_KEY);
+        }
+      } catch (err) {
+        /* 会话存储不可写：忽略 */
+      }
+    }
+    if (localStore) {
+      try {
+        if (value && remember) {
+          localStore.setItem(REMEMBER_KEY, value);
+          localStore.setItem(REMEMBER_ORIGIN_KEY, current);
+        } else {
+          localStore.removeItem(REMEMBER_KEY);
+          localStore.removeItem(REMEMBER_ORIGIN_KEY);
+        }
+      } catch (err) {
+        /* 本地存储不可写：忽略 */
+      }
+    }
+  }
+
+  function clearToken(sessionStore, localStore) {
+    if (sessionStore) {
+      try {
+        sessionStore.removeItem(REMEMBER_KEY);
+        sessionStore.removeItem(REMEMBER_ORIGIN_KEY);
+      } catch (err) {
+        /* 忽略不可用存储 */
+      }
+    }
+    if (localStore) {
+      try {
+        localStore.removeItem(REMEMBER_KEY);
+        localStore.removeItem(REMEMBER_ORIGIN_KEY);
+      } catch (err) {
+        /* 忽略不可用存储 */
+      }
+    }
+  }
+
+  function requestStatus(item) {
+    var outcome = OUTCOME_LABELS[item && item.outcome] || (item && item.outcome) || '';
+    var label = STATE_LABELS[item && item.state] || (item && item.state) || '';
+    return outcome ? outcome + ' · ' + (label || '—') : label || '—';
+  }
+
+  function executionTokens(executions) {
+    var lossless = numbers();
+    var values = (executions || []).map(function (execution) {
+      return (execution && execution.tokens ? execution.tokens.total : 0) || 0;
+    });
+    if (lossless && typeof lossless.sumIntTexts === 'function') return lossless.sumIntTexts(values);
+    return String(values.length);
+  }
+
+  function executionCost(executions) {
+    var lossless = numbers();
+    var values = (executions || []).map(function (execution) {
+      return execution && execution.cost_micro_usd != null ? execution.cost_micro_usd : 0;
+    });
+    if (lossless && typeof lossless.sumIntTexts === 'function') return lossless.sumIntTexts(values);
+    return '0';
+  }
+
+  // 模型 Token 限额：后端只返回已配置的上限，0 表示该周期不限。
+  function tokenLimitText(limit) {
+    var value = intText(limit);
+    if (value === '' || value === '0') return '不限';
+    return formatToken(limit, 'raw');
+  }
+
+  var api = {
+    VERSION: '1.0.0',
+    STORAGE_PREFIX: STORAGE_PREFIX,
+    REMEMBER_KEY: REMEMBER_KEY,
+    REMEMBER_ORIGIN_KEY: REMEMBER_ORIGIN_KEY,
+    normalizeGrain: normalizeGrain,
+    normalizeTokenUnit: normalizeTokenUnit,
+    normalizeCurrency: normalizeCurrency,
+    normalizeRate: normalizeRate,
+    rangeBounds: rangeBounds,
+    buildDataQuery: buildDataQuery,
+    buildDataURL: buildDataURL,
+    buildCaptureURL: buildCaptureURL,
+    readStoredToken: readStoredToken,
+    persistToken: persistToken,
+    clearToken: clearToken,
+    requestStatus: requestStatus,
+    executionTokens: executionTokens,
+    executionCost: executionCost,
+    tokenLimitText: tokenLimitText,
+    parseBody: parseBody,
+    preferences: preferences,
+    boot: boot,
+  };
+
+  /* ------------------------------------------------------------------ *
+   * 运行时状态与 DOM
+   * ------------------------------------------------------------------ */
+
+  var DATA_URL = 'lookup/data';
+  var CAPTURE_URL = 'lookup/capture';
+
   var state = {
     token: '',
     page: 1,
@@ -39,127 +397,22 @@
     range: 'today',
     grain: 'day',
     tokenUnit: 'raw',
+    currency: 'USD',
+    rate: DEFAULT_USD_CNY_RATE,
     trend: [],
+    summary: null,
   };
 
-  /* ------------------------------------------------------------------ *
-   * 纯展示逻辑
-   * ------------------------------------------------------------------ */
+  // epoch 让任何一次迟到的响应失效；inflight 让上一次请求被真正取消。
+  var epoch = 0;
+  var inflight = null;
 
-  function formatInt(value) {
-    var n = Number(value);
-    return Number.isFinite(n) ? Math.round(n).toLocaleString() : '—';
+  function el(id) {
+    return document.getElementById(id);
   }
-
-  function formatMicroUSD(value) {
-    var n = Number(value);
-    if (!Number.isFinite(n)) return '—';
-    var usd = n / 1e6;
-    var digits = Math.abs(usd) >= 1 ? 4 : 6;
-    return '$' + usd.toLocaleString(undefined, { maximumFractionDigits: digits });
-  }
-
-  function formatDateTime(value) {
-    if (!value) return '—';
-    var date = new Date(value);
-    return Number.isNaN(date.getTime()) ? String(value) : date.toLocaleString();
-  }
-
-  function formatDay(value) {
-    if (!value) return '—';
-    var date = new Date(value);
-    if (Number.isNaN(date.getTime())) return String(value);
-    var pad = function (n) { return n < 10 ? '0' + n : String(n); };
-    return pad(date.getMonth() + 1) + '-' + pad(date.getDate());
-  }
-
-  function requestStatus(item) {
-    var outcome = OUTCOME_LABELS[item.outcome] || item.outcome;
-    var label = STATE_LABELS[item.state] || item.state;
-    if (item.outcome) return outcome + ' · ' + (label || '—');
-    return label || '—';
-  }
-
-  // 请求数 / Token / 费用三个口径都由共享图表的同一组趋势点渲染。
-  // 月维度只需服务端按日聚合，再由图表组件按月合并。
-  function serverBucket() {
-    return state.grain === 'hour' ? 'hour' : 'day';
-  }
-
-  function rangeBounds(mode) {
-    if (mode === 'all') return {};
-    var start = new Date();
-    start.setHours(0, 0, 0, 0);
-    if (mode !== 'today') {
-      var days = Number(mode);
-      if (Number.isFinite(days) && days > 1) start.setDate(start.getDate() - (days - 1));
-    }
-    return { from: start.toISOString(), to: new Date().toISOString() };
-  }
-
-  function buildDataURL() {
-    var url = new URL(DATA_URL);
-    var bounds = rangeBounds(state.range);
-    if (bounds.from) url.searchParams.set('from', bounds.from);
-    if (bounds.to) url.searchParams.set('to', bounds.to);
-    url.searchParams.set('page', String(state.page));
-    url.searchParams.set('page_size', String(state.pageSize));
-    url.searchParams.set('bucket', serverBucket());
-    return url;
-  }
-
-  function buildCaptureURL(id) {
-    var url = new URL(CAPTURE_URL);
-    url.searchParams.set('id', id);
-    return url;
-  }
-
-  /* ------------------------------------------------------------------ *
-   * 本机存储（独立前缀，仅存用户自己的密钥）
-   * ------------------------------------------------------------------ */
-
-  function readRememberedToken() {
-    try {
-      return localStorage.getItem(REMEMBER_KEY) || sessionStorage.getItem(REMEMBER_KEY) || '';
-    } catch (_) {
-      return '';
-    }
-  }
-
-  function tokenIsPersisted() {
-    try {
-      return localStorage.getItem(REMEMBER_KEY) !== null;
-    } catch (_) {
-      return false;
-    }
-  }
-
-  function persistToken(token, remember) {
-    try {
-      sessionStorage.setItem(REMEMBER_KEY, token);
-      if (remember) localStorage.setItem(REMEMBER_KEY, token);
-      else localStorage.removeItem(REMEMBER_KEY);
-    } catch (_) {
-      /* 隐私模式下不可写：仍可在本次会话内使用 */
-    }
-  }
-
-  function forgetToken() {
-    try {
-      localStorage.removeItem(REMEMBER_KEY);
-      sessionStorage.removeItem(REMEMBER_KEY);
-    } catch (_) {
-      /* 忽略不可写存储 */
-    }
-  }
-
-  /* ------------------------------------------------------------------ *
-   * DOM
-   * ------------------------------------------------------------------ */
-
-  var el = function (id) { return document.getElementById(id); };
 
   function clear(node) {
+    if (!node) return;
     while (node.firstChild) node.removeChild(node.firstChild);
   }
 
@@ -192,6 +445,7 @@
     el('switch-key').hidden = true;
     el('login-gate').hidden = false;
     if (message) showBanner(message);
+    else hideBanner();
   }
 
   function showDashboard() {
@@ -205,103 +459,268 @@
     el('refresh').disabled = busy;
   }
 
+  var store = function (name) {
+    try {
+      return root[name] || null;
+    } catch (err) {
+      return null;
+    }
+  };
+
+  function sessionStore() { return store('sessionStorage'); }
+  function localStore() { return store('localStorage'); }
+
+  /* ------------------------------------------------------------------ *
+   * 生命周期：取消在途请求、清空私有数据、释放图表
+   * ------------------------------------------------------------------ */
+
+  // 每一次新的用户操作都会作废上一次请求：递增 epoch 并 abort 进行中的 fetch。
+  function newEpoch() {
+    epoch += 1;
+    if (inflight && typeof inflight.abort === 'function') {
+      try {
+        inflight.abort();
+      } catch (err) {
+        /* 已经结束的请求 abort 失败可以忽略 */
+      }
+    }
+    inflight = null;
+    return epoch;
+  }
+
+  function disposeCharts() {
+    var shared = charts();
+    if (shared && typeof shared.disposeAll === 'function') {
+      try {
+        shared.disposeAll();
+      } catch (err) {
+        /* 图表释放失败不应阻断清理 */
+      }
+    }
+  }
+
+  function closeSnapshot() {
+    var modal = el('capture-modal');
+    if (modal && modal.open && typeof modal.close === 'function') modal.close();
+    clear(el('capture-body'));
+  }
+
+  // 清空所有来自密钥的私有 DOM，并释放图表实例。
+  function resetPrivateUI() {
+    state.trend = [];
+    state.summary = null;
+    ['quotas', 'token-limits', 'stats', 'recent-body'].forEach(function (id) {
+      clear(el(id));
+    });
+    ['key-label', 'key-state', 'retention', 'recent-state', 'token-limits-state', 'page-info'].forEach(function (id) {
+      if (el(id)) el(id).textContent = '';
+    });
+    el('trend-empty').hidden = true;
+    el('prev').disabled = true;
+    el('next').disabled = true;
+    disposeCharts();
+    ['trend-requests', 'trend-tokens', 'trend-cost'].forEach(function (id) {
+      clear(el(id));
+    });
+    closeSnapshot();
+  }
+
+  // 退出/切换密钥/凭据失效：取消请求、清空凭据与私有数据、回到输入界面。
+  function dropSession(message) {
+    newEpoch();
+    state.token = '';
+    clearToken(sessionStore(), localStore());
+    if (el('key')) el('key').value = '';
+    if (el('remember-key')) el('remember-key').checked = false;
+    resetPrivateUI();
+    state.page = 1;
+    state.total = 0;
+    setBusy(false);
+    showGate(message || '');
+  }
+
   /* ------------------------------------------------------------------ *
    * 网络
    * ------------------------------------------------------------------ */
 
-  function apiFetch(url) {
-    return fetch(url.toString(), {
+  function baseURL(relative) {
+    try {
+      return new URL(relative, root.location.href).toString();
+    } catch (err) {
+      return relative;
+    }
+  }
+
+  function apiFetch(url, signal) {
+    return fetch(url, {
       method: 'GET',
       headers: { Authorization: 'Bearer ' + state.token, Accept: 'application/json' },
       credentials: 'same-origin',
       cache: 'no-store',
+      signal: signal,
     });
   }
 
-  async function loadUsage() {
+  function isStale(myEpoch) {
+    return myEpoch !== epoch;
+  }
+
+  async function loadUsage(options) {
+    var opts = options || {};
+    var myEpoch = newEpoch();
+    var controller = typeof AbortController === 'function' ? new AbortController() : null;
+    inflight = controller;
     setBusy(true);
     try {
-      var response = await apiFetch(buildDataURL());
+      var response = await apiFetch(buildDataURL(baseURL(DATA_URL), state).toString(), controller ? controller.signal : undefined);
+      if (isStale(myEpoch)) return;
       if (response.status === 401) {
-        forgetToken();
-        state.token = '';
-        showGate('密钥无效或已停用，请重新输入。');
+        dropSession('密钥无效或已停用，请重新输入。');
         return;
       }
       if (!response.ok) {
         showBanner('查询失败（HTTP ' + response.status + '）。');
         return;
       }
-      renderUsage(await response.json());
+      var payload = parseBody(await response.text());
+      if (isStale(myEpoch)) return;
+      renderUsage(payload);
       hideBanner();
       showDashboard();
-    } catch (_) {
+      if (opts.remember) persistToken(sessionStore(), localStore(), originOf(''), state.token, opts.remember === 'local');
+    } catch (err) {
+      if (isStale(myEpoch) || (err && err.name === 'AbortError')) return;
       showBanner('网络异常，请稍后重试。');
     } finally {
-      setBusy(false);
+      if (!isStale(myEpoch)) {
+        inflight = null;
+        setBusy(false);
+      }
     }
   }
 
   async function openSnapshot(id) {
+    var myEpoch = newEpoch();
+    var controller = typeof AbortController === 'function' ? new AbortController() : null;
+    inflight = controller;
     var response;
     try {
-      response = await apiFetch(buildCaptureURL(id));
-    } catch (_) {
+      response = await apiFetch(buildCaptureURL(baseURL(CAPTURE_URL), id).toString(), controller ? controller.signal : undefined);
+    } catch (err) {
+      if (isStale(myEpoch) || (err && err.name === 'AbortError')) return;
       showBanner('网络异常，请稍后重试。');
       return;
     }
+    if (isStale(myEpoch)) return;
     if (response.status === 401) {
-      showGate('密钥无效或已停用，请重新输入。');
+      dropSession('密钥无效或已停用，请重新输入。');
       return;
     }
     if (!response.ok) {
+      // 其它密钥、未知请求与不可用快照一律是同一种结果，页面不区分。
       showBanner('请求快照不可用。');
       return;
     }
-    renderSnapshot(await response.json());
+    var detail;
+    try {
+      detail = parseBody(await response.text());
+    } catch (err) {
+      showBanner('请求快照响应无法解析。');
+      return;
+    }
+    if (isStale(myEpoch)) return;
+    inflight = null;
+    renderSnapshot(detail);
     var modal = el('capture-modal');
-    if (typeof modal.showModal === 'function') modal.showModal();
+    if (modal && typeof modal.showModal === 'function') modal.showModal();
   }
 
   /* ------------------------------------------------------------------ *
    * 渲染
    * ------------------------------------------------------------------ */
 
-  function renderUsage(data) {
-    var key = data.key || {};
-    var summary = data.summary || {};
-    var tokens = summary.tokens || {};
-
-    el('key-label').textContent = key.label ? key.label : '密钥概览';
-    el('key-state').textContent = (key.enabled ? '已启用' : '已停用') +
-      (key.expires_at ? ' · 到期 ' + formatDateTime(key.expires_at) : '');
-    el('retention').textContent = data.retention_from ? '保留自 ' + formatDateTime(data.retention_from) : '';
-
+  function renderQuotas(key) {
     var quotas = el('quotas');
     clear(quotas);
-    quotas.appendChild(card('已用额度', formatMicroUSD(key.spent_micro_usd)));
-    quotas.appendChild(card('在途预占', formatMicroUSD(key.held_micro_usd)));
-    quotas.appendChild(card('总额度', key.quota_micro_usd ? formatMicroUSD(key.quota_micro_usd) : '不限'));
-    quotas.appendChild(card('日额度', key.daily_micro_usd ? formatMicroUSD(key.daily_micro_usd) : '不限'));
-    quotas.appendChild(card('周额度', key.weekly_micro_usd ? formatMicroUSD(key.weekly_micro_usd) : '不限'));
-    quotas.appendChild(card('月额度', key.monthly_micro_usd ? formatMicroUSD(key.monthly_micro_usd) : '不限'));
+    quotas.appendChild(card('已用额度', formatMoney(key.spent_micro_usd, state.currency, state.rate)));
+    quotas.appendChild(card('在途预占', formatMoney(key.held_micro_usd, state.currency, state.rate)));
+    quotas.appendChild(card('总额度', key.quota_micro_usd ? formatMoney(key.quota_micro_usd, state.currency, state.rate) : '不限'));
+    quotas.appendChild(card('日额度', key.daily_micro_usd ? formatMoney(key.daily_micro_usd, state.currency, state.rate) : '不限'));
+    quotas.appendChild(card('周额度', key.weekly_micro_usd ? formatMoney(key.weekly_micro_usd, state.currency, state.rate) : '不限'));
+    quotas.appendChild(card('月额度', key.monthly_micro_usd ? formatMoney(key.monthly_micro_usd, state.currency, state.rate) : '不限'));
     quotas.appendChild(card('并发上限', key.max_concurrent ? formatInt(key.max_concurrent) : '不限'));
     if (key.allowed_models && key.allowed_models.length) {
       quotas.appendChild(card('允许模型', key.allowed_models.join('、')));
+    } else {
+      quotas.appendChild(card('允许模型', '不限'));
     }
+  }
 
+  function renderTokenLimits(key) {
+    var container = el('token-limits');
+    clear(container);
+    var limits = key.model_token_limits || [];
+    el('token-limits-state').textContent = limits.length
+      ? limits.length + ' 个模型设有 Token 上限'
+      : '未设置模型 Token 上限';
+    if (!limits.length) {
+      container.appendChild(card('模型 Token 限额', '未设置'));
+      return;
+    }
+    limits.forEach(function (limit) {
+      var box = text('div', 'card');
+      box.appendChild(text('span', 'card-label', limit.model || '未标记模型'));
+      box.appendChild(text('span', 'card-value', '总量 ' + tokenLimitText(limit.total)));
+      box.appendChild(text('span', 'card-note', '日 ' + tokenLimitText(limit.daily) +
+        ' · 周 ' + tokenLimitText(limit.weekly) +
+        ' · 月 ' + tokenLimitText(limit.monthly)));
+      container.appendChild(box);
+    });
+  }
+
+  function renderStats(summary) {
+    var tokens = summary.tokens || {};
     var stats = el('stats');
     clear(stats);
     stats.appendChild(card('请求数', formatInt(summary.requests)));
     stats.appendChild(card('执行次数', formatInt(summary.executions)));
     stats.appendChild(card('失败请求', formatInt(summary.failed), summary.failed ? 'danger' : null));
     stats.appendChild(card('未结算请求', formatInt(summary.pending), summary.pending ? 'warn' : null));
-    stats.appendChild(card('执行成本', formatMicroUSD(summary.cost_micro_usd)));
-    stats.appendChild(card('人工补记', formatMicroUSD(summary.adjustment_micro_usd)));
-    stats.appendChild(card('总 Token', formatInt(tokens.total)));
+    stats.appendChild(card('执行成本', formatMoney(summary.cost_micro_usd, state.currency, state.rate)));
+    stats.appendChild(card('人工补记', formatMoney(summary.adjustment_micro_usd, state.currency, state.rate)));
+    ['input', 'output', 'reasoning', 'cache_read', 'cache_write', 'total'].forEach(function (slot) {
+      if (tokens[slot] === undefined && slot !== 'total') return;
+      stats.appendChild(card('Token·' + tokenSlotLabel(slot), formatToken(tokens[slot], state.tokenUnit)));
+    });
     if (typeof summary.cache_read_ratio === 'number') {
       stats.appendChild(card('缓存读取占比', (summary.cache_read_ratio * 100).toFixed(1) + '%'));
     }
+  }
+
+  function tokenSlotLabel(slot) {
+    return {
+      input: '输入',
+      output: '输出',
+      reasoning: '思考',
+      cache_read: '缓存读',
+      cache_write: '缓存写',
+      total: '合计',
+    }[slot] || slot;
+  }
+
+  function renderUsage(data) {
+    var key = data.key || {};
+    var summary = data.summary || {};
+
+    el('key-label').textContent = key.label ? key.label : '密钥概览';
+    el('key-state').textContent = (key.enabled ? '已启用' : '已停用') +
+      (key.expires_at ? ' · 到期 ' + formatMoment(key.expires_at) : '');
+    el('retention').textContent = data.retention_from ? '保留自 ' + formatMoment(data.retention_from) : '';
+
+    renderQuotas(key);
+    renderTokenLimits(key);
+    state.summary = summary;
+    renderStats(summary);
 
     state.trend = data.trend || [];
     renderTrend();
@@ -309,21 +728,24 @@
   }
 
   // 共享图表组件负责请求数 / Token / 费用三条趋势；缺席时降级为内置条形。
+  //
+  // 关键：共享渲染器按容器复用 ECharts 实例，因此在这里绝不清空容器——
+  // 一旦移除已有 canvas/svg，实例就与 DOM 脱钩，重新渲染只会得到空白图。
   function renderTrend() {
     var containers = { requests: el('trend-requests'), tokens: el('trend-tokens'), cost: el('trend-cost') };
-    Object.keys(containers).forEach(function (name) { clear(containers[name]); });
+    var shared = charts();
     el('trend-empty').hidden = state.trend.length > 0;
 
-    var shared = window.CMCharts;
     if (shared && typeof shared.render === 'function') {
       shared.render(containers, state.trend, {
         bucket: state.grain,
         tokenUnit: state.tokenUnit,
-        currency: 'USD',
-        rate: USD_CNY_RATE,
+        currency: state.currency,
+        rate: state.rate,
       });
       return;
     }
+    Object.keys(containers).forEach(function (name) { clear(containers[name]); });
     renderTrendFallback(containers);
   }
 
@@ -334,16 +756,16 @@
       max = Math.max(max, trendValue(point, 'tokens'), trendValue(point, 'requests'), trendValue(point, 'cost'));
     });
     state.trend.forEach(function (point) {
-      containers.requests.appendChild(fallbackBar(formatDay(point.time), trendValue(point, 'requests'), max, formatInt));
-      containers.tokens.appendChild(fallbackBar(formatDay(point.time), trendValue(point, 'tokens'), max, formatInt));
-      containers.cost.appendChild(fallbackBar(formatDay(point.time), trendValue(point, 'cost'), max, formatMicroUSD));
+      containers.requests.appendChild(fallbackBar(bucketText(point.time, state.grain), trendValue(point, 'requests'), max, function (value) { return formatInt(value); }));
+      containers.tokens.appendChild(fallbackBar(bucketText(point.time, state.grain), trendValue(point, 'tokens'), max, function (value) { return formatToken(value, state.tokenUnit); }));
+      containers.cost.appendChild(fallbackBar(bucketText(point.time, state.grain), trendValue(point, 'cost'), max, function (value) { return formatMoney(value, state.currency, state.rate); }));
     });
   }
 
   function trendValue(point, metric) {
-    if (metric === 'tokens') return Number((point.tokens || {}).total) || 0;
-    if (metric === 'requests') return Number(point.requests) || 0;
-    return Number(point.cost_micro_usd) || 0;
+    if (metric === 'tokens') return Number(intText(point.tokens ? point.tokens.total : 0)) || 0;
+    if (metric === 'requests') return Number(intText(point.requests)) || 0;
+    return Number(intText(point.cost_micro_usd)) || 0;
   }
 
   function fallbackBar(label, value, max, format) {
@@ -361,21 +783,14 @@
   function renderRecent(items, total, page, pageSize) {
     var body = el('recent-body');
     clear(body);
-    el('recent-state').textContent = total + ' 条记录';
+    el('recent-state').textContent = formatInt(total) + ' 条记录';
     items.forEach(function (item) {
       var row = document.createElement('tr');
-      row.appendChild(text('td', null, formatDateTime(item.started_at)));
+      row.appendChild(text('td', null, formatMoment(item.started_at)));
       row.appendChild(text('td', 'model', item.model || '—'));
       row.appendChild(text('td', null, requestStatus(item)));
-      var executions = item.executions || [];
-      var tokens = executions.reduce(function (sum, execution) {
-        return sum + Number((execution.tokens || {}).total || 0);
-      }, 0);
-      row.appendChild(text('td', 'num', formatInt(tokens)));
-      var cost = executions.reduce(function (sum, execution) {
-        return sum + (execution.cost_micro_usd == null ? 0 : Number(execution.cost_micro_usd));
-      }, 0);
-      row.appendChild(text('td', 'num', formatMicroUSD(cost + Number(item.adjustment_micro_usd || 0))));
+      row.appendChild(text('td', 'num', formatToken(executionTokens(item.executions), state.tokenUnit)));
+      row.appendChild(text('td', 'num', formatMoney(executionCost(item.executions), state.currency, state.rate)));
       var action = text('td', null);
       var button = text('button', null, '查看快照');
       button.type = 'button';
@@ -404,8 +819,8 @@
 
     var meta = text('p', 'snapshot-meta');
     meta.appendChild(text('span', 'snapshot-status', SNAPSHOT_LABELS[detail.status] || detail.status || '未知'));
-    meta.appendChild(document.createTextNode(' · 记录时间 ' + formatDateTime(detail.at) +
-      (detail.expires_at ? ' · 保留至 ' + formatDateTime(detail.expires_at) : '')));
+    meta.appendChild(document.createTextNode(' · 记录时间 ' + formatMoment(detail.at) +
+      (detail.expires_at ? ' · 保留至 ' + formatMoment(detail.expires_at) : '')));
     body.appendChild(meta);
 
     if (detail.status !== 'captured') {
@@ -434,6 +849,64 @@
   }
 
   /* ------------------------------------------------------------------ *
+   * 主题与展示偏好
+   * ------------------------------------------------------------------ */
+
+  function systemIsDark() {
+    try {
+      return !!(root.matchMedia && root.matchMedia('(prefers-color-scheme: dark)').matches);
+    } catch (err) {
+      return false;
+    }
+  }
+
+  function applyTheme() {
+    var theme = preferences.readTheme(localStore());
+    var palette = preferences.resolvePalette(theme, systemIsDark());
+    try {
+      document.documentElement.dataset.palette = palette;
+    } catch (err) {
+      /* 非标准 DOM：忽略 */
+    }
+    // 图表需要在主题切换后重新上色，否则会停留在旧底色。
+    var chartApi = charts();
+    if (chartApi && typeof chartApi.refreshTheme === 'function') {
+      try {
+        chartApi.refreshTheme(palette);
+      } catch (err) {
+        /* 忽略刷新失败 */
+      }
+    }
+  }
+
+  function syncUnitControls() {
+    var unit = el('token-unit');
+    if (unit) unit.value = state.tokenUnit;
+    var currency = el('currency');
+    if (currency) currency.value = state.currency;
+    var rate = el('rate');
+    if (rate) rate.value = String(state.rate);
+    var cny = state.currency === 'CNY';
+    if (el('rate')) el('rate').hidden = !cny;
+    if (el('rate-label')) el('rate-label').hidden = !cny;
+  }
+
+  function readUnitPreferences() {
+    var units = preferences.readUnits(localStore());
+    state.tokenUnit = normalizeTokenUnit(units.tokenUnit);
+    state.currency = normalizeCurrency(units.currency);
+    state.rate = normalizeRate(units.currencyRate);
+  }
+
+  function persistUnitPreferences() {
+    preferences.writeUnits(localStore(), {
+      tokenUnit: state.tokenUnit,
+      currency: state.currency,
+      currencyRate: state.rate,
+    });
+  }
+
+  /* ------------------------------------------------------------------ *
    * 事件绑定
    * ------------------------------------------------------------------ */
 
@@ -453,17 +926,12 @@
     }
     state.token = token;
     state.page = 1;
-    persistToken(token, el('remember-key').checked);
-    loadUsage();
+    var remember = el('remember-key').checked ? 'local' : 'session';
+    loadUsage({ remember: remember });
   }
 
   function switchKey() {
-    forgetToken();
-    state.token = '';
-    el('key').value = '';
-    el('remember-key').checked = false;
-    hideBanner();
-    showGate('');
+    dropSession('');
     el('key').focus();
   }
 
@@ -472,34 +940,82 @@
     el('switch-key').addEventListener('click', switchKey);
     el('refresh').addEventListener('click', function () { state.page = 1; loadUsage(); });
     el('range').addEventListener('change', function () { state.range = el('range').value; state.page = 1; loadUsage(); });
-    el('token-unit').addEventListener('change', function () { state.tokenUnit = el('token-unit').value; renderTrend(); });
+    el('token-unit').addEventListener('change', function () {
+      state.tokenUnit = normalizeTokenUnit(el('token-unit').value);
+      persistUnitPreferences();
+      renderTrend();
+      if (state.summary) renderStats(state.summary);
+    });
+    el('currency').addEventListener('change', function () {
+      state.currency = normalizeCurrency(el('currency').value);
+      persistUnitPreferences();
+      syncUnitControls();
+      renderTrend();
+    });
+    el('rate').addEventListener('change', function () {
+      state.rate = normalizeRate(el('rate').value);
+      persistUnitPreferences();
+      syncUnitControls();
+      renderTrend();
+    });
     el('grain-switch').addEventListener('click', function (event) {
       var target = event.target.closest('[data-grain]');
       if (!target) return;
-      state.grain = target.getAttribute('data-grain');
+      state.grain = normalizeGrain(target.getAttribute('data-grain'));
       syncGrainSwitch();
       state.page = 1;
       loadUsage();
     });
     el('prev').addEventListener('click', function () { if (state.page > 1) { state.page -= 1; loadUsage(); } });
     el('next').addEventListener('click', function () { state.page += 1; loadUsage(); });
-    el('capture-close').addEventListener('click', function () { el('capture-modal').close(); });
+    el('capture-close').addEventListener('click', closeSnapshot);
+
+    // CPA 主题（dark/light/auto，含跨标签页写入）与系统配色变化都要同步，
+    // 并让已渲染的图表按新底色重新上色。
+    root.addEventListener('storage', function (event) {
+      if (!event || event.key === null || event.key === preferences.CPA_THEME_KEY) {
+        applyTheme();
+      }
+    });
+    try {
+      if (root.matchMedia) {
+        var query = root.matchMedia('(prefers-color-scheme: dark)');
+        var listener = function () { applyTheme(); };
+        if (typeof query.addEventListener === 'function') query.addEventListener('change', listener);
+        else if (typeof query.addListener === 'function') query.addListener(listener);
+      }
+    } catch (err) {
+      /* 不支持主题查询的环境忽略 */
+    }
+  }
+
+  // 就绪标记：脚本已绑定事件，静态外壳之外的验收/调试可以据此等待，而不是靠
+  // 猜测解析完成时机（HTML 元素在脚本执行前就已存在）。
+  function markReady() {
+    try {
+      document.documentElement.dataset.lookupReady = '1';
+    } catch (err) {
+      /* 非标准 DOM：忽略 */
+    }
   }
 
   function boot() {
     bind();
+    applyTheme();
+    readUnitPreferences();
+    syncUnitControls();
     syncGrainSwitch();
-    var remembered = readRememberedToken();
-    if (!remembered) {
+    markReady();
+    var remembered = readStoredToken(sessionStore(), localStore(), originOf(''));
+    if (!remembered.token) {
       showGate('');
       return;
     }
-    el('key').value = remembered;
-    el('remember-key').checked = tokenIsPersisted();
-    state.token = remembered;
+    el('key').value = remembered.token;
+    el('remember-key').checked = remembered.remembered;
+    state.token = remembered.token;
     loadUsage();
   }
 
-  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
-  else boot();
-})();
+  return api;
+});
