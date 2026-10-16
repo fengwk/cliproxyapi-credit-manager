@@ -711,7 +711,402 @@ async function main() {
     await cdp.screenshot('13-mobile-capture.png');
     await cdp.send('Emulation.clearDeviceMetricsOverride');
 
-    /* --- 12. 控制台错误 --- */
+    /* --- 12. 会话边界：登出/重新登录必须作废在途请求与已渲染数据 --- */
+
+    // 受控 fetch：测试显式决定每个请求何时、以什么结果返回；不依赖墙钟等待，也不放宽断言。
+    const cmFetch = (expr) =>
+      cdp.evaluate(`(() => {
+        if (!window.__cmFetch) {
+          const calls = [];
+          const controller = {
+            calls: calls,
+            active: false,
+            real: null,
+            install() {
+              if (!this.active) {
+                this.real = window.fetch.bind(window);
+                window.fetch = (input, init) => new Promise((resolve, reject) => {
+                  calls.push({ path: String(input), init: init, resolve: resolve, reject: reject, settled: false });
+                });
+                this.active = true;
+              }
+              return true;
+            },
+            uninstall() {
+              if (this.active) {
+                window.fetch = this.real;
+                this.active = false;
+              }
+              return true;
+            },
+            reset() {
+              calls.length = 0;
+              return true;
+            },
+            pending() {
+              return calls.filter((call) => !call.settled).length;
+            },
+            fulfill(index, status, body) {
+              const call = calls[index];
+              if (!call || call.settled) return false;
+              call.settled = true;
+              call.resolve({ ok: status >= 200 && status < 300, status: status, text: () => Promise.resolve(body) });
+              return true;
+            },
+            reject(index, message) {
+              const call = calls[index];
+              if (!call || call.settled) return false;
+              call.settled = true;
+              call.reject(new Error(message || 'network down'));
+              return true;
+            },
+          };
+          window.__cmFetch = controller;
+        }
+        return window.__cmFetch.${expr};
+      })()`);
+    const deferFetch = async () => {
+      await cmFetch('reset()');
+      await cmFetch('install()');
+    };
+    const realFetch = () => cmFetch('uninstall()');
+    // 排空微任务与宏任务队列，让受控的 promise 链完全执行；不依赖固定时长。
+    const drain = () =>
+      cdp.evaluate(
+        'new Promise((resolve) => { let n = 0; const step = () => { if (++n >= 12) return resolve(true); setTimeout(step, 0); }; setTimeout(step, 0); })'
+      );
+    const loginFresh = async (label) => {
+      await cdp.send('Page.navigate', { url: shellUrl });
+      await cdp.waitFor("document.querySelector('#login-view') && !document.querySelector('#login-view').hidden", 10000, label + '：登录界面');
+      await cdp.setValue('#management-key', MANAGEMENT_KEY);
+      await cdp.click('#login-button');
+      await cdp.waitFor("!document.querySelector('#main-view').hidden", 10000, label + '：主视图');
+      await cdp.waitFor("document.querySelectorAll('#usage-items .row-title').length > 0", 10000, label + '：使用统计');
+    };
+    // 单个子场景独立成败：断言失败或意外异常都不会中断其余检查。
+    const step = async (name, fn) => {
+      try {
+        await fn();
+      } catch (err) {
+        check(name, false, '异常：' + String((err && err.message) || err));
+      }
+    };
+    // 表单编辑器把自己的校验错误写在自己的错误行里（弹窗级错误行由 handle.setError 使用）。
+    const editorError = () => cdp.text('.modal .modal-body .inline-error');
+
+    await step('登出作废在途的创建请求', async () => {
+      await loginFresh('登出在途创建');
+      await deferFetch();
+      await cdp.clickText('.tab', '客户端 Key');
+      await cdp.clickText('#panel-keys button', '新建 Key');
+      await cdp.waitFor("document.querySelector('.modal #key-label')", 10000, '新建 Key 弹窗');
+      await cdp.setValue('.modal #key-label', '登出前提交');
+      const renderedBeforeLogout = await cdp.text('#usage-summary');
+      await cdp.clickText('.modal button', '创建');
+      check('创建请求已发出并处于挂起状态', (await cmFetch('pending()')) === 1, 'pending=' + (await cmFetch('pending()')));
+      await cdp.click('#logout-button');
+      const callsAfterLogout = await cmFetch('calls.length');
+      check('登出本身不发起新的网络请求', callsAfterLogout === 1, 'calls=' + callsAfterLogout);
+      check(
+        '登出立即关闭弹窗并回到登录界面',
+        (await cdp.evaluate("document.querySelectorAll('.modal').length")) === 0 &&
+          (await cdp.evaluate("!document.querySelector('#login-view').hidden && document.querySelector('#main-view').hidden"))
+      );
+      check(
+        '登出清空已渲染的账务内容',
+        renderedBeforeLogout.includes('执行成本') &&
+          (await cdp.text('#usage-summary')).trim() === '' &&
+          (await cdp.text('#usage-items')).trim() === '',
+        renderedBeforeLogout.replace(/\n/g, ' ').slice(0, 60)
+      );
+      await cmFetch(
+        `fulfill(0, 201, ${JSON.stringify('{"item":{"id":"key-late","spec":{"label":"登出前提交"}},"key":"sk-late-secret-0001"}')})`
+      );
+      await drain();
+      check('登出后到达的创建响应不弹明文密钥', (await cdp.evaluate("document.querySelectorAll('.secret-box').length")) === 0);
+      check(
+        '登出后到达的创建响应不补拉 Key 列表',
+        (await cmFetch('calls.length')) === 1 && (await cmFetch('pending()')) === 0,
+        'calls=' + (await cmFetch('calls.length'))
+      );
+      check(
+        '登出后到达的创建响应不写回会话状态',
+        (await cdp.evaluate('CM.state.key')) === '' &&
+          (await cdp.evaluate('CM.state.keys.items')) === null &&
+          (await cdp.evaluate('CM.state.usage.report')) === null
+      );
+      check('登出后没有残留的明文密钥弹窗', (await cdp.evaluate("document.querySelector('#modal-root').hidden === true")) === true);
+    });
+
+    await step('同一密钥重新登录后旧会话的迟到 401 不得踢掉新会话', async () => {
+      await loginFresh('迟到 401');
+      await deferFetch();
+      await cdp.clickText('.tab', '客户端 Key');
+      await cdp.click('#keys-refresh');
+      check('刷新 Key 列表的请求处于挂起状态', (await cmFetch('pending()')) === 1, 'pending=' + (await cmFetch('pending()')));
+      await realFetch();
+      await cdp.click('#logout-button');
+      await cdp.setValue('#management-key', MANAGEMENT_KEY);
+      await cdp.click('#login-button');
+      await cdp.waitFor("!document.querySelector('#main-view').hidden", 10000, '同一密钥重新登录');
+      await cdp.waitFor("document.querySelectorAll('#usage-items .row-title').length > 0", 10000, '新会话使用统计');
+      await cmFetch(`fulfill(0, 401, ${JSON.stringify('{"error":"invalid management key"}')})`);
+      await drain();
+      check(
+        '旧会话的迟到 401 不会把新会话踢下线',
+        (await cdp.evaluate("!document.querySelector('#main-view').hidden && document.querySelector('#login-view').hidden")) === true
+      );
+      check('迟到 401 之后新会话仍然持有密钥', (await cdp.evaluate('CM.state.key')) === MANAGEMENT_KEY);
+      check('迟到 401 不写入登录错误', (await cdp.evaluate("document.querySelector('#login-error').hidden")) === true);
+      check('迟到 401 之后新会话数据仍然可见', (await cdp.text('#usage-items')).includes('req-001'));
+    });
+
+    await step('当前会话的真实 401 仍然回到登录界面', async () => {
+      await loginFresh('当前会话 401');
+      await deferFetch();
+      await cdp.clickText('.tab', '客户端 Key');
+      await cdp.click('#keys-refresh');
+      await cmFetch(`fulfill(0, 401, ${JSON.stringify('{"error":"invalid management key"}')})`);
+      await drain();
+      check(
+        '当前会话的 401 仍然回到登录界面',
+        (await cdp.evaluate("!document.querySelector('#login-view').hidden && document.querySelector('#main-view').hidden")) === true
+      );
+      check('当前会话的 401 显示服务端错误', (await cdp.text('#login-error')).includes('invalid management key'), await cdp.text('#login-error'));
+      check('当前会话的 401 清空内存中的密钥', (await cdp.evaluate('CM.state.key')) === '');
+    });
+
+    /* --- 13. 乱序返回的使用统计：最新一次查询必须胜出 --- */
+
+    await step('乱序返回的旧查询不得覆盖最新查询', async () => {
+      await loginFresh('乱序使用统计');
+      const usageBody = (requests, search) =>
+        JSON.stringify({
+          summary: {
+            requests: requests,
+            executions: requests,
+            failed: 0,
+            pending: 0,
+            cost_micro_usd: 0,
+            adjustment_micro_usd: 0,
+            tokens: { input: 0, cache_read: 0, cache_write: 0, output: 0, reasoning: 0, total: 0 },
+            complete_executions: 0,
+          },
+          trend: [],
+          items: [],
+          total: requests,
+          page: 1,
+          page_size: 20,
+          retention_from: '2026-07-01T00:00:00Z',
+          mock_search: search,
+        });
+      await deferFetch();
+      await cdp.setValue('#usage-search', 'A');
+      await cdp.click('#usage-apply');
+      await cdp.setValue('#usage-search', 'B');
+      await cdp.click('#usage-apply');
+      check('两次查询都已发出并处于挂起状态', (await cmFetch('pending()')) === 2, 'pending=' + (await cmFetch('pending()')));
+      // 先返回较新的 B，再返回更早发出的 A：A 属于过期响应。
+      await cmFetch(`fulfill(1, 200, ${JSON.stringify(usageBody(222, 'B'))})`);
+      await drain();
+      await cmFetch(`fulfill(0, 200, ${JSON.stringify(usageBody(111, 'A'))})`);
+      await drain();
+      const statusAfter = await cdp.text('#usage-status');
+      check('乱序返回时最新查询胜出（状态行）', statusAfter.includes('search=B') && !statusAfter.includes('search=A'), statusAfter);
+      check(
+        '乱序返回时旧响应不覆盖最新结果',
+        (await cdp.text('#usage-summary')).includes('222') && !(await cdp.text('#usage-summary')).includes('111'),
+        (await cdp.text('#usage-summary')).replace(/\n/g, ' ').slice(0, 80)
+      );
+      check('乱序返回时明细总数来自最新查询', (await cdp.text('#usage-total')).includes('222'), await cdp.text('#usage-total'));
+      check('乱序返回后结束加载态', !statusAfter.includes('正在读取'), statusAfter);
+      await realFetch();
+    });
+
+    /* --- 14. 金额输入：非法美元输入必须阻止提交 --- */
+
+    await step('财务处理弹窗拒绝非法美元输入', async () => {
+      await loginFresh('财务金额校验');
+      await cdp.clickText('#usage-items .card:nth-child(3) button', '处理待定');
+      await cdp.waitFor("document.querySelector('.modal #resolve-action')", 10000, '财务弹窗');
+      await cdp.evaluate("document.querySelector('.modal #resolve-action').value='charge'");
+      await cdp.setValue('.modal #resolve-reason', '非法美元输入必须被拒绝');
+      await cdp.evaluate("document.querySelector('.modal #resolve-confirm').checked = true");
+      await cdp.setModalMoney('金额', 'usd', '1');
+      check('财务处理弹窗的合法美元输入精确换算', (await cdp.modalMoney('金额', 'micro')) === '1000000', await cdp.modalMoney('金额', 'micro'));
+      await cdp.setModalMoney('金额', 'usd', '0.0000001');
+      const resolveBefore = (await hitsOf('/api/resolve')).length;
+      await cdp.clickText('.modal button', '提交处理');
+      check('非法的美元输入被拒绝并说明原因', (await cdp.text('.modal .inline-error')).includes('美元输入无效'), await cdp.text('.modal .inline-error'));
+      check('非法美元输入不会把旧的微美元残留值提交出去', (await hitsOf('/api/resolve')).length === resolveBefore, 'hits=' + (await hitsOf('/api/resolve')).length);
+    });
+
+    await step('修正后的美元输入按精确微美元提交', async () => {
+      await loginFresh('财务金额修正');
+      await cdp.clickText('#usage-items .card:nth-child(3) button', '处理待定');
+      await cdp.waitFor("document.querySelector('.modal #resolve-action')", 10000, '财务弹窗');
+      await cdp.evaluate("document.querySelector('.modal #resolve-action').value='charge'");
+      await cdp.setValue('.modal #resolve-reason', '修正后按精确金额提交');
+      await cdp.evaluate("document.querySelector('.modal #resolve-confirm').checked = true");
+      await cdp.setModalMoney('金额', 'usd', '2');
+      await cdp.clickText('.modal button', '提交处理');
+      await cdp.waitFor("document.querySelector('.toast')", 10000, '财务处理已提交');
+      check('修正美元输入后按精确微美元提交', JSON.parse((await debug('resolve')).body).amount_micro_usd === 2000000, (await debug('resolve')).body);
+    });
+
+    await step('价格弹窗拒绝非法美元输入并保留可选思考价格的语义', async () => {
+      await loginFresh('价格金额校验');
+      await cdp.clickText('.tab', '价格');
+      await cdp.waitFor("document.querySelectorAll('#prices-list tbody tr').length === 3", 10000, '价格列表');
+      await cdp.clickText('#panel-prices button', '新增价格');
+      await cdp.waitFor("document.querySelector('.modal #price-model')", 10000, '新增价格弹窗');
+      await cdp.setValue('.modal #price-model', 'mock-invalid-usd');
+      await cdp.setModalMoney('输入', 'micro', '1000000');
+      await cdp.setModalMoney('输入', 'usd', 'garbage');
+      const putCount = async () => (await hitsOf('/api/prices')).filter((entry) => entry.startsWith('PUT ')).length;
+      const putBefore = await putCount();
+      await cdp.clickText('.modal button', '保存价格');
+      check('价格弹窗拒绝非法的美元输入', (await editorError()).includes('美元输入无效'), await editorError());
+      check('价格弹窗的非法美元输入不会提交请求', (await putCount()) === putBefore);
+      // 思考价格：微美元留空但美元输入非法时，绝不能静默回退为「按输出计费」。
+      await cdp.setModalMoney('输入', 'usd', '1');
+      await cdp.setModalMoney('思考', 'usd', 'garbage');
+      await cdp.clickText('.modal button', '保存价格');
+      const reasoningError = await editorError();
+      check(
+        '思考价格的非法美元输入不会被静默忽略',
+        reasoningError.includes('思考价格') && reasoningError.includes('美元输入无效'),
+        reasoningError
+      );
+      check('思考价格校验失败时不提交价格', (await putCount()) === putBefore);
+      // 修正后仍然可以正常提交：思考价格为空时才按输出计费。
+      await cdp.setModalMoney('思考', 'usd', '0.5');
+      await cdp.clickText('.modal button', '保存价格');
+      await cdp.waitFor("document.querySelector('.toast')", 10000, '价格已保存');
+      const priceBody = JSON.parse((await debug('prices:put')).body);
+      check(
+        '修正后的价格请求体精确且保留思考价格',
+        priceBody.model === 'mock-invalid-usd' && priceBody.rates.input === 1000000 && priceBody.rates.reasoning === 500000,
+        JSON.stringify(priceBody)
+      );
+    });
+
+    await step('Key 弹窗拒绝非法美元输入', async () => {
+      await loginFresh('Key 金额校验');
+      await cdp.clickText('.tab', '客户端 Key');
+      await cdp.waitFor("document.querySelectorAll('#keys-list tbody tr').length === 2", 10000, 'Key 列表');
+      await cdp.clickText('#panel-keys button', '新建 Key');
+      await cdp.waitFor("document.querySelector('.modal #key-label')", 10000, '新建 Key 弹窗');
+      await cdp.setValue('.modal #key-label', '金额校验');
+      await cdp.setModalMoney('总额度', 'micro', '1234567');
+      await cdp.setModalMoney('总额度', 'usd', 'garbage');
+      const postCount = async () => (await hitsOf('/api/keys')).filter((entry) => entry.startsWith('POST ')).length;
+      const postBefore = await postCount();
+      await cdp.clickText('.modal button', '创建');
+      check('Key 弹窗拒绝非法的美元输入', (await editorError()).includes('美元输入无效'), await editorError());
+      check('Key 弹窗的非法美元输入不会提交请求', (await postCount()) === postBefore);
+    });
+
+    /* --- 15. 自定义密钥材料：原样下发，留空才由服务端生成 --- */
+
+    await step('轮换时原样下发自定义密钥并由后端校验', async () => {
+      await loginFresh('轮换密钥材料');
+      await cdp.clickText('.tab', '客户端 Key');
+      await cdp.waitFor("document.querySelectorAll('#keys-list tbody tr').length === 2", 10000, 'Key 列表');
+      await cdp.clickText('#keys-list tbody tr:first-child button', '轮换密钥');
+      await cdp.waitFor("document.querySelector('.modal #rotate-key')", 10000, '轮换弹窗');
+      await cdp.setValue('.modal #rotate-key', '  sk-raw-keep  ');
+      await cdp.evaluate("document.querySelector('.modal #rotate-confirm').checked = true");
+      await cdp.clickText('.modal button', '确认轮换');
+      await drain();
+      check('轮换请求体原样保留自定义密钥的首尾空白', JSON.parse((await debug('keys:rotate')).body).key === '  sk-raw-keep  ', (await debug('keys:rotate')).body);
+      check('带首尾空白的自定义密钥由服务端校验拒绝', (await cdp.text('.modal .inline-error')).includes('whitespace'), await cdp.text('.modal .inline-error'));
+      check('被拒绝的轮换不展示新的明文密钥', (await cdp.evaluate("document.querySelectorAll('.secret-box').length")) === 0);
+      // 全空白既不能被裁剪成空串，也不能退化成「由服务端生成」。
+      await cdp.setValue('.modal #rotate-key', '   ');
+      await cdp.clickText('.modal button', '确认轮换');
+      await drain();
+      check('全空白的自定义密钥原样下发', JSON.parse((await debug('keys:rotate')).body).key === '   ', (await debug('keys:rotate')).body);
+      check('全空白的自定义密钥仍然被拒绝', (await cdp.text('.modal .inline-error')).includes('whitespace'), await cdp.text('.modal .inline-error'));
+    });
+
+    await step('轮换的合法自定义密钥与留空生成', async () => {
+      await loginFresh('轮换密钥成功路径');
+      await cdp.clickText('.tab', '客户端 Key');
+      await cdp.waitFor("document.querySelectorAll('#keys-list tbody tr').length === 2", 10000, 'Key 列表');
+      await cdp.clickText('#keys-list tbody tr:first-child button', '轮换密钥');
+      await cdp.waitFor("document.querySelector('.modal #rotate-key')", 10000, '轮换弹窗');
+      await cdp.setValue('.modal #rotate-key', 'sk-custom-rotate-01');
+      await cdp.evaluate("document.querySelector('.modal #rotate-confirm').checked = true");
+      await cdp.clickText('.modal button', '确认轮换');
+      await cdp.waitFor("document.querySelector('.modal .secret-box')", 10000, '合法自定义密钥轮换成功');
+      check('合法自定义密钥轮换成功后展示新密钥', (await cdp.text('.modal .secret-box')).includes('sk-mock-rotated'));
+      await cdp.clickText('.modal button', '我已保存，关闭');
+      await cdp.clickText('#keys-list tbody tr:first-child button', '轮换密钥');
+      await cdp.waitFor("document.querySelector('.modal #rotate-key')", 10000, '再次打开轮换弹窗');
+      await cdp.evaluate("document.querySelector('.modal #rotate-confirm').checked = true");
+      await cdp.clickText('.modal button', '确认轮换');
+      await cdp.waitFor("document.querySelector('.modal .secret-box')", 10000, '留空轮换成功');
+      const generatedRotate = JSON.parse((await debug('keys:rotate')).body);
+      check('留空自定义密钥时不下发 key 字段', !Object.prototype.hasOwnProperty.call(generatedRotate, 'key'), JSON.stringify(generatedRotate));
+      await cdp.clickText('.modal button', '我已保存，关闭');
+    });
+
+    await step('新建 Key 支持可选的自定义密钥材料', async () => {
+      await loginFresh('新建密钥材料');
+      await cdp.clickText('.tab', '客户端 Key');
+      await cdp.waitFor("document.querySelectorAll('#keys-list tbody tr').length === 2", 10000, 'Key 列表');
+      await cdp.clickText('#panel-keys button', '新建 Key');
+      await cdp.waitFor("document.querySelector('.modal #key-label')", 10000, '新建 Key 弹窗');
+      check('新建弹窗提供可选的自定义密钥输入', (await cdp.evaluate("document.querySelector('.modal #key-material') !== null")) === true);
+      // 原样下发：首尾空白必须由服务端校验拒绝，而不是被前端悄悄裁剪。
+      await cdp.setValue('.modal #key-label', '自定义密钥');
+      await cdp.setValue('.modal #key-material', '  sk-custom-create-01  ');
+      await cdp.clickText('.modal button', '创建');
+      await drain();
+      check(
+        '新建请求体原样保留自定义密钥的首尾空白',
+        JSON.parse((await debug('keys:create')).body).key === '  sk-custom-create-01  ',
+        (await debug('keys:create')).body
+      );
+      check('带首尾空白的自定义密钥由服务端校验拒绝', (await cdp.text('.modal .inline-error')).includes('whitespace'), await cdp.text('.modal .inline-error'));
+      check('被拒绝的新建不展示明文密钥', (await cdp.evaluate("document.querySelectorAll('.secret-box').length")) === 0);
+      await cdp.setValue('.modal #key-material', 'sk-custom-create-01');
+      await cdp.clickText('.modal button', '创建');
+      await cdp.waitFor("document.querySelector('.modal .secret-box')", 10000, '自定义密钥创建成功');
+      check('新建请求体精确携带自定义密钥材料', JSON.parse((await debug('keys:create')).body).key === 'sk-custom-create-01', (await debug('keys:create')).body);
+      check('自定义密钥仍走一次性明文展示', (await cdp.text('.modal')).includes('只显示这一次'));
+      await cdp.clickText('.modal button', '我已保存，关闭');
+      check(
+        '自定义密钥不写入本地存储也不进入 URL',
+        (await cdp.evaluate('window.localStorage.length + window.sessionStorage.length')) === 0 &&
+          (await cdp.evaluate('location.search + location.hash')) === ''
+      );
+      check('关闭弹窗后自定义密钥输入不再留在页面中', (await cdp.evaluate("document.querySelector('.modal #key-material') === null")) === true);
+      // 留空表示由服务端生成：请求体不得携带 key 字段。
+      await cdp.clickText('#panel-keys button', '新建 Key');
+      await cdp.waitFor("document.querySelector('.modal #key-material')", 10000, '再次打开新建弹窗');
+      await cdp.clickText('.modal button', '创建');
+      await cdp.waitFor("document.querySelector('.modal .secret-box')", 10000, '留空创建成功');
+      check(
+        '留空自定义密钥时请求体不含 key 字段',
+        !Object.prototype.hasOwnProperty.call(JSON.parse((await debug('keys:create')).body), 'key'),
+        (await debug('keys:create')).body
+      );
+      await cdp.clickText('.modal button', '我已保存，关闭');
+    });
+
+    /* --- 16. 快照状态标签与服务端状态对齐 --- */
+
+    await step('快照状态按服务端取值显示中文标签', async () => {
+      await loginFresh('快照状态标签');
+      await cdp.clickText('#usage-items .card:first-child button', '查看请求体');
+      await cdp.waitFor("document.querySelector('.modal .badge')", 10000, '快照弹窗');
+      check('捕获成功状态显示为「快照可用」', (await cdp.text('.modal .badge')).includes('快照可用'), await cdp.text('.modal .badge'));
+      await cdp.clickText('.modal button', '关闭');
+    });
+
+    /* --- 17. 控制台错误 --- */
     const consoleErrors = cdp.events.filter((name) => name === 'Runtime.exceptionThrown').length;
     check('运行期间没有未捕获异常', consoleErrors === 0, 'count=' + consoleErrors);
   } finally {

@@ -408,6 +408,16 @@ function readBody(req) {
   });
 }
 
+// 与 credit.validateMaterial 保持一致：只有空值才生成新的密钥材料；带首尾空白或
+// 控制字符的自定义材料一律拒绝，绝不静默裁剪，否则调用方会拿到一个与输入不同的密钥。
+function validateCustomMaterial(value) {
+  if (typeof value !== 'string' || value === '') return null;
+  if (value.trim() !== value) return 'invalid: key material must not have leading or trailing whitespace';
+  if (value.length < 8) return 'invalid: key material is too short';
+  if (/[\u0000-\u001f\u007f]/.test(value)) return 'invalid: key material must not contain control characters';
+  return null;
+}
+
 function usageReport(query) {
   const page = Number(query.get('page') || '1');
   const pageSize = Number(query.get('page_size') || '20');
@@ -528,18 +538,48 @@ async function handle(req, res) {
     if (endpoint === '/api/keys' && req.method === 'POST') {
       const body = await readBody(req);
       recorded.last['keys:create'] = { body };
-      json(res, 201, { item: { id: 'key-new', spec: JSON.parse(body), spent_micro_usd: 0, held_micro_usd: 0 }, key: 'sk-mock-onetime-5f3a9c' });
+      let parsed = null;
+      try {
+        parsed = JSON.parse(body);
+      } catch (err) {
+        json(res, 400, { error: 'invalid: request body must be JSON' });
+        return;
+      }
+      const materialError = validateCustomMaterial(parsed && parsed.key);
+      if (materialError) {
+        json(res, 400, { error: materialError });
+        return;
+      }
+      json(res, 201, { item: { id: 'key-new', spec: parsed, spent_micro_usd: 0, held_micro_usd: 0 }, key: 'sk-mock-onetime-5f3a9c' });
       return;
     }
     if (endpoint === '/api/keys' && req.method === 'PUT') {
       const body = await readBody(req);
       recorded.last['keys:update'] = { body };
-      json(res, 200, { item: { id: 'key-1', spec: JSON.parse(body).spec } });
+      const updated = JSON.parse(body);
+      // 更新接口不得回传密钥材料（handler.go 对 credit.ErrInvalid 的处理）。
+      if (updated && updated.spec && updated.spec.key) {
+        json(res, 400, { error: 'invalid: key material must not be updated' });
+        return;
+      }
+      json(res, 200, { item: { id: 'key-1', spec: updated.spec } });
       return;
     }
     if (endpoint === '/api/rotate') {
       const body = await readBody(req);
       recorded.last['keys:rotate'] = { body };
+      let parsed = null;
+      try {
+        parsed = JSON.parse(body);
+      } catch (err) {
+        json(res, 400, { error: 'invalid: request body must be JSON' });
+        return;
+      }
+      const materialError = validateCustomMaterial(parsed && parsed.key);
+      if (materialError) {
+        json(res, 400, { error: materialError });
+        return;
+      }
       json(res, 200, { item: { id: 'key-1' }, key: 'sk-mock-rotated-9c2b41' });
       return;
     }
@@ -568,7 +608,8 @@ async function handle(req, res) {
       if (id === 'req-001') {
         json(res, 200, {
           request_id: id,
-          status: 'ok',
+          // 服务端真实状态取值来自 internal/capture：captured/disabled/oversize/dropped/expired/unavailable。
+          status: 'captured',
           headers: {
             'Content-Type': 'application/json',
             'X-Api-Key': 'REDACTED',
