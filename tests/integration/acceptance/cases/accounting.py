@@ -125,3 +125,40 @@ def unpriced_denied(ctx):
     check(ctx.wait_until(lambda: _find_key(ctx.manager, item_a["id"])["spent_micro_usd"] == 14), "key A settled")
     check(ctx.wait_until(lambda: _find_key(ctx.manager, item_b["id"])["spent_micro_usd"] == 14), "key B settled")
     return {"denied_status": denied.status, "upstream_calls": ctx.mock.count("/chat/completions")}
+
+
+@case("billing.real_reserved_label_credential_is_billed",
+      "a real CPA usage whose upstream account label is the reserved word 'warmup' is billed exactly 14 microUSD, never exempted")
+def reserved_label_still_billed(ctx):
+    # CPA resolves a usage record's Source from the upstream account, project,
+    # email or api-key label -- it is not a trusted execution origin. Configuring
+    # the real upstream credential as "warmup" therefore reproduces a customer
+    # whose Source collides with a reserved word: the plugin must bill it like
+    # any other customer and never treat the label as a billing exemption.
+    original_keys = ctx.openai_upstream_keys
+    try:
+        ctx.openai_upstream_keys = ["warmup"]
+        ctx.recreate_host("billing-reserved-label")
+        ctx.set_price("synthetic-chat")
+        item, key = ctx.new_key(label="billing-reserved-label")
+        response = ctx.client.chat(key, "synthetic-chat")
+        check_eq(response.status, 200, "client completion status")
+
+        calls = ctx.mock.calls_for("/chat/completions")
+        check_eq(len(calls), 1, "upstream call count")
+        check_eq(calls[0]["upstream_key"], "warmup",
+                 "upstream credential carries the reserved-word label")
+
+        request = _settled(ctx, item["id"])
+        check(request is not None, "request settled within timeout")
+        check_eq(request["state"], "settled", "request state")
+        check_eq(request["held_micro_usd"], 0, "hold released on settle")
+        check_eq(request["executions"][0]["cost_micro_usd"], 14, "execution cost microUSD")
+        row = _find_key(ctx.manager, item["id"])
+        check_eq(row["spent_micro_usd"], 14, "key spent ledger")
+        check_eq(row["held_micro_usd"], 0, "key hold released")
+        check_eq(ctx.manager.health().json()["status"], "ok", "health stays ok")
+        return {"upstream_key": calls[0]["upstream_key"], "key_spent": row["spent_micro_usd"],
+                "execution_cost": request["executions"][0]["cost_micro_usd"]}
+    finally:
+        ctx.openai_upstream_keys = original_keys

@@ -547,19 +547,20 @@ func TestUsageIgnoresForeignAndInternalRecords(t *testing.T) {
 		APIKey: h.key.Principal, AccessProvider: "config-inline",
 		Detail: pluginapi.UsageDetail{InputTokens: 10, OutputTokens: 5, TotalTokens: 15},
 	})
-	// An internal host source must be ignored and reported.
+	// A real background execution (an internal host path such as a warmup probe)
+	// carries no access provider of this plugin's own, so it is ignored. Its
+	// Source is only an upstream account label and never a billing gate.
 	h.usage(pluginapi.UsageRecord{
-		RequestID: "exec-usage-internal", TraceID: "trace-usage", Provider: "openai", Model: testModel,
-		APIKey: h.key.Principal, Source: "plugin_host_model_callback",
-		AccessProvider: "plugin:cliproxyapi-credit-manager:" + authProviderID,
-		Detail:         pluginapi.UsageDetail{InputTokens: 10, OutputTokens: 5, TotalTokens: 15},
+		RequestID: "exec-usage-background", TraceID: "trace-usage", Provider: "openai", Model: testModel,
+		APIKey: h.key.Principal, Source: "warmup",
+		Detail: pluginapi.UsageDetail{InputTokens: 10, OutputTokens: 5, TotalTokens: 15},
 	})
 	key, err := h.store().GetKey(context.Background(), h.key.ID)
 	if err != nil {
 		t.Fatalf("GetKey: %v", err)
 	}
 	if key.SpentMicroUSD != 0 {
-		t.Fatalf("foreign and internal records must not be billed, spent = %d", key.SpentMicroUSD)
+		t.Fatalf("foreign and background records must not be billed, spent = %d", key.SpentMicroUSD)
 	}
 }
 
