@@ -13,7 +13,7 @@ const EMOJI = /[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}\u{FE0F}\u{2B00}-\u{2BFF}]/u
 
 test('index.html 仅引用相对资源，且不含任何凭据或账务数据', () => {
   const refs = [...html.matchAll(/(?:href|src)="([^"]+)"/g)].map((m) => m[1]);
-  assert.deepEqual(refs.sort(), ['./app.js', './charts.js', './lookup.html', './numbers.js', './style.css', './vendor/echarts-5.6.0.min.js']);
+  assert.deepEqual(refs.sort(), ['./admin-pricing.js', './app.js', './charts.js', './lookup.html', './numbers.js', './style.css', './vendor/echarts-5.6.0.min.js']);
   assert.ok(!/https?:\/\//.test(html), '静态外壳不得引用外部 CDN');
   assert.ok(!/sk-[A-Za-z0-9]{8,}/.test(html), '静态外壳不得内嵌密钥');
   assert.ok(!/Bearer\s+[A-Za-z0-9]{16,}/i.test(html), '静态外壳不得内嵌凭据');
@@ -22,9 +22,13 @@ test('index.html 仅引用相对资源，且不含任何凭据或账务数据', 
   assert.ok(html.includes('lang="zh-CN"'));
 });
 
-test('五个标签页在 HTML 与脚本中一致', () => {
+test('标签页在 HTML 与脚本中一致（动态派生标签 ID）', () => {
   const htmlTabs = [...html.matchAll(/data-tab="([a-z]+)"/g)].map((m) => m[1]);
-  assert.deepEqual(htmlTabs, ['usage', 'keys', 'prices', 'credentials', 'health']);
+  assert.ok(htmlTabs.length >= 6, '标签页数量应至少包含基础与概览等页面');
+  const required = ['overview', 'usage', 'keys', 'prices', 'credentials', 'health'];
+  for (const tab of required) {
+    assert.ok(htmlTabs.includes(tab), `缺少必需标签页 ${tab}`);
+  }
   for (const tab of htmlTabs) {
     assert.ok(html.includes(`id="panel-${tab}"`), `缺少面板 panel-${tab}`);
     assert.ok(js.includes(`${tab}: function`), `脚本缺少 ${tab} 的加载器`);

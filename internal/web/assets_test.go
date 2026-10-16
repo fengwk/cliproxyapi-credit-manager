@@ -32,6 +32,7 @@ func TestShellIsSelfContained(t *testing.T) {
 		"./vendor/echarts-5.6.0.min.js": true,
 		"./charts.js":                   true,
 		"./numbers.js":                  true,
+		"./admin-pricing.js":            true,
 		"./app.js":                      true,
 	}
 	if len(refs) == 0 {
@@ -56,29 +57,34 @@ func TestShellIsSelfContained(t *testing.T) {
 	}
 }
 
-// 五个标签页的面板必须与脚本中的加载器一一对应。
+// 标签页的面板必须与脚本中的加载器一一对应（动态派生标签 ID）。
 func TestTabsMatchPanelsAndLoaders(t *testing.T) {
 	html := readAsset(t, "index.html")
 	js := readAsset(t, "app.js")
 
 	tabPattern := regexp.MustCompile(`data-tab="([a-z]+)"`)
 	matches := tabPattern.FindAllStringSubmatch(html, -1)
-	want := []string{"usage", "keys", "prices", "credentials", "health"}
-	if len(matches) != len(want) {
-		t.Fatalf("应有 %d 个标签页，实际 %d 个", len(want), len(matches))
+	if len(matches) < 6 {
+		t.Fatalf("标签页数量应至少包含基础与概览等页面，实际 %d 个", len(matches))
 	}
-	for i, match := range matches {
-		if match[1] != want[i] {
-			t.Errorf("第 %d 个标签页为 %s，期望 %s", i+1, match[1], want[i])
+	requiredBase := []string{"overview", "usage", "keys", "prices", "credentials", "health"}
+	foundMap := make(map[string]bool)
+	for _, match := range matches {
+		tab := match[1]
+		foundMap[tab] = true
+		if !strings.Contains(html, `id="panel-`+tab+`"`) {
+			t.Errorf("缺少面板 panel-%s", tab)
 		}
-		if !strings.Contains(html, `id="panel-`+match[1]+`"`) {
-			t.Errorf("缺少面板 panel-%s", match[1])
+		if !strings.Contains(html, `aria-controls="panel-`+tab+`"`) {
+			t.Errorf("标签 %s 缺少 aria-controls", tab)
 		}
-		if !strings.Contains(html, `aria-controls="panel-`+match[1]+`"`) {
-			t.Errorf("标签 %s 缺少 aria-controls", match[1])
+		if !strings.Contains(js, tab+": function") {
+			t.Errorf("脚本缺少 %s 的标签加载器", tab)
 		}
-		if !strings.Contains(js, match[1]+": function") {
-			t.Errorf("脚本缺少 %s 的标签加载器", match[1])
+	}
+	for _, req := range requiredBase {
+		if !foundMap[req] {
+			t.Errorf("缺少必需标签页 %s", req)
 		}
 	}
 }

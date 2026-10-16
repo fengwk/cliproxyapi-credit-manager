@@ -113,6 +113,23 @@
       <p id="trend-empty" class="muted" hidden>当前时间范围内暂无用量记录。</p>
     </div>
 
+    <div class="section" id="lookup-models-section" hidden>
+      <div class="section-head">
+        <h2>模型调用分析</h2>
+        <span id="lookup-models-count" class="muted"></span>
+      </div>
+      <div class="chart-grid lookup-models-grid">
+        <div class="chart-card">
+          <h3>模型用量分布</h3>
+          <div id="lookup-model-share" class="chart chart-donut" aria-label="模型用量分布环形图"></div>
+        </div>
+        <div class="chart-card">
+          <h3>模型效率表现</h3>
+          <div id="lookup-model-rank" class="model-rank-list"></div>
+        </div>
+      </div>
+    </div>
+
     <div class="section">
       <div class="section-head">
         <h2>最近请求</h2>

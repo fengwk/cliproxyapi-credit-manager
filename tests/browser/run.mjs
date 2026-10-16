@@ -226,7 +226,11 @@ function connect(wsUrl) {
 async function main() {
   fs.mkdirSync(SHOTS, { recursive: true });
   const mock = await startMock();
-  const profileDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cm-chrome-'));
+  const profileRoot = process.env.CM_BROWSER_TMP_DIR
+    ? path.resolve(process.env.CM_BROWSER_TMP_DIR)
+    : path.join(ARTIFACTS, 'chrome-profiles');
+  fs.mkdirSync(profileRoot, { recursive: true });
+  const profileDir = fs.mkdtempSync(path.join(profileRoot, 'run-'));
   const origin = `http://127.0.0.1:${mock.port}`;
   const shellUrl = `${origin}/v0/resource/plugins/credit-manager/index.html`;
 
@@ -270,12 +274,39 @@ async function main() {
     check('错误密钥显示服务端错误且不自动重试', wrongText.includes('invalid management key'), wrongText);
     check('错误密钥后仍停留在登录界面', await cdp.evaluate("document.querySelector('#main-view').hidden === true"));
 
-    /* --- 2. 登录成功并加载使用统计 --- */
+    /* --- 2. 登录成功并进入概览 --- */
     await cdp.setValue('#management-key', MANAGEMENT_KEY);
     await cdp.click('#login-button');
     await cdp.waitFor("!document.querySelector('#main-view').hidden", 10000, '主视图出现');
-    await cdp.waitFor("document.querySelectorAll('#usage-items .row-title').length > 0", 10000, '使用统计渲染');
+    await cdp.waitFor("document.querySelectorAll('#overview-summary .metric-card').length > 0", 10000, '概览卡片渲染');
     check('登录后显示会话状态', (await cdp.text('#session-status')).includes('已登录'));
+
+    // 登录只允许加载需要立即展示的接口：其它标签页必须等到点击才请求。
+    const afterLogin = await hits();
+    check(
+      '登录后未提前请求价格/凭据/额度接口',
+      !afterLogin.some((entry) => entry.includes('/api/prices') || entry.includes('/v8/management/credentials') || entry.includes('/quota')),
+      afterLogin.join(' | ')
+    );
+    // 登录会先校验一次密钥并加载概览与 Key 列表；除此之外不得请求其它管理接口。
+    const afterLoginApis = [
+      ...new Set(
+        afterLogin
+          .filter((entry) => entry.includes('/api/'))
+          .map((entry) => entry.replace(/^[A-Z]+ /, '').split('?')[0].split('/').pop())
+      ),
+    ].sort();
+    check('登录只请求健康检查、概览与 Key 列表', JSON.stringify(afterLoginApis) === JSON.stringify(['health', 'keys', 'overview']), JSON.stringify(afterLoginApis));
+
+    const overviewSummary = await cdp.text('#overview-summary');
+    check('概览卡片包含总请求数与总成本', overviewSummary.includes('总请求数') && overviewSummary.includes('总成本'));
+    check('概览模型占比卡片存在', await cdp.evaluate("!!document.querySelector('#overview-model-share')"));
+    check('概览模型效率排行卡片存在', await cdp.evaluate("!!document.querySelector('#overview-model-rank')"));
+    await cdp.screenshot('02-overview.png');
+
+    /* --- 2b. 切换到使用统计面板 --- */
+    await cdp.click('#tab-usage');
+    await cdp.waitFor("document.querySelectorAll('#usage-items .row-title').length > 0", 10000, '使用统计渲染');
 
     const usageStatus = await cdp.text('#usage-status');
     check('状态行展示接口与查询串', usageStatus.includes('/api/usage') && usageStatus.includes('page=1') && usageStatus.includes('page_size=20'), usageStatus);
@@ -318,23 +349,6 @@ async function main() {
       scopeNote.includes('不等于全 Key 账本支出') && scopeNote.includes('人工补记按请求汇总'),
       scopeNote.slice(0, 240)
     );
-
-    // 登录只允许加载需要立即展示的接口：其它标签页必须等到点击才请求。
-    const afterLogin = await hits();
-    check(
-      '登录后未提前请求价格/凭据/额度接口',
-      !afterLogin.some((entry) => entry.includes('/api/prices') || entry.includes('/v8/management/credentials') || entry.includes('/quota')),
-      afterLogin.join(' | ')
-    );
-    // 登录会先校验一次密钥并加载使用统计与 Key 列表；除此之外不得请求其它管理接口。
-    const afterLoginApis = [
-      ...new Set(
-        afterLogin
-          .filter((entry) => entry.includes('/api/'))
-          .map((entry) => entry.replace(/^[A-Z]+ /, '').split('?')[0].split('/').pop())
-      ),
-    ].sort();
-    check('登录只请求健康检查、使用统计与 Key 列表', JSON.stringify(afterLoginApis) === JSON.stringify(['health', 'keys', 'usage']), JSON.stringify(afterLoginApis));
     check('展示保留边界', (await cdp.text('#usage-retention')).includes('2026-07-01'));
     check('全局引入 real ECharts 依赖', (await cdp.evaluate("typeof window.echarts !== 'undefined'")));
     check('全局引入 real CMCharts', (await cdp.evaluate("typeof window.CMCharts !== 'undefined' && typeof window.CMCharts.render === 'function'")));
@@ -644,6 +658,13 @@ async function main() {
     await cdp.clickText('.modal button', '我已保存，关闭');
     check('轮换请求体只包含必要字段', JSON.parse((await debug('keys:rotate')).body).id === 'key-1');
 
+    /* --- 6b. 查看密钥明文 --- */
+    await cdp.clickText('#keys-list tbody tr:first-child button', '查看密钥');
+    await cdp.waitFor("document.querySelector('.modal input.mono')", 10000, '查看明文弹窗');
+    check('查看明文弹窗正确展示解密密钥', (await cdp.evaluate("document.querySelector('.modal input.mono').value")).includes('sk-revealed'));
+    check('查看明文弹窗提示一次性显示', (await cdp.text('.modal')).includes('一次性显示'));
+    await cdp.clickText('.modal button', '已复制并关闭');
+
     /* --- 7. 价格 --- */
     await cdp.click('#tab-prices');
     await cdp.waitFor("document.querySelectorAll('#prices-list tbody tr').length === 3", 10000, '价格列表');
@@ -676,6 +697,29 @@ async function main() {
     // 保存后必须强制重新拉取价格列表（界面与 PUT 结果保持一致）。
     await sleep(200);
     check('保存价格后强制刷新价格列表', (await getHitsOf('/api/prices')).length === 2, (await getHitsOf('/api/prices')).join(' | '));
+
+    /* --- 7b. 高级定价规则 --- */
+    check('高级定价规则列表渲染', await cdp.evaluate("document.querySelectorAll('#pricing-rules-list table').length > 0"));
+    const rulesText = await cdp.text('#pricing-rules-list');
+    check('规则列表展示规则 ID 与匹配模式', rulesText.includes('rule-') || rulesText.includes('gpt-4o'));
+
+    /* --- 7c. 调用方管理 --- */
+    await cdp.click('#tab-callers');
+    await cdp.waitFor("document.querySelectorAll('#callers-list tbody tr').length > 0", 10000, '调用方列表');
+    const callersText = await cdp.text('#callers-list');
+    check('调用方列表包含显示名称', callersText.includes('研发一部') || callersText.includes('caller-'));
+
+    /* --- 7d. 审计日志 --- */
+    await cdp.click('#tab-audit');
+    await cdp.waitFor("document.querySelectorAll('#audit-list tbody tr').length > 0", 10000, '审计日志列表');
+    const auditText = await cdp.text('#audit-list');
+    check('审计日志展示操作记录', auditText.includes('create_key') || auditText.includes('reset_spend'));
+
+    /* --- 7e. 实时汇率刷新 --- */
+    await cdp.click('#btn-refresh-exchange-rate');
+    await sleep(200);
+    const rateVal = Number(await cdp.evaluate("document.querySelector('#currency-rate').value"));
+    check('汇率刷新后汇率输入框具有合法正数值', rateVal > 0, 'rate=' + rateVal);
 
     /* --- 8. 上游凭据与额度 --- */
     await cdp.click('#tab-credentials');
@@ -733,6 +777,7 @@ async function main() {
     await cdp.setValue('#management-key', MANAGEMENT_KEY);
     await cdp.click('#login-button');
     await cdp.waitFor("!document.querySelector('#main-view').hidden", 10000, '再次登录');
+    await cdp.click('#tab-usage');
     await cdp.waitFor("document.querySelectorAll('#usage-items .row-title').length > 0", 10000, '移动端使用统计');
     await cdp.send('Emulation.setDeviceMetricsOverride', { width: 390, height: 844, deviceScaleFactor: 2, mobile: true });
     await sleep(300);
@@ -829,6 +874,7 @@ async function main() {
       await cdp.setValue('#management-key', MANAGEMENT_KEY);
       await cdp.click('#login-button');
       await cdp.waitFor("!document.querySelector('#main-view').hidden", 10000, label + '：主视图');
+      await cdp.click('#tab-usage');
       await cdp.waitFor("document.querySelectorAll('#usage-items .row-title').length > 0", 10000, label + '：使用统计');
     };
     // 单个子场景独立成败：断言失败或意外异常都不会中断其余检查。
@@ -927,6 +973,7 @@ async function main() {
       await cdp.setValue('#management-key', MANAGEMENT_KEY);
       await cdp.click('#login-button');
       await cdp.waitFor("!document.querySelector('#main-view').hidden", 10000, '同一密钥重新登录');
+      await cdp.click('#tab-usage');
       await cdp.waitFor("document.querySelectorAll('#usage-items .row-title').length > 0", 10000, '新会话使用统计');
       await cmFetch(`fulfill(0, 401, ${JSON.stringify('{"error":"invalid management key"}')})`);
       await drain();

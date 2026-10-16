@@ -99,6 +99,68 @@ const KEYS = [
   },
 ];
 
+const CALLERS = [
+  {
+    id: 'caller-1',
+    display_name: '研发一部',
+    enabled: true,
+    created_at: '2026-01-01T00:00:00Z',
+  },
+  {
+    id: 'caller-2',
+    display_name: '数据分析团队',
+    enabled: true,
+    created_at: '2026-02-01T00:00:00Z',
+  },
+];
+
+const AUDIT_EVENTS = [
+  {
+    seq: 1,
+    at: '2026-10-15T10:00:00Z',
+    action: 'create_key',
+    key_id: 'key-1',
+    caller_id: 'caller-1',
+    reason: '初始化系统',
+    detail: '创建生产主力 Key',
+  },
+  {
+    seq: 2,
+    at: '2026-10-15T11:00:00Z',
+    action: 'reset_spend',
+    key_id: 'key-1',
+    caller_id: 'caller-1',
+    reason: '月度周期刷新',
+    detail: '重置月度额度基线',
+  },
+];
+
+const PRICING_RULES = [
+  {
+    id: 'rule-1',
+    match_kind: 'glob',
+    pattern: 'opencode-go/*',
+    priority: 10,
+    enabled: true,
+    price: {
+      model: 'opencode-go/*',
+      billing_mode: 'standard',
+      input_rate: 1000000,
+      output_rate: 3000000,
+      cache_read_rate: 100000,
+      cache_write_rate: 2000000,
+      reasoning_rate: 4000000,
+      per_image_micro_usd: 0,
+    },
+    tiers: [],
+  },
+];
+
+const CATALOG_MODELS = [
+  { model: 'gpt-4o', provider: 'openai', input_rate: 2500000, output_rate: 10000000, cache_read_rate: 1250000 },
+  { model: 'claude-3-5-sonnet', provider: 'anthropic', input_rate: 3000000, output_rate: 15000000, cache_read_rate: 300000 },
+];
+
 const REQUESTS_PAGE_1 = [
   {
     id: 'req-001',
@@ -637,6 +699,153 @@ async function handle(req, res) {
       const body = await readBody(req);
       recorded.last['resolve'] = { body };
       json(res, 200, { ok: true });
+      return;
+    }
+    if (endpoint === '/api/overview') {
+      recorded.last['overview'] = url.search;
+      json(res, 200, {
+        summary: {
+          requests: 6,
+          executions: 7,
+          failed: 1,
+          pending: 1,
+          cost_micro_usd: 1250000000000000,
+          adjustment_micro_usd: 500000,
+          tokens: 2800000000000000,
+          complete_executions: 6,
+          cache_read_ratio: 0.25,
+        },
+        trend: [
+          { bucket: '2026-10-14T00:00:00Z', requests: 2, executions: 2, failed: 0, pending: 0, cost_micro_usd: 400000, adjustment_micro_usd: 0, tokens: 1000000 },
+          { bucket: '2026-10-15T00:00:00Z', requests: 4, executions: 5, failed: 1, pending: 1, cost_micro_usd: 850000, adjustment_micro_usd: 500000, tokens: 1800000 },
+        ],
+        models: [
+          {
+            model: 'opencode-go/glm-5',
+            requests: 4,
+            executions: 5,
+            failed: 0,
+            pending: 0,
+            cost_micro_usd: 800000000000000,
+            adjustment_micro_usd: 0,
+            tokens: 1800000000000000,
+            complete_executions: 5,
+            cache_read_ratio: 0.35,
+            latency_ms: 6000,
+            latency_samples: 4,
+            ttft_ms: 1200,
+            ttft_samples: 4,
+            output_tokens: 500000000000000,
+          },
+          {
+            model: 'gpt-5',
+            requests: 2,
+            executions: 2,
+            failed: 1,
+            pending: 1,
+            cost_micro_usd: 450000000000000,
+            adjustment_micro_usd: 500000,
+            tokens: 1000000000000000,
+            complete_executions: 1,
+            cache_read_ratio: 0.15,
+            latency_ms: 3500,
+            latency_samples: 1,
+            ttft_ms: 800,
+            ttft_samples: 1,
+            output_tokens: 300000000000000,
+          },
+        ],
+        retention_from: '2026-07-01T00:00:00Z',
+      });
+      return;
+    }
+    if (endpoint === '/api/reveal' && req.method === 'POST') {
+      const body = await readBody(req);
+      const parsed = JSON.parse(body || '{}');
+      if (parsed.id === 'key-legacy') {
+        json(res, 409, { error: 'legacy key cannot be revealed, rotate to encrypted' });
+        return;
+      }
+      json(res, 200, { id: parsed.id, key: 'sk-revealed-' + (parsed.id || 'secret') });
+      return;
+    }
+    if (endpoint === '/api/delete-key' && req.method === 'POST') {
+      const body = await readBody(req);
+      const parsed = JSON.parse(body || '{}');
+      recorded.last['delete-key'] = parsed;
+      const k = KEYS.find((item) => item.id === parsed.id);
+      if (k) k.deleted_at = new Date().toISOString();
+      json(res, 200, { ok: true });
+      return;
+    }
+    if (endpoint === '/api/reset-spend' && req.method === 'POST') {
+      const body = await readBody(req);
+      recorded.last['reset-spend'] = JSON.parse(body || '{}');
+      json(res, 200, { keys: 1, windows: ['daily', 'weekly', 'monthly', 'total'] });
+      return;
+    }
+    if (endpoint === '/api/callers' && req.method === 'GET') {
+      json(res, 200, { items: CALLERS });
+      return;
+    }
+    if (endpoint === '/api/callers' && req.method === 'POST') {
+      const body = await readBody(req);
+      const parsed = JSON.parse(body || '{}');
+      const caller = {
+        id: parsed.id || 'caller-' + (CALLERS.length + 1),
+        display_name: parsed.display_name || '',
+        enabled: parsed.enabled !== false,
+        created_at: new Date().toISOString(),
+      };
+      CALLERS.push(caller);
+      json(res, 201, { item: caller });
+      return;
+    }
+    if (endpoint === '/api/callers' && req.method === 'PUT') {
+      const body = await readBody(req);
+      const parsed = JSON.parse(body || '{}');
+      const caller = CALLERS.find((c) => c.id === parsed.id);
+      if (caller) {
+        if (parsed.display_name !== undefined) caller.display_name = parsed.display_name;
+        if (parsed.enabled !== undefined) caller.enabled = parsed.enabled;
+      }
+      json(res, 200, { item: caller || parsed });
+      return;
+    }
+    if (endpoint === '/api/audit' && req.method === 'GET') {
+      json(res, 200, { items: AUDIT_EVENTS, total: AUDIT_EVENTS.length, page: 1, page_size: 20 });
+      return;
+    }
+    if (endpoint === '/api/pricing-rules' && req.method === 'GET') {
+      json(res, 200, { items: PRICING_RULES });
+      return;
+    }
+    if (endpoint === '/api/pricing-rules' && req.method === 'PUT') {
+      const body = await readBody(req);
+      const parsed = JSON.parse(body || '{}');
+      const existing = PRICING_RULES.findIndex((r) => r.id === parsed.id);
+      if (existing >= 0) {
+        PRICING_RULES[existing] = parsed;
+      } else {
+        PRICING_RULES.push(parsed);
+      }
+      json(res, 200, { item: parsed });
+      return;
+    }
+    if (endpoint === '/api/delete-price-rule' && req.method === 'POST') {
+      const body = await readBody(req);
+      const parsed = JSON.parse(body || '{}');
+      const idx = PRICING_RULES.findIndex((r) => r.id === parsed.id);
+      if (idx >= 0) PRICING_RULES.splice(idx, 1);
+      json(res, 200, { ok: true });
+      return;
+    }
+    if (endpoint === '/api/model-catalog') {
+      json(res, 200, { models: CATALOG_MODELS });
+      return;
+    }
+    if (endpoint === '/api/exchange-rate') {
+      json(res, 200, { rate: 7.25, currency: 'CNY', updated_at: '2026-10-16T12:00:00Z' });
       return;
     }
     json(res, 404, { error: 'unknown endpoint' });
