@@ -582,6 +582,8 @@ async function main() {
     check('更新请求体保留未编辑字段', Array.isArray(updateBody.spec.allowed_models) && updateBody.spec.allowed_models.length === 2);
     await cdp.screenshot('07-keys.png', { fullPage: true });
 
+    const keysPutCount = async () => (await hitsOf('/api/keys')).filter((entry) => entry.startsWith('PUT ')).length;
+    const putsBeforeDisable = await keysPutCount();
     await cdp.clickText('#keys-list tbody tr:first-child button', '禁用');
     await cdp.waitFor("document.querySelector('.modal #confirm-checkbox')", 10000, '二次确认弹窗');
     await cdp.clickText('.modal button', '禁用');
@@ -589,8 +591,14 @@ async function main() {
     await cdp.evaluate("document.querySelector('.modal #confirm-checkbox').checked = true");
     await cdp.clickText('.modal button', '禁用');
     await sleep(300);
-    check('确认后提交禁用', (await debug('keys:update')).body.includes('"enabled":false') === false || true);
     const disableBody = JSON.parse((await debug('keys:update')).body);
+    // 勾选确认后必须真的提交一次禁用：观察到的 PUT 恰好多一次，且携带禁用后的 spec。
+    // （列表接口返回的是静态 fixture，无法从渲染结果观察 key-1 的禁用状态，只能从请求层观察。）
+    check(
+      '确认后提交禁用',
+      (await keysPutCount()) === putsBeforeDisable + 1 && disableBody.spec.enabled === false,
+      'puts=' + putsBeforeDisable + '->' + (await keysPutCount()) + ' body=' + (await debug('keys:update')).body
+    );
     check('禁用通过完整 spec 提交', disableBody.spec.enabled === false && disableBody.spec.future_policy === 'keep-me');
 
     await cdp.clickText('#keys-list tbody tr:first-child button', '轮换密钥');
@@ -923,6 +931,80 @@ async function main() {
       await realFetch();
     });
 
+    /* --- 13b. 命中缓存的筛选切换：在途的旧查询必须被作废 --- */
+
+    // 切到未缓存的粒度会发起新查询；再切回已缓存的粒度时命中缓存、不再发请求。
+    // 此时在途的旧查询仍然迟到返回：它属于过期响应，绝不能把结果（或错误）写到当前筛选条件下。
+    const cacheRaceBody = (requests, bucket) =>
+      JSON.stringify({
+        summary: {
+          requests: requests,
+          executions: requests,
+          failed: 0,
+          pending: 0,
+          cost_micro_usd: 0,
+          adjustment_micro_usd: 0,
+          tokens: { input: 0, cache_read: 0, cache_write: 0, output: 0, reasoning: 0, total: 0 },
+          complete_executions: 0,
+        },
+        trend: [],
+        items: [],
+        total: requests,
+        page: 1,
+        page_size: 20,
+        retention_from: '2026-07-01T00:00:00Z',
+        mock_bucket: bucket,
+      });
+    const switchAwayAndBack = async () => {
+      await deferFetch();
+      await cdp.setValue('#usage-bucket', 'hour');
+      check('切换到未缓存的粒度会发起新查询', (await cmFetch('pending()')) === 1, 'pending=' + (await cmFetch('pending()')));
+      await cdp.setValue('#usage-bucket', 'day');
+      check(
+        '切回已缓存的粒度命中缓存且不发新请求',
+        (await cmFetch('calls.length')) === 1 && !(await cdp.text('#usage-status')).includes('正在读取'),
+        'calls=' + (await cmFetch('calls.length')) + ' status=' + (await cdp.text('#usage-status'))
+      );
+    };
+
+    await step('切回缓存粒度后迟到的旧查询成功不得覆盖缓存结果', async () => {
+      await loginFresh('缓存命中竞态：成功响应');
+      await switchAwayAndBack();
+      await cmFetch(`fulfill(0, 200, ${JSON.stringify(cacheRaceBody(424242, 'hour'))})`);
+      await drain();
+      const statusAfter = await cdp.text('#usage-status');
+      check(
+        '迟到的旧查询不覆盖缓存结果（状态行仍是缓存查询）',
+        statusAfter.includes('bucket=day') && !statusAfter.includes('bucket=hour') && !statusAfter.includes('正在读取'),
+        statusAfter
+      );
+      check(
+        '迟到的旧查询不覆盖缓存结果（汇总仍是缓存数据）',
+        !(await cdp.text('#usage-summary')).includes('424,242'),
+        (await cdp.text('#usage-summary')).replace(/\n/g, ' ').slice(0, 80)
+      );
+      check('迟到的旧查询不改变缓存的总条数', (await cdp.text('#usage-total')).includes('25'), await cdp.text('#usage-total'));
+      await realFetch();
+    });
+
+    await step('切回缓存粒度后迟到的旧查询失败不得写入新状态', async () => {
+      await loginFresh('缓存命中竞态：失败响应');
+      await switchAwayAndBack();
+      await cmFetch("reject(0, 'network down')");
+      await drain();
+      check(
+        '迟到的旧查询失败不写入错误状态',
+        (await cdp.evaluate("document.querySelector('#usage-error').hidden")) === true,
+        await cdp.text('#usage-error')
+      );
+      check(
+        '迟到的旧查询失败不打断缓存结果的展示',
+        (await cdp.text('#usage-status')).includes('bucket=day') && !(await cdp.text('#usage-status')).includes('正在读取'),
+        await cdp.text('#usage-status')
+      );
+      await realFetch();
+    });
+
     /* --- 14. 金额输入：非法美元输入必须阻止提交 --- */
 
     await step('财务处理弹窗拒绝非法美元输入', async () => {
@@ -1117,7 +1199,8 @@ async function main() {
     }
     chrome.child.kill('SIGKILL');
     mock.child.kill('SIGKILL');
-    fs.rmSync(profileDir, { recursive: true, force: true });
+    // Chrome 的子进程可能仍在写 profile 目录，删除需要重试，否则清理竞态会掩盖已经完成的检查结果。
+    fs.rmSync(profileDir, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
   }
 
   const report = {

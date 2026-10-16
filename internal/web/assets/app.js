@@ -882,26 +882,34 @@
     }
     return fetch(path, init).then(
       function (response) {
-        return response.text().then(function (text) {
-          if (stale()) throw staleError();
-          var data = null;
-          if (text.trim() !== '') {
-            try {
-              data = parseJSON(text);
-            } catch (err) {
-              data = null;
+        return response.text().then(
+          function (text) {
+            if (stale()) throw staleError();
+            var data = null;
+            if (text.trim() !== '') {
+              try {
+                data = parseJSON(text);
+              } catch (err) {
+                data = null;
+              }
             }
+            if (!response.ok) {
+              var message = data && typeof data.error === 'string' && data.error ? data.error : truncateText(text);
+              var error = new Error(message || ('HTTP ' + response.status));
+              error.status = response.status;
+              error.kind = response.status === 401 || response.status === 403 ? 'auth' : 'http';
+              error.detail = text;
+              throw error;
+            }
+            return data;
+          },
+          function (cause) {
+            // 读取响应体失败同样是一种请求结果：会话变更后到达的失败必须作废，
+            // 否则旧会话的普通错误会被当成新会话的错误写进界面状态。
+            if (stale()) throw staleError();
+            throw cause;
           }
-          if (!response.ok) {
-            var message = data && typeof data.error === 'string' && data.error ? data.error : truncateText(text);
-            var error = new Error(message || ('HTTP ' + response.status));
-            error.status = response.status;
-            error.kind = response.status === 401 || response.status === 403 ? 'auth' : 'http';
-            error.detail = text;
-            throw error;
-          }
-          return data;
-        });
+        );
       },
       function (cause) {
         if (stale()) throw staleError();
@@ -1742,9 +1750,17 @@
     if (!state.key) return;
     var filters = state.usage.filters;
     var query = buildUsageQuery(filters);
-    if (!force && state.usage.requestedQuery === query && state.usage.report) return;
     // 读取序号：只有最后一次发出的查询可以写回结果，先发的响应迟到一律丢弃。
+    // 序号必须先自增（含命中缓存的分支）：即使本次命中缓存、不再发起请求，
+    // 也必须作废在途的旧查询，否则更早发出的查询迟到时会覆盖当前筛选条件下的缓存结果。
     var seq = ++state.usage.loadSeq;
+    if (!force && state.usage.requestedQuery === query && state.usage.report) {
+      // 命中缓存：清掉在途查询留下的加载/错误状态，并用缓存结果重新渲染，保持界面自洽。
+      state.usage.loading = false;
+      state.usage.error = '';
+      renderUsage();
+      return;
+    }
     state.usage.loading = true;
     state.usage.error = '';
     renderUsageStatus();
