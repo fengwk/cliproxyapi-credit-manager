@@ -416,7 +416,7 @@ func (s *Store) PutPrice(ctx context.Context, price Price) error {
 			p.Rates.CacheWrite, p.BillingMode, p.PerImageMicroUSD); err != nil {
 			return fmt.Errorf("store price: %w", err)
 		}
-		return nil
+		return insertAudit(ctx, tx, s.nowUTC(), ActionPriceUpdate, "", "", "", "model="+p.Model)
 	})
 }
 

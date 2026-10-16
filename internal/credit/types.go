@@ -246,6 +246,8 @@ type Report struct {
 	Page          int       `json:"page"`
 	PageSize      int       `json:"page_size"`
 	RetentionFrom time.Time `json:"retention_from"`
+	// Models is populated only for customer lookup, from the same snapshot.
+	Models []ModelMetrics `json:"models,omitempty"`
 }
 
 type Maintenance struct {

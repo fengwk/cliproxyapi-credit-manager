@@ -154,9 +154,21 @@ ownership before returning a snapshot. Foreign and unknown snapshot IDs share
 one 404 response. No resource route exposes administrative writes.
 Envelope errors `{"error":"safe message"}`.
 - GET `/api/keys` => `{"items":[Key]}`
-- POST `/api/keys` KeySpec => `{"item":Key,"key":"one-time plaintext"}`
+- POST `/api/keys` KeySpec => `{"item":Key,"key":"plaintext"}`
 - PUT `/api/keys` `{"id":id,"spec":KeySpec}` => `{"item":Key}`
 - POST `/api/rotate` `{"id":id,"key":"optional custom"}` => item,key
+- POST `/api/reveal` `{"id":id}` => id,key; an audited disclosure of encrypted
+  material. Legacy HMAC-only keys return 409 until rotated.
+- POST `/api/delete-key` `{"id":id,"reason":"mandatory"}` => ok; permanent soft
+  deletion, never a ledger/history deletion or forgiveness of pending charges.
+- POST `/api/reset-spend` `{id|ids|all,total,daily,weekly,monthly,reason}` =>
+  `{keys,windows}`. Exactly one scope, at least one window, mandatory reason.
+  Baselines affect admission usage only; durable spend, history and holds remain.
+- GET/POST/PUT `/api/callers` => items/item; `{id,display_name,enabled}` is
+  attribution metadata, never an authentication, concurrency or routing policy.
+- GET `/api/audit?key_id=&caller_id=&page=&page_size=` => items,total,page,page_size.
+  Key/caller mutations, disclosures, resets, pricing edits and manual resolutions
+  append audit events atomically with the action; no key material is included.
 - GET `/api/prices` => `{"items":[Price]}`; PUT `/api/prices` Price => `{"ok":true}`
   (`Price` adds optional `billing_mode` `""|"token"|"per_image"` and
   `per_image_micro_usd`; a per-image price ignores token rates.)
@@ -177,6 +189,15 @@ Envelope errors `{"error":"safe message"}`.
   editing or deleting a rule never reprices an admitted request.
 - GET `/api/usage` query from/to RFC3339,key_id,model,provider,auth_id,result,
   search,page,page_size,bucket(hour/day/month) => Report (summary/trend/items/all-match total).
+- GET `/api/overview` shares usage filters, ignores pagination, and returns
+  summary,trend,models,retention_from from one read snapshot. Models are grouped
+  by requested model, never an upstream alias. Output paired with measured latency
+  is `measured_output_tokens`; zero samples mean undefined, not zero efficiency.
+- GET `/api/model-catalog?refresh=1` => items,source,fetched_at,cached,stale,error.
+  Fixed HTTPS sources, bounded fetches, no redirects; missing rates stay missing.
+  Import is an explicit administrator write, not a background price update.
+- GET `/api/exchange-rate?refresh=1` => base,quote,rate,source,fetched_at,cached,stale,error.
+  Fixed USD/CNY source, display only. Failure never changes financial prices.
 - GET `/api/capture?id=<lifecycle-id>` => Detail. Click only, never list body.
 - POST `/api/resolve` `{"id":id,"action":"release|charge","amount_micro_usd":N,
   "reason":"mandatory"}` => `{"ok":true}`
@@ -184,16 +205,18 @@ Envelope errors `{"error":"safe message"}`.
   "retention_months":3,"capture_enabled":bool,"last_error":string}`
 
 Frontend plain HTML/CSS/JS, no bundler/CDN; ECharts 5.6.0 is vendored with license.
-Chinese. Responsive tabs: usage,keys,prices,credentials,health.
+Chinese. Responsive tabs: overview,usage,keys,callers,prices,audit,credentials,health.
 Credentials default to per-tab sessionStorage; explicit remember mirrors to
 localStorage. Management and customer keys use separate storage prefixes;
 never use Cookie/URL or consume CPA's stored login. Logout/auth failure clears
 private DOM and chart instances; epochs reject late responses from old sessions.
-Static shell never embeds credentials. One-time key dialog.
+Static shell never embeds credentials. Key plaintext is shown only in explicit
+create/rotate/reveal dialogs and removed when the dialog or session ends.
 Charts/totals/list share Report; include explicit pending and quality states.
 Hour/day/month buckets are UTC; month means calendar month, not 30 days.
 Token and money display/tooltip values use exact integers/decimal arithmetic;
-only chart geometry may use floats. USD/CNY is display-only at a manual rate.
+only chart geometry may use floats. USD/CNY is display-only at a manual or
+explicitly refreshed reference rate.
 Request model top, execution model and actual declared response model separately;
 only known opencode-go/commandcode namespace is normalized for display, never
 bill/access control. Body modal lazy fetch, textContent, lexical JSON formatting

@@ -82,7 +82,8 @@ http://<cpa-host>:8317/v0/resource/plugins/cliproxyapi-credit-manager/index.html
 ```
 
 用 CPA 的**管理密钥**登录，然后在「客户端 Key」页建第一把 Key。
-明文只显示一次，请立即保存。
+新建/轮换时显示明文；新 Key 另有 AES-GCM 密文备份，可通过管理鉴权后的「查看密钥」再次展示并记审计。
+此前仅保存 HMAC 的旧 Key 不能恢复明文，须轮换后才能使用此功能。数据库与 pepper 均须妥善保护。
 默认在当前标签的 `sessionStorage` 保持登录，刷新无需重输；显式勾选「记住密钥」
 才写入 `localStorage`。不要在共享设备上记住管理密钥。
 
@@ -96,7 +97,7 @@ http://<cpa-host>:8317/v0/resource/plugins/cliproxyapi-credit-manager/index.html
 所有 `api` 请求都走宿主鉴权，需要 `Authorization: Bearer <管理密钥>`；
 非 GET 请求还必须带 `Content-Type: application/json`。下面用占位值演示。
 
-**建一把客户端 Key**（返回的 `key` 是唯一一次明文）：
+**建一把客户端 Key**（返回的 `key` 是客户端凭据，不会出现在列表或审计里）：
 
 ```sh
 curl -sS -X POST 'http://127.0.0.1:8317/v0/management/plugins/credit-manager/api/keys' \

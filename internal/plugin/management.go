@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"path"
+	"sort"
 	"strings"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
@@ -17,6 +18,14 @@ import (
 var managementRouteSuffixes = map[string][]string{
 	"/api/keys":              {http.MethodGet, http.MethodPost, http.MethodPut},
 	"/api/rotate":            {http.MethodPost},
+	"/api/reveal":            {http.MethodPost},
+	"/api/delete-key":        {http.MethodPost},
+	"/api/reset-spend":       {http.MethodPost},
+	"/api/callers":           {http.MethodGet, http.MethodPost, http.MethodPut},
+	"/api/audit":             {http.MethodGet},
+	"/api/overview":          {http.MethodGet},
+	"/api/model-catalog":     {http.MethodGet},
+	"/api/exchange-rate":     {http.MethodGet},
 	"/api/prices":            {http.MethodGet, http.MethodPut},
 	"/api/pricing-rules":     {http.MethodGet, http.MethodPut},
 	"/api/delete-price-rule": {http.MethodPost},
@@ -99,15 +108,11 @@ func (m *Manager) handleManagementRegister(request []byte) ([]byte, error) {
 
 // sortedManagementSuffixes returns the declared suffixes in a stable order.
 func sortedManagementSuffixes() []string {
-	order := []string{"/api/keys", "/api/rotate", "/api/prices", "/api/pricing-rules",
-		"/api/delete-price-rule", "/api/price-preview", "/api/usage", "/api/capture",
-		"/api/resolve", "/api/health"}
-	out := make([]string, 0, len(order))
-	for _, suffix := range order {
-		if _, ok := managementRouteSuffixes[suffix]; ok {
-			out = append(out, suffix)
-		}
+	out := make([]string, 0, len(managementRouteSuffixes))
+	for suffix := range managementRouteSuffixes {
+		out = append(out, suffix)
 	}
+	sort.Strings(out)
 	return out
 }
 
@@ -118,12 +123,28 @@ func managementRouteDescription(method, suffix string) string {
 		case http.MethodGet:
 			return "List credit keys."
 		case http.MethodPost:
-			return "Create a credit key and return its one-time plaintext."
+			return "Create a credit key and return its plaintext."
 		default:
 			return "Update a credit key specification."
 		}
 	case "/api/rotate":
 		return "Rotate a credit key material."
+	case "/api/reveal":
+		return "Reveal one recoverable credit key and audit the disclosure."
+	case "/api/delete-key":
+		return "Soft delete a credit key, preserving its ledger."
+	case "/api/reset-spend":
+		return "Reset selected quota baselines without clearing history or holds."
+	case "/api/callers":
+		return "Manage caller attribution metadata."
+	case "/api/audit":
+		return "Page the management audit trail."
+	case "/api/overview":
+		return "Full-selection usage, model distribution and efficiency metrics."
+	case "/api/model-catalog":
+		return "Preview the reference price catalog without changing prices."
+	case "/api/exchange-rate":
+		return "Read the display-only USD/CNY exchange rate."
 	case "/api/prices":
 		if method == http.MethodGet {
 			return "List configured model prices."

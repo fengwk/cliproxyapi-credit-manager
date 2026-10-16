@@ -64,6 +64,7 @@ func (h *Handler) SetStatus(version string, health func() string) {
 var assetMIMEs = map[string]string{
 	"index.html":                  "text/html; charset=utf-8",
 	"app.js":                      "text/javascript; charset=utf-8",
+	"admin-pricing.js":            "text/javascript; charset=utf-8",
 	"style.css":                   "text/css; charset=utf-8",
 	"charts.js":                   "text/javascript; charset=utf-8",
 	"numbers.js":                  "text/javascript; charset=utf-8",
@@ -158,6 +159,11 @@ func (h *Handler) Handle(req pluginapi.ManagementRequest) pluginapi.ManagementRe
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	switch req.Method + " " + strings.TrimPrefix(req.Path, BasePath) {
+	case "GET /api/overview":
+		return h.HandleAnalytics(ctx, req)
+	case "POST /api/reveal", "POST /api/delete-key", "POST /api/reset-spend",
+		"GET /api/callers", "POST /api/callers", "PUT /api/callers", "GET /api/audit":
+		return h.HandleKeyManagement(ctx, req)
 	case "GET /api/keys":
 		keys, err := h.db.ListKeys(ctx)
 		if err != nil {

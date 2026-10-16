@@ -33,11 +33,12 @@ import (
 type ModelMetrics struct {
 	Model string `json:"model"`
 	Summary
-	LatencyMS      int64 `json:"latency_ms"`
-	LatencySamples int64 `json:"latency_samples"`
-	TTFTMS         int64 `json:"ttft_ms"`
-	TTFTSamples    int64 `json:"ttft_samples"`
-	OutputTokens   int64 `json:"output_tokens"`
+	LatencyMS            int64 `json:"latency_ms"`
+	LatencySamples       int64 `json:"latency_samples"`
+	TTFTMS               int64 `json:"ttft_ms"`
+	TTFTSamples          int64 `json:"ttft_samples"`
+	OutputTokens         int64 `json:"output_tokens"`
+	MeasuredOutputTokens int64 `json:"measured_output_tokens"`
 }
 
 // Analytics is the management overview of one filtered selection: the same
@@ -99,11 +100,12 @@ func (s *Store) Analytics(ctx context.Context, f Filter) (Analytics, error) {
 // a mean is defined exactly when its sample count is positive; an unmeasured
 // execution contributes zero to the sum without dragging down the mean.
 const modelExecAggregate = execAggregate + `,
-	COALESCE(SUM(u.latency_ms),0),
+	COALESCE(SUM(CASE WHEN u.latency_ms > 0 THEN u.latency_ms ELSE 0 END),0),
 	COALESCE(SUM(CASE WHEN u.latency_ms > 0 THEN 1 ELSE 0 END),0),
-	COALESCE(SUM(u.ttft_ms),0),
+	COALESCE(SUM(CASE WHEN u.ttft_ms > 0 THEN u.ttft_ms ELSE 0 END),0),
 	COALESCE(SUM(CASE WHEN u.ttft_ms > 0 THEN 1 ELSE 0 END),0),
-	COALESCE(SUM(u.tokens_output + u.tokens_reasoning),0)`
+	COALESCE(SUM(u.tokens_output + u.tokens_reasoning),0),
+	COALESCE(SUM(CASE WHEN u.latency_ms > 0 THEN u.tokens_output + u.tokens_reasoning ELSE 0 END),0)`
 
 // reportModels aggregates three model-keyed result sets inside the caller's
 // snapshot: request-level counters, execution-level counters and adjustments.
@@ -164,12 +166,12 @@ func (s *Store) reportModels(ctx context.Context, q querier, where string, args 
 	for execRows.Next() {
 		var model string
 		var totals execTotals
-		var latencyMS, latencySamples, ttftMS, ttftSamples, outputTokens int64
+		var latencyMS, latencySamples, ttftMS, ttftSamples, outputTokens, measuredOutputTokens int64
 		if err := execRows.Scan(&model, &totals.executions, &totals.known, &totals.cost,
 			&totals.tokens.Input, &totals.tokens.CacheRead, &totals.tokens.CacheWrite,
 			&totals.tokens.Output, &totals.tokens.Reasoning, &totals.tokens.Total,
 			&totals.completeCacheRead, &totals.completeInputTotal,
-			&latencyMS, &latencySamples, &ttftMS, &ttftSamples, &outputTokens); err != nil {
+			&latencyMS, &latencySamples, &ttftMS, &ttftSamples, &outputTokens, &measuredOutputTokens); err != nil {
 			execRows.Close()
 			return nil, fmt.Errorf("scan model executions: %w", err)
 		}
@@ -183,6 +185,7 @@ func (s *Store) reportModels(ctx context.Context, q querier, where string, args 
 		metrics.TTFTMS = ttftMS
 		metrics.TTFTSamples = ttftSamples
 		metrics.OutputTokens = outputTokens
+		metrics.MeasuredOutputTokens = measuredOutputTokens
 	}
 	if err := execRows.Err(); err != nil {
 		execRows.Close()

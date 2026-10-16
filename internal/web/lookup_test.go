@@ -20,6 +20,7 @@ import (
 // match it exactly: adding a name here is a security decision, and no other
 // embedded file may become reachable through Asset.
 var exactAssets = []string{
+	"admin-pricing.js",
 	"app.js",
 	"charts.js",
 	"index.html",

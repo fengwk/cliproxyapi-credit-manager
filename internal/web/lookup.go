@@ -45,24 +45,32 @@ type requestLookup interface {
 	LookupRequest(ctx context.Context, keyID, requestID string) (credit.Request, error)
 }
 
+type customerReport interface {
+	LookupReport(context.Context, credit.Filter) (credit.Report, error)
+}
+
 // lookupKey is the sanitized self-service view of one key. It deliberately
 // carries quota and counters only: the principal, scope, fingerprint and any
 // key material never leave the store, and no other key is ever described.
 type lookupKey struct {
-	ID               string                   `json:"id"`
-	Label            string                   `json:"label"`
-	Enabled          bool                     `json:"enabled"`
-	QuotaMicroUSD    int64                    `json:"quota_micro_usd"`
-	DailyMicroUSD    int64                    `json:"daily_micro_usd"`
-	WeeklyMicroUSD   int64                    `json:"weekly_micro_usd"`
-	MonthlyMicroUSD  int64                    `json:"monthly_micro_usd"`
-	MaxConcurrent    int64                    `json:"max_concurrent"`
-	AllowedModels    []string                 `json:"allowed_models,omitempty"`
-	ModelTokenLimits []credit.ModelTokenLimit `json:"model_token_limits,omitempty"`
-	ExpiresAt        *time.Time               `json:"expires_at,omitempty"`
-	SpentMicroUSD    int64                    `json:"spent_micro_usd"`
-	HeldMicroUSD     int64                    `json:"held_micro_usd"`
-	CreatedAt        time.Time                `json:"created_at"`
+	ID                  string                   `json:"id"`
+	Label               string                   `json:"label"`
+	Enabled             bool                     `json:"enabled"`
+	QuotaMicroUSD       int64                    `json:"quota_micro_usd"`
+	DailyMicroUSD       int64                    `json:"daily_micro_usd"`
+	WeeklyMicroUSD      int64                    `json:"weekly_micro_usd"`
+	MonthlyMicroUSD     int64                    `json:"monthly_micro_usd"`
+	MaxConcurrent       int64                    `json:"max_concurrent"`
+	AllowedModels       []string                 `json:"allowed_models,omitempty"`
+	ModelTokenLimits    []credit.ModelTokenLimit `json:"model_token_limits,omitempty"`
+	ExpiresAt           *time.Time               `json:"expires_at,omitempty"`
+	SpentMicroUSD       int64                    `json:"spent_micro_usd"`
+	QuotaUsedMicroUSD   int64                    `json:"quota_used_micro_usd"`
+	DailyUsedMicroUSD   int64                    `json:"daily_used_micro_usd"`
+	WeeklyUsedMicroUSD  int64                    `json:"weekly_used_micro_usd"`
+	MonthlyUsedMicroUSD int64                    `json:"monthly_used_micro_usd"`
+	HeldMicroUSD        int64                    `json:"held_micro_usd"`
+	CreatedAt           time.Time                `json:"created_at"`
 }
 
 // lookupExecution is the sanitized execution view. The upstream credential
@@ -103,14 +111,15 @@ type lookupRequest struct {
 // lookupData is the self-service usage response: the authenticated key's own
 // quota summary plus its own summary, trend and paged request list.
 type lookupData struct {
-	Key           lookupKey       `json:"key"`
-	Summary       credit.Summary  `json:"summary"`
-	Trend         []credit.Point  `json:"trend"`
-	Items         []lookupRequest `json:"items"`
-	Total         int64           `json:"total"`
-	Page          int             `json:"page"`
-	PageSize      int             `json:"page_size"`
-	RetentionFrom time.Time       `json:"retention_from"`
+	Key           lookupKey             `json:"key"`
+	Summary       credit.Summary        `json:"summary"`
+	Trend         []credit.Point        `json:"trend"`
+	Items         []lookupRequest       `json:"items"`
+	Total         int64                 `json:"total"`
+	Page          int                   `json:"page"`
+	PageSize      int                   `json:"page_size"`
+	RetentionFrom time.Time             `json:"retention_from"`
+	Models        []credit.ModelMetrics `json:"models"`
 }
 
 // HandleLookup serves one unauthenticated customer self-service request.
@@ -183,7 +192,18 @@ func (h *Handler) lookupUsage(ctx context.Context, key credit.Key, query url.Val
 	}
 	filter.Page, _ = strconv.Atoi(query.Get("page"))
 	filter.PageSize, _ = strconv.Atoi(query.Get("page_size"))
-	report, err := h.db.Report(ctx, filter)
+	// GetKey hydrates effective quota counters for display; Authenticate
+	// intentionally avoids these management-only queries on the request path.
+	key, err = h.db.GetKey(ctx, key.ID)
+	if err != nil {
+		return failure(err)
+	}
+	var report credit.Report
+	if source, ok := h.db.(customerReport); ok {
+		report, err = source.LookupReport(ctx, filter)
+	} else {
+		report, err = h.db.Report(ctx, filter)
+	}
 	if err != nil {
 		return failure(err)
 	}
@@ -200,6 +220,7 @@ func (h *Handler) lookupUsage(ctx context.Context, key credit.Key, query url.Val
 		Page:          report.Page,
 		PageSize:      report.PageSize,
 		RetentionFrom: report.RetentionFrom,
+		Models:        report.Models,
 	})
 }
 
@@ -236,20 +257,24 @@ func (h *Handler) lookupCapture(ctx context.Context, key credit.Key, query url.V
 // sanitizeLookupKey projects a ledger key onto its public self-service shape.
 func sanitizeLookupKey(key credit.Key) lookupKey {
 	return lookupKey{
-		ID:               key.ID,
-		Label:            key.Spec.Label,
-		Enabled:          key.Spec.Enabled,
-		QuotaMicroUSD:    key.Spec.QuotaMicroUSD,
-		DailyMicroUSD:    key.Spec.DailyMicroUSD,
-		WeeklyMicroUSD:   key.Spec.WeeklyMicroUSD,
-		MonthlyMicroUSD:  key.Spec.MonthlyMicroUSD,
-		MaxConcurrent:    key.Spec.MaxConcurrent,
-		AllowedModels:    key.Spec.AllowedModels,
-		ModelTokenLimits: key.Spec.ModelTokenLimits,
-		ExpiresAt:        key.Spec.ExpiresAt,
-		SpentMicroUSD:    key.SpentMicroUSD,
-		HeldMicroUSD:     key.HeldMicroUSD,
-		CreatedAt:        key.CreatedAt,
+		ID:                  key.ID,
+		Label:               key.Spec.Label,
+		Enabled:             key.Spec.Enabled,
+		QuotaMicroUSD:       key.Spec.QuotaMicroUSD,
+		DailyMicroUSD:       key.Spec.DailyMicroUSD,
+		WeeklyMicroUSD:      key.Spec.WeeklyMicroUSD,
+		MonthlyMicroUSD:     key.Spec.MonthlyMicroUSD,
+		MaxConcurrent:       key.Spec.MaxConcurrent,
+		AllowedModels:       key.Spec.AllowedModels,
+		ModelTokenLimits:    key.Spec.ModelTokenLimits,
+		ExpiresAt:           key.Spec.ExpiresAt,
+		SpentMicroUSD:       key.SpentMicroUSD,
+		QuotaUsedMicroUSD:   key.QuotaUsedMicroUSD,
+		DailyUsedMicroUSD:   key.DailyUsedMicroUSD,
+		WeeklyUsedMicroUSD:  key.WeeklyUsedMicroUSD,
+		MonthlyUsedMicroUSD: key.MonthlyUsedMicroUSD,
+		HeldMicroUSD:        key.HeldMicroUSD,
+		CreatedAt:           key.CreatedAt,
 	}
 }
 

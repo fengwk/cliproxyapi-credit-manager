@@ -114,6 +114,11 @@ func (s *Store) pruneCounters(ctx context.Context, cutoff time.Time) error {
 			if err := pruneCounterTable(ctx, tx, "key_token_counters", win, age, periods); err != nil {
 				return err
 			}
+			for _, table := range []string{"key_money_baselines", "key_token_baselines"} {
+				if err := pruneCounterTable(ctx, tx, table, win, age, periods); err != nil {
+					return err
+				}
+			}
 		}
 		return nil
 	})

@@ -152,7 +152,12 @@ func scanPricingRule(scan func(...any) error) (PricingRule, error) {
 // PutPricingRule upserts one pricing rule. It is an administrator operation;
 // requests admitted earlier keep the price frozen on their snapshot.
 func (s *Store) PutPricingRule(ctx context.Context, rule PricingRule) error {
-	return putPricingRule(ctx, s.db, rule)
+	return s.inTx(ctx, func(tx *sql.Tx) error {
+		if err := putPricingRule(ctx, tx, rule); err != nil {
+			return err
+		}
+		return insertAudit(ctx, tx, s.nowUTC(), ActionRuleUpdate, "", "", "", "rule_id="+strings.TrimSpace(rule.ID))
+	})
 }
 
 func putPricingRule(ctx context.Context, q querier, rule PricingRule) error {
@@ -193,18 +198,20 @@ func (s *Store) DeletePricingRule(ctx context.Context, id string) error {
 	if id == "" {
 		return fmt.Errorf("%w: pricing rule id is required", ErrInvalid)
 	}
-	res, err := s.db.ExecContext(ctx, `DELETE FROM pricing_rules WHERE id = ?`, id)
-	if err != nil {
-		return fmt.Errorf("delete pricing rule: %w", err)
-	}
-	n, err := res.RowsAffected()
-	if err != nil {
-		return fmt.Errorf("delete pricing rule: %w", err)
-	}
-	if n == 0 {
-		return fmt.Errorf("%w: pricing rule %s", ErrNotFound, id)
-	}
-	return nil
+	return s.inTx(ctx, func(tx *sql.Tx) error {
+		res, err := tx.ExecContext(ctx, `DELETE FROM pricing_rules WHERE id = ?`, id)
+		if err != nil {
+			return fmt.Errorf("delete pricing rule: %w", err)
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("delete pricing rule: %w", err)
+		}
+		if n == 0 {
+			return fmt.Errorf("%w: pricing rule %s", ErrNotFound, id)
+		}
+		return insertAudit(ctx, tx, s.nowUTC(), ActionRuleDelete, "", "", "", "rule_id="+id)
+	})
 }
 
 // ListPricingRules returns every rule in resolution order.

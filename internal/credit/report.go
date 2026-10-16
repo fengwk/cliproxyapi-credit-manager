@@ -13,6 +13,16 @@ import (
 // Report summarizes and pages request history. Aggregation happens in SQLite;
 // only the current page hydrates nested executions.
 func (s *Store) Report(ctx context.Context, f Filter) (Report, error) {
+	return s.report(ctx, f, false)
+}
+
+// LookupReport includes full-selection model metrics without widening the
+// paged item query. Both sets are read from the same financial snapshot.
+func (s *Store) LookupReport(ctx context.Context, f Filter) (Report, error) {
+	return s.report(ctx, f, true)
+}
+
+func (s *Store) report(ctx context.Context, f Filter, includeModels bool) (Report, error) {
 	now := s.nowUTC()
 	from, to, err := s.reportRange(f, now)
 	if err != nil {
@@ -57,6 +67,12 @@ func (s *Store) Report(ctx context.Context, f Filter) (Report, error) {
 			Page:          page,
 			PageSize:      size,
 			RetentionFrom: s.retentionFrom(now),
+		}
+		if includeModels {
+			out.Models, err = s.reportModels(ctx, q, where, args, execWhere, execArgs)
+			if err != nil {
+				return err
+			}
 		}
 		return nil
 	})
@@ -533,6 +549,14 @@ func (s *Store) Resolve(ctx context.Context, id string, resolution Resolution) e
 			}
 			req.charge = next
 		}
-		return s.settleRequest(ctx, tx, req, at, resolution.Action)
+		if err := s.settleRequest(ctx, tx, req, at, resolution.Action); err != nil {
+			return err
+		}
+		key, err := loadKey(ctx, tx, "id = ?", req.keyID)
+		if err != nil {
+			return err
+		}
+		return insertAudit(ctx, tx, at, ActionResolve, req.keyID, key.callerID,
+			resolution.Reason, fmt.Sprintf("request_id=%s action=%s amount_micro_usd=%d", req.id, resolution.Action, amount))
 	})
 }

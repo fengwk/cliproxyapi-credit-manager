@@ -15,14 +15,18 @@ import (
 
 // Audit actions. They are the stable vocabulary of the management audit trail.
 const (
-	ActionCreate     = "create"
-	ActionUpdate     = "update"
-	ActionRotate     = "rotate"
-	ActionReveal     = "reveal"
-	ActionDelete     = "delete"
-	ActionReset      = "reset"
-	ActionCallerNew  = "caller_create"
-	ActionCallerEdit = "caller_update"
+	ActionCreate      = "create"
+	ActionUpdate      = "update"
+	ActionRotate      = "rotate"
+	ActionReveal      = "reveal"
+	ActionDelete      = "delete"
+	ActionReset       = "reset"
+	ActionCallerNew   = "caller_create"
+	ActionCallerEdit  = "caller_update"
+	ActionPriceUpdate = "price_update"
+	ActionRuleUpdate  = "rule_update"
+	ActionRuleDelete  = "rule_delete"
+	ActionResolve     = "resolve"
 )
 
 // materialKeyDomain separates the key-material encryption key from the key
@@ -226,6 +230,9 @@ func (s *Store) DeleteKey(ctx context.Context, id, reason string) error {
 		return fmt.Errorf("%w: key id is required", ErrInvalid)
 	}
 	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		return fmt.Errorf("%w: deletion reason is required", ErrInvalid)
+	}
 	return s.inTx(ctx, func(tx *sql.Tx) error {
 		key, err := loadKey(ctx, tx, "id = ?", id)
 		if err != nil {
