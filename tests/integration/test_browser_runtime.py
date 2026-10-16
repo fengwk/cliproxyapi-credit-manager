@@ -20,6 +20,13 @@ class BrowserRuntimeTests(unittest.TestCase):
                 driver.chromium.launch.side_effect = RuntimeError("launch failed")
                 ctx = MagicMock()
                 ctx.artifacts = "/synthetic"
+                # The cases seed a host before they launch a browser; make the
+                # synthetic context support that setup so every case still
+                # reaches (and fails at) the browser launch boundary.
+                ctx.new_key.return_value = ({}, "key")
+                ctx.set_price.return_value = MagicMock(status=200)
+                ctx.client.chat.return_value = MagicMock(status=200)
+                ctx.client.post.return_value = MagicMock(status=200)
                 with patch.object(browser, "_launch", return_value=driver), patch.object(
                     browser, "_seed", return_value=({}, "key", {"started_at": "2026-01-01T00:00:00Z"})
                 ):

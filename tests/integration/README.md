@@ -119,9 +119,15 @@ Each case's host lives at `<artifacts>/host-<n>-<case>/` with `config.yaml`,
 | `lifecycle` | Unknown usage stays pending (never free); client cancel does not hang and keeps the hold; restart retains the settled balance and keeps unfinished work pending. |
 | `retry` | A 429 on the first upstream credential fails over, one client request, two independent per-attempt usage rows (failed-unknown not written off), hold retained; all-failures never bill as free. |
 | `warmup` | Background warmup: default-off issues no background activity; enabled issues a *real* pinned host model execution (upstream 1, host log shows credential selection with no client scope) that creates no customer ledger row/hold/charge; an unknown `AuthID` fails with no host-side fallback; with a single bound credential a customer request runs alongside the worker on the *exact same AuthID* and is billed; a forged warmup session header is still billed in full; reconfiguring to disabled leaves no residual worker. |
-| `affinity` | Native CPA session-affinity scheduling (`routing.session-affinity: true`, default round-robin, two synthetic credentials): an explicit `X-Session-ID` shared by three requests with different user content, and a grown conversation prefix (system+user stable, assistant+user appended) with **no** session header, each keep every request on one credential (identical `AuthID` and upstream key) and bill 3 x 14 = 42. Unrelated requests without a session do alternate the two credentials, so the binding is not a default. |
+| `affinity` | Native CPA session-affinity scheduling (`routing.session-affinity: true`, default round-robin, two synthetic credentials): an explicit `X-Session-ID` shared by three requests with different user content, and a grown conversation prefix (system+user stable, assistant+user appended) with **no** session header, each keep every request on one credential (identical `AuthID` and upstream key) and bill 3 x 14 = 42. Unrelated requests without a session do alternate the two credentials, so the binding is not a default. A third case binds an explicit session, then reassigns the key's caller and rotates the key material, and asserts the same session stays on the same `AuthID`/upstream key. |
 | `gemini` | Native `generateContent` and `streamGenerateContent` (`alt=sse`) authenticate, forward the upstream Google key and bill. |
-| `browser` | Real isolated Chromium: per-tab session login, optional remembered reload, logout clearing storage/charts, real ECharts/month query, lazy capture-body modal with redaction/64-bit fidelity, customer own-key snapshot lookup. |
+| `browser` | Real isolated Chromium: per-tab session login, optional remembered reload, logout clearing storage/charts, real ECharts/month query, lazy capture-body modal with redaction/64-bit fidelity, customer own-key snapshot lookup, the default overview tab's real ECharts aggregate, an advanced rule saved through the DOM with a lossless 2^53+1 rate, and customer model-data isolation. |
+| `management` | Every declared management route denies a missing and a wrong credential without leaking data; the read routes succeed with the management secret. |
+| `keyops` | Caller attribution metadata (server principal/scope/fingerprint, stable across reads; a disabled caller never disables its key) and reveal/rotate/soft-delete keeping the ledger, history and an unfinished hold, with a retained pending request still settling. |
+| `reset` | `reset-spend` re-opens the quota baseline only: it keeps the lifetime ledger, the request history and an in-flight hold (which still settles). |
+| `audit` | Key, pricing-rule and resolve operations are all audited (newest first, with identifiers/reasons/details) and never contain a plaintext key. |
+| `pricing` | Nested rate sheets keep exact signed 64-bit values (2^53+1, int64 max) across save/reload without touching the ledger; rule context/service tiers resolve exactly; a native chat bills `per_image` by the requested count while an out-of-range count (100) is denied before any upstream call. |
+| `reference` | `/api/model-catalog` and `/api/exchange-rate` are management-gated and, with host egress pinned to a closed loopback port, answer the safe `unavailable` envelope instead of live prices. |
 
 ## Environment notes
 
@@ -140,3 +146,8 @@ Each case's host lives at `<artifacts>/host-<n>-<case>/` with `config.yaml`,
   with `disk quota exceeded`.
 - The browser module requires a locally cached Playwright Chromium; if it is
   missing the case fails with an explicit message rather than silently passing.
+- The host is launched with `HTTP_PROXY`/`HTTPS_PROXY` pinned to a closed
+  loopback port, so the plugin's reference catalog and FX routes can never reach
+  the public internet from a run (the `reference` module asserts the safe
+  `unavailable` envelope); loopback traffic is exempted, so the upstream mock
+  and the harness are unaffected.
