@@ -46,6 +46,17 @@ func managementRequest(method, suffix, body string) pluginapi.ManagementRequest 
 	}
 }
 
+// Well-formed RFC3339 dates may still exceed the ledger timestamp range.
+func TestUsageRangeRejectsTimestampOverflow(t *testing.T) {
+	h := testHandler(t)
+	req := managementRequest("GET", "/api/usage", "")
+	req.Query.Set("from", "2026-01-01T00:00:00Z")
+	req.Query.Set("to", "2500-01-01T00:00:00Z")
+	if got := h.Handle(req); got.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status=%d body=%s", got.StatusCode, got.Body)
+	}
+}
+
 // Rejected requests must not change financial state, even if their JSON is valid.
 func TestManagementBoundary(t *testing.T) {
 	h := testHandler(t)

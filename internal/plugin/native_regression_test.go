@@ -4,6 +4,7 @@ import (
 	"context"
 	"testing"
 
+	"github.com/fengwk/cliproxyapi-credit-manager/internal/credit"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 )
 
@@ -48,7 +49,18 @@ func TestNativeUsageWithoutTimestampReplaysIdempotently(t *testing.T) {
 	}
 	h.usage(record)
 	h.usage(record)
+	h.complete("request-replay", "trace-replay", pluginapi.RequestCompletionSucceeded)
+	// A duplicate after settlement must neither add a charge nor reopen a hold.
+	h.usage(record)
 	if message := h.m.LastError(); message != "" {
 		t.Fatalf("identical replay degraded health: %s", message)
+	}
+	key, err := h.store().GetKey(context.Background(), h.key.ID)
+	if err != nil || key.SpentMicroUSD != 20 || key.HeldMicroUSD != 0 {
+		t.Fatalf("replayed key=%+v err=%v", key, err)
+	}
+	report, err := h.store().Report(context.Background(), credit.Filter{KeyID: h.key.ID})
+	if err != nil || report.Summary.Executions != 1 || report.Summary.CostMicroUSD != 20 || report.Summary.Tokens.Total != 15 {
+		t.Fatalf("replayed summary=%+v err=%v", report.Summary, err)
 	}
 }

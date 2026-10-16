@@ -23,6 +23,10 @@ func (s *Store) Report(ctx context.Context, f Filter) (Report, error) {
 		to = now.Add(time.Nanosecond)
 	}
 	from, to = from.UTC(), to.UTC()
+	// UnixNano silently wraps instants outside SQLite's int64 timestamp range.
+	if !time.Unix(0, from.UnixNano()).Equal(from) || !time.Unix(0, to.UnixNano()).Equal(to) {
+		return Report{}, fmt.Errorf("%w: report range is not representable at nanosecond precision", ErrInvalid)
+	}
 	if !to.After(from) {
 		return Report{}, fmt.Errorf("%w: report range is empty", ErrInvalid)
 	}

@@ -846,6 +846,35 @@ async function main() {
       check('登出后没有残留的明文密钥弹窗', (await cdp.evaluate("document.querySelector('#modal-root').hidden === true")) === true);
     });
 
+    await step('已关闭弹窗的失败不能解除新弹窗的重复提交保护', async () => {
+      await loginFresh('弹窗提交所有权');
+      await cdp.clickText('.tab', '客户端 Key');
+      await cdp.waitFor("document.querySelectorAll('#keys-list tbody tr').length === 2", 10000, 'Key 列表');
+      await deferFetch();
+      await cdp.clickText('#panel-keys button', '新建 Key');
+      await cdp.clickText('.modal button', '创建');
+      await cdp.clickText('.modal-head button', '关闭');
+      await cdp.clickText('#panel-keys button', '新建 Key');
+      await cdp.clickText('.modal button', '创建');
+      await cdp.clickText('.modal button', '创建');
+      check('挂起的创建请求不能重复提交', (await cmFetch('calls.length')) === 2);
+      await cmFetch("reject(0, 'old dialog failed')");
+      await drain();
+      check(
+        '旧弹窗失败不会启用新弹窗的提交按钮',
+        await cdp.evaluate("document.querySelector('.modal-foot .btn-primary').disabled === true")
+      );
+      await cdp.clickText('.modal button', '创建');
+      check('旧弹窗失败后仍不能重复创建', (await cmFetch('calls.length')) === 2);
+      await cmFetch("reject(1, 'current dialog failed')");
+      await drain();
+      check(
+        '当前弹窗失败后允许重试',
+        await cdp.evaluate("document.querySelector('.modal-foot .btn-primary').disabled === false")
+      );
+      await realFetch();
+    });
+
     await step('同一密钥重新登录后旧会话的迟到 401 不得踢掉新会话', async () => {
       await loginFresh('迟到 401');
       await deferFetch();

@@ -2994,12 +2994,11 @@
               return;
             }
             errorNode.hidden = true;
-            this.disabled = true;
+            var submitButton = this;
+            submitButton.disabled = true;
             saveKey(handle, existing, fields, function () {
-              // 只有失败时才需要恢复按钮；成功路径会关闭弹窗。
-              handle.root.querySelectorAll('.modal-foot button').forEach(function (node) {
-                node.disabled = false;
-              });
+              // 只恢复发起本次提交的按钮，不触碰后来打开的弹窗。
+              submitButton.disabled = false;
             });
           },
         }),
@@ -3029,8 +3028,8 @@
         }
       },
       function (error) {
-        if (onFailure) onFailure();
         if (failRequest(error)) return;
+        if (onFailure) onFailure();
         handle.setError(describeError(error));
       }
     );

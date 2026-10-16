@@ -162,3 +162,26 @@ func TestReportRejectsOffsetOverflow(t *testing.T) {
 		t.Fatalf("safe extreme page = items %d total %d page %d size %d", len(rep.Items), rep.Total, rep.Page, rep.PageSize)
 	}
 }
+
+// Range timestamps must not wrap before they become SQLite predicates.
+func TestReportRejectsUnrepresentableRange(t *testing.T) {
+	h := newHarness(t)
+	for _, f := range []Filter{
+		{From: testEpoch, To: time.Date(2500, 1, 1, 0, 0, 0, 0, time.UTC)},
+		{From: time.Date(1500, 1, 1, 0, 0, 0, 0, time.UTC), To: testEpoch},
+	} {
+		if report, err := h.store.Report(h.ctx(), f); !errors.Is(err, ErrInvalid) {
+			t.Errorf("range %s..%s: report=%+v err=%v, want ErrInvalid", f.From, f.To, report, err)
+		}
+	}
+
+	h.mustPrice("m1", Rates{Input: million})
+	key, _ := h.mustKey(KeySpec{Enabled: true})
+	h.mustReserve(ReserveInput{ID: "range", TraceID: "range", KeyID: key.ID, RequestedModel: "m1"})
+	report, err := h.store.Report(h.ctx(), Filter{
+		From: time.Unix(0, math.MinInt64), To: time.Unix(0, math.MaxInt64),
+	})
+	if err != nil || report.Total != 1 {
+		t.Fatalf("representable range total=%d err=%v", report.Total, err)
+	}
+}
