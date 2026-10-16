@@ -302,6 +302,9 @@ async function main() {
     check('概览卡片包含总请求数与总成本', overviewSummary.includes('总请求数') && overviewSummary.includes('总成本'));
     check('概览模型占比卡片存在', await cdp.evaluate("!!document.querySelector('#overview-model-share')"));
     check('概览模型效率排行卡片存在', await cdp.evaluate("!!document.querySelector('#overview-model-rank')"));
+    check('概览 Token 趋势使用真实嵌套桶而非空折线', await cdp.evaluate(
+      "echarts.getInstanceByDom(document.getElementById('overview-token-chart')).getOption().series.some(s => s.data.some(v => Number(v) > 0))"
+    ));
     await cdp.screenshot('02-overview.png');
 
     /* --- 2b. 切换到使用统计面板 --- */

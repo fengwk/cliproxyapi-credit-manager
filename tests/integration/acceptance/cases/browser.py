@@ -455,11 +455,11 @@ def lookup_own_key_capture(ctx):
         return {"key_label": "browser-lookup", "modal_chars": len(modal)}
 
 
-OVERVIEW_CHART_IDS = ["overview-token-chart", "overview-cost-chart"]
+OVERVIEW_CHART_IDS = ["overview-token-chart", "overview-cost-chart", "overview-model-share"]
 
 
 def _wait_overview_charts(page):
-    """Wait until both overview charts are real, positively-sized ECharts SVGs."""
+    """Wait until overview trends and model share are real, positively-sized SVGs."""
     page.wait_for_function(
         "() => { var ids = " + repr(OVERVIEW_CHART_IDS) + ";"
         " if (!window.echarts) return false;"
@@ -496,17 +496,23 @@ def _overview_state(page):
       "the default overview tab draws real ECharts SVGs and the operator's own aggregate from a real host")
 def overview_charts(ctx):
     # The default view is the 概览 tab; a seeded request gives it real aggregate
-    # data, so the operator's own summary and both trend charts must render.
+    # data, so its summary, trend charts and model-share donut must render.
     item, key, request = _seed(ctx, "browser-overview")
     with _browser() as browser:
         context = browser.new_context()
         page = context.new_page()
         _login_shell(page, ctx)
         page.wait_for_selector("#panel-overview:not([hidden])", timeout=15000)
+        # The tab is visible before its asynchronous aggregate response arrives.
+        page.wait_for_selector("#overview-summary", state="visible", timeout=15000)
         check(page.is_visible("#overview-summary"), "the overview summary is visible by default")
 
         _wait_overview_charts(page)
         state = _overview_state(page)
+        check(page.evaluate(
+            "() => echarts.getInstanceByDom(document.getElementById('overview-token-chart'))"
+            ".getOption().series.some(s => s.data.some(v => Number(v) > 0))"
+        ), "the real token trend contains the seeded usage, not just empty axes")
         check(state["echarts"], "the real ECharts runtime is loaded on the overview tab")
         for chart_id in OVERVIEW_CHART_IDS:
             info = state["charts"][chart_id]
