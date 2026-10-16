@@ -64,6 +64,9 @@ const (
 	// slack) charged to the storage budget in addition to stored bytes.
 	rowOverhead = 512
 
+	// Bound ID memory and index overhead independently of the body.
+	maxRequestIDBytes = 128
+
 	// statusRingLimit bounds the in-memory memory of recent outcomes. Metadata
 	// per dropped request is small and TTL bound, never unbounded on disk.
 	statusRingLimit = 4096
@@ -228,6 +231,11 @@ func (s *Store) Enqueue(snapshot Snapshot) {
 	}
 	if snapshot.RequestID == "" {
 		// Without an id the snapshot can never be retrieved.
+		s.countDropped()
+		return
+	}
+	if len(snapshot.RequestID) > maxRequestIDBytes {
+		// Do not retain an oversized ID even in the status ring.
 		s.countDropped()
 		return
 	}
@@ -535,6 +543,20 @@ type statusEntry struct {
 	status    string
 	at        time.Time
 	expiresAt time.Time
+	// evidenceUntil, when set, is how long the outcome is remembered after the
+	// snapshot itself is gone. The entry's own expiresAt is always the original
+	// snapshot lifetime, so Get never rewrites it when remembering an expiry or
+	// eviction.
+	evidenceUntil time.Time
+}
+
+// retainedUntil reports when the remembered outcome stops being served: the
+// explicit evidence lifetime when set, otherwise the snapshot's own expiry.
+func (e statusEntry) retainedUntil() time.Time {
+	if !e.evidenceUntil.IsZero() {
+		return e.evidenceUntil
+	}
+	return e.expiresAt
 }
 
 // statusRing is a small fixed capacity FIFO of recent outcomes. Entries are
@@ -569,7 +591,7 @@ func (r *statusRing) lookup(id string, now time.Time) (statusEntry, bool) {
 		if entry.id != id {
 			continue
 		}
-		if !now.Before(entry.expiresAt) {
+		if !now.Before(entry.retainedUntil()) {
 			return statusEntry{}, false
 		}
 		return entry, true
@@ -585,7 +607,7 @@ func (r *statusRing) prune(now time.Time) {
 	kept := make([]statusEntry, 0, r.size)
 	for i := 0; i < r.size; i++ {
 		entry := r.buf[(r.head+i)%len(r.buf)]
-		if now.Before(entry.expiresAt) {
+		if now.Before(entry.retainedUntil()) {
 			kept = append(kept, entry)
 		}
 	}

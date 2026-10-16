@@ -12,6 +12,18 @@ import (
 // redactedValue replaces sensitive header values and obvious JSON secret fields.
 const redactedValue = "[redacted]"
 
+const (
+	// maxJSONNodes bounds the number of JSON values the preflight walk accepts,
+	// counting composite values, object keys and scalar values. A compact body
+	// can expand into a huge object graph; the bound is charged while the body
+	// is still a token stream, so an over-complex body is dropped before the
+	// graph is built.
+	maxJSONNodes = 100000
+	// maxJSONDepth bounds JSON nesting so a deeply nested body cannot exhaust
+	// memory or the stack while it is decoded.
+	maxJSONDepth = 256
+)
+
 // errRedactionFailed is returned for a body that is JSON shaped but cannot be
 // decoded as one complete document (invalid JSON, excessive nesting or trailing
 // content). The snapshot is dropped instead of being stored unredacted, because
@@ -153,6 +165,101 @@ func looksLikeJSON(b []byte) bool {
 	return false
 }
 
+// preflightJSON bounds structure before allocating the decoded object graph.
+// Duplicate decoded keys are refused: last-wins map decoding can hide an earlier
+// secret while the original bytes would otherwise be kept as "unchanged".
+func preflightJSON(raw []byte) error {
+	type scope struct {
+		object    bool
+		keys      map[string]struct{}
+		expectKey bool
+	}
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+
+	var stack []scope
+	nodes := 0
+	rootDone := false
+
+	for {
+		token, err := dec.Token()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return errRedactionFailed
+		}
+		if rootDone {
+			// A single root value was already read; anything else is a second
+			// document or trailing content.
+			return errRedactionFailed
+		}
+		switch value := token.(type) {
+		case json.Delim:
+			switch value {
+			case '{', '[':
+				nodes++
+				if nodes > maxJSONNodes || len(stack) >= maxJSONDepth {
+					return errRedactionFailed
+				}
+				stack = append(stack, scope{object: value == '{', expectKey: value == '{'})
+			case '}', ']':
+				if len(stack) == 0 {
+					return errRedactionFailed
+				}
+				closed := stack[len(stack)-1]
+				stack = stack[:len(stack)-1]
+				if closed.object != (value == '}') {
+					return errRedactionFailed
+				}
+				if len(stack) == 0 {
+					rootDone = true
+					continue
+				}
+				// The closed composite is a value of its parent object.
+				if parent := &stack[len(stack)-1]; parent.object {
+					parent.expectKey = true
+				}
+			default:
+				return errRedactionFailed
+			}
+		case string:
+			nodes++
+			if nodes > maxJSONNodes {
+				return errRedactionFailed
+			}
+			if n := len(stack); n > 0 && stack[n-1].object {
+				top := &stack[n-1]
+				if top.expectKey {
+					if top.keys == nil {
+						top.keys = make(map[string]struct{})
+					}
+					if _, duplicate := top.keys[value]; duplicate {
+						return errRedactionFailed
+					}
+					top.keys[value] = struct{}{}
+					top.expectKey = false
+					continue
+				}
+				// A string value satisfies the pending key of its parent object.
+				top.expectKey = true
+			}
+		default:
+			nodes++
+			if nodes > maxJSONNodes {
+				return errRedactionFailed
+			}
+			if n := len(stack); n > 0 && stack[n-1].object {
+				stack[n-1].expectKey = true
+			}
+		}
+	}
+	if len(stack) != 0 || !rootDone {
+		return errRedactionFailed
+	}
+	return nil
+}
+
 // redactJSONBody redacts obvious secret fields of a JSON body recursively.
 //
 // The returned body is the original byte slice (and changed is false) whenever
@@ -161,15 +268,20 @@ func looksLikeJSON(b []byte) bool {
 // actually removed.
 //
 // A body that is JSON shaped but cannot be decoded as one complete document
-// (invalid JSON, nesting past the decoder limit, trailing content) reports
-// errRedactionFailed so the caller drops the snapshot: redaction cannot be
-// guaranteed for it, and storing it unredacted would leak secrets. Numbers are
-// decoded with json.Number so that 64-bit integer text survives redaction
-// unchanged.
+// (invalid JSON, duplicate keys, excessive nesting or complexity, trailing
+// content) reports errRedactionFailed so the caller drops the snapshot:
+// redaction cannot be guaranteed for it, and storing it unredacted would leak
+// secrets. Numbers are decoded with json.Number so that 64-bit integer text
+// survives redaction unchanged.
 func redactJSONBody(raw []byte) (out []byte, changed bool, err error) {
 	if !looksLikeJSON(raw) {
 		// Not JSON shaped: plain text and binary diagnostics are kept as they are.
 		return raw, false, nil
+	}
+	// Reject duplicate keys, malformed and over-complex documents before the
+	// full decode builds an object graph.
+	if err := preflightJSON(raw); err != nil {
+		return nil, false, errRedactionFailed
 	}
 	dec := json.NewDecoder(bytes.NewReader(raw))
 	dec.UseNumber()

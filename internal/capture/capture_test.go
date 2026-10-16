@@ -941,3 +941,163 @@ func TestUndecodableJSONBodiesAreNeverStored(t *testing.T) {
 		t.Fatalf("valid body = %q, want redacted secret", detail.Body)
 	}
 }
+
+// millionEmptyObjects builds a shallow but node-dense JSON body: one array that
+// holds a million empty objects. It is ~3MB of valid JSON, so a decoder that
+// materializes the whole object graph would build a million maps before the
+// redactor could decide that nothing needed redaction.
+func millionEmptyObjects(t *testing.T) []byte {
+	t.Helper()
+	var builder bytes.Buffer
+	builder.Grow(3 << 20)
+	builder.WriteByte('[')
+	for i := 0; i < 1_000_000; i++ {
+		if i != 0 {
+			builder.WriteByte(',')
+		}
+		builder.WriteString("{}")
+	}
+	builder.WriteByte(']')
+	return builder.Bytes()
+}
+
+// TestCaptureDropsDuplicateJSONKeys covers the proven duplicate-key privacy
+// defect end to end: a secret shadowed by a later duplicate key (including an
+// escape-equivalent key) previously decoded to a value that no longer held the
+// secret, so redaction reported "unchanged" and stored the original bytes with
+// the secret. Such bodies must be dropped instead, never served and never
+// mutate the caller's memory that is forwarded upstream.
+func TestCaptureDropsDuplicateJSONKeys(t *testing.T) {
+	clock := newTestClock()
+	store, _ := openTestStore(t, testConfig(1<<20, 1<<30), clock, nil)
+
+	bodies := map[string][]byte{
+		"shadowed": []byte(`{"x":{"api_key":"synthetic-secret"},"x":null}`),
+		"escaped":  []byte(`{"x":{"api_key":"synthetic-secret"},"\u0078":null}`),
+		"plain":    []byte(`{"api_key":"first","api_key":"second"}`),
+	}
+	originals := make(map[string][]byte, len(bodies))
+	for id, body := range bodies {
+		originals[id] = append([]byte(nil), body...)
+		store.Enqueue(Snapshot{RequestID: id, Body: body})
+	}
+	flush(t, store)
+
+	if rows := countRows(t, store); rows != 0 {
+		t.Fatalf("%d rows stored, want none: duplicate-key bodies must be dropped", rows)
+	}
+	if stats := store.Stats(); stats.Dropped != int64(len(bodies)) {
+		t.Fatalf("Dropped = %d, want %d", stats.Dropped, len(bodies))
+	}
+	for id := range bodies {
+		detail, err := store.Get(id)
+		if err != nil {
+			t.Fatalf("Get(%s): %v", id, err)
+		}
+		if detail.Status != StatusDropped {
+			t.Fatalf("Get(%s) status = %q, want %q", id, detail.Status, StatusDropped)
+		}
+		if strings.Contains(detail.Body, "synthetic-secret") || strings.Contains(detail.Body, "second") {
+			t.Fatalf("Get(%s) served a shadowed secret: %q", id, detail.Body)
+		}
+		if !bytes.Equal(bodies[id], originals[id]) {
+			t.Fatalf("forwarded body %s was mutated", id)
+		}
+	}
+}
+
+// TestCaptureDropsExcessiveJSONComplexity verifies that a body inside the raw
+// byte limit which expands into a huge object graph is discarded under the
+// parsing-complexity budget, while ordinary JSON keeps working exactly as
+// before and the caller's body is never touched.
+func TestCaptureDropsExcessiveJSONComplexity(t *testing.T) {
+	clock := newTestClock()
+	store, _ := openTestStore(t, testConfig(8<<20, 1<<30), clock, nil)
+
+	body := millionEmptyObjects(t)
+	if int64(len(body)) > store.cfg.MaxBodyBytes {
+		t.Fatalf("test body is %d bytes, want inside the %d byte body limit", len(body), store.cfg.MaxBodyBytes)
+	}
+	original := append([]byte(nil), body...)
+	store.Enqueue(Snapshot{RequestID: "complex", Body: body})
+	flush(t, store)
+
+	detail, err := store.Get("complex")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if detail.Status != StatusDropped {
+		t.Fatalf("status = %q, want %q", detail.Status, StatusDropped)
+	}
+	if detail.Body != "" {
+		t.Fatalf("complex body was served: %d bytes", len(detail.Body))
+	}
+	if !bytes.Equal(body, original) {
+		t.Fatal("caller body was mutated")
+	}
+	if rows := countRows(t, store); rows != 0 {
+		t.Fatalf("%d rows stored, want none", rows)
+	}
+
+	enqueue(store, "ordinary", []byte(`{"model":"gpt","messages":[{"role":"user","content":"hi"}]}`))
+	flush(t, store)
+	if got := statusOf(t, store, "ordinary"); got != StatusCaptured {
+		t.Fatalf("ordinary status = %q, want %q", got, StatusCaptured)
+	}
+}
+
+// TestComplexityPreflightDoesNotBuildLargeObjectGraph measures the memory bound
+// directly: a 3MB body with a million nodes is rejected while allocating only a
+// small fraction of the object graph the old decoder would have built. It does
+// not run in parallel because it reads the process heap counters.
+func TestComplexityPreflightDoesNotBuildLargeObjectGraph(t *testing.T) {
+	body := millionEmptyObjects(t)
+	runtime.GC()
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	out, changed, err := redactJSONBody(body)
+	runtime.ReadMemStats(&after)
+
+	if !errors.Is(err, errRedactionFailed) {
+		t.Fatalf("error = %v, want %v", err, errRedactionFailed)
+	}
+	if changed || out != nil {
+		t.Fatalf("got (%q, %v), want no output", out, changed)
+	}
+	if grown := after.TotalAlloc - before.TotalAlloc; grown > 64<<20 {
+		t.Fatalf("rejecting a %d byte body allocated %d bytes, want at most %d", len(body), grown, uint64(64<<20))
+	}
+}
+
+// TestOversizedRequestIDIsCountedNotRemembered verifies the request id bound: an
+// unusably long id is counted as dropped but is never written to the status
+// ring or to disk, so the ring and its row overhead stay bounded. The exact
+// boundary length is still captured.
+func TestOversizedRequestIDIsCountedNotRemembered(t *testing.T) {
+	clock := newTestClock()
+	store, _ := openTestStore(t, testConfig(1<<20, 1<<30), clock, nil)
+
+	huge := strings.Repeat("a", maxRequestIDBytes+1)
+	store.Enqueue(Snapshot{RequestID: huge, Body: []byte(`{"secret":"leak"}`)})
+	if stats := store.Stats(); stats.Dropped != 1 {
+		t.Fatalf("Dropped = %d, want 1", stats.Dropped)
+	}
+	flush(t, store)
+	if rows := countRows(t, store); rows != 0 {
+		t.Fatalf("%d rows stored, want none", rows)
+	}
+	detail, err := store.Get(huge)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if detail.Status != StatusUnavailable {
+		t.Fatalf("oversized id status = %q, want %q", detail.Status, StatusUnavailable)
+	}
+
+	boundary := strings.Repeat("b", maxRequestIDBytes)
+	enqueue(store, boundary, []byte("body"))
+	flush(t, store)
+	if got := statusOf(t, store, boundary); got != StatusCaptured {
+		t.Fatalf("boundary id status = %q, want %q", got, StatusCaptured)
+	}
+}
