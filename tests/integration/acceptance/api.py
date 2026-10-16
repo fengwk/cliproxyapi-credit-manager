@@ -116,6 +116,49 @@ class Manager:
             {"id": request_id, "action": action, "amount_micro_usd": amount_micro_usd, "reason": reason},
         )
 
+    # Extended management surface (aligned features) ------------------------
+    def callers(self):
+        return self.call("GET", "/api/callers")
+
+    def create_caller(self, spec):
+        return self.call("POST", "/api/callers", spec)
+
+    def update_caller(self, spec):
+        return self.call("PUT", "/api/callers", spec)
+
+    def audit(self, **query):
+        return self.call("GET", "/api/audit", query=query)
+
+    def overview(self, **query):
+        return self.call("GET", "/api/overview", query=query)
+
+    def model_catalog(self, **query):
+        return self.call("GET", "/api/model-catalog", query=query)
+
+    def exchange_rate(self, **query):
+        return self.call("GET", "/api/exchange-rate", query=query)
+
+    def pricing_rules(self):
+        return self.call("GET", "/api/pricing-rules")
+
+    def put_pricing_rule(self, rule):
+        return self.call("PUT", "/api/pricing-rules", rule)
+
+    def delete_pricing_rule(self, rule_id):
+        return self.call("POST", "/api/delete-price-rule", {"id": rule_id})
+
+    def price_preview(self, **query):
+        return self.call("GET", "/api/price-preview", query=query)
+
+    def reveal(self, key_id):
+        return self.call("POST", "/api/reveal", {"id": key_id})
+
+    def delete_key(self, key_id, reason):
+        return self.call("POST", "/api/delete-key", {"id": key_id, "reason": reason})
+
+    def reset_spend(self, spec):
+        return self.call("POST", "/api/reset-spend", spec)
+
 
 class Client:
     """Client-facing proxy API (OpenAI + Gemini routes)."""

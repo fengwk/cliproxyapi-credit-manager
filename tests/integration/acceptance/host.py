@@ -185,12 +185,21 @@ class Host:
     def start(self, timeout=45) -> None:
         config_path = self.config.write()
         self._log = self.log_path.open("wb")
+        # Egress is pinned to a closed loopback port so the plugin's reference
+        # catalog and FX lookups (https://models.dev, https://open.er-api.com)
+        # can never reach the public internet from an acceptance run: the fetch
+        # fails deterministically and fast, and the plugin reports its safe
+        # "unavailable" envelope instead of live prices. Loopback traffic (the
+        # upstream mock and the harness itself) is explicitly exempted, and Go's
+        # proxy handling always bypasses localhost/loopback regardless.
         env = {
             "HOME": str(self.config.root),
             "TMPDIR": str(self.config.root / "tmp"),
             "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
-            "NO_PROXY": "*",
-            "no_proxy": "*",
+            "HTTP_PROXY": "http://127.0.0.1:1",
+            "HTTPS_PROXY": "http://127.0.0.1:1",
+            "NO_PROXY": "127.0.0.1,localhost,::1",
+            "no_proxy": "127.0.0.1,localhost,::1",
         }
         self.process = subprocess.Popen(
             [str(self.binary), "--config", str(config_path), "--local-model"],

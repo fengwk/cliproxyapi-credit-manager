@@ -138,3 +138,70 @@ def lcp_conversation_growth(ctx):
     return {"message_counts": [len(m) for m in (first, second, third)],
             "auth_ids": auth_ids, "upstream_keys": sorted({c["upstream_key"] for c in calls}),
             "requests": len(auth_ids), "costs": costs, "key_spent": _spent(ctx, item["id"])}
+
+
+IDENTITY_SESSION_ID = "synthetic-affinity-identity"
+
+
+@case("affinity.key_identity_change_keeps_session_binding",
+      "reassigning the caller and rotating the key material leaves an existing session pinned to the same credential")
+def identity_change_keeps_binding(ctx):
+    ctx.recreate_host("affinity-identity", session_affinity=True)
+    ctx.set_price(MODEL)
+    check_eq(len(ctx.openai_upstream_keys), 2, "two upstream credentials are configured")
+
+    check_eq(ctx.manager.create_caller({"id": "affinity-caller-a", "display_name": "Affinity A"}).status, 201,
+             "first caller created")
+    check_eq(ctx.manager.create_caller({"id": "affinity-caller-b", "display_name": "Affinity B"}).status, 201,
+             "second caller created")
+    item, key = ctx.new_key(label="affinity-identity", caller_id="affinity-caller-a")
+    key_id = item["id"]
+
+    # Bind the session to one credential with two round-robin credentials live.
+    ctx.mock.reset()
+    for turn in ("synthetic-identity-1", "synthetic-identity-2"):
+        check_eq(_post(ctx, key, [{"role": "user", "content": turn}], {SESSION_HEADER: IDENTITY_SESSION_ID}).status,
+                 200, "binding request succeeds")
+    auth_ids, _costs = _collect(ctx, key_id, 2)
+    bound_auth = set(auth_ids)
+    bound_upstream = {call["upstream_key"] for call in ctx.mock.calls_for("/chat/completions")}
+    check_eq(len(bound_auth), 1, f"the session binds to one credential: {auth_ids}")
+    check_eq(len(bound_upstream), 1, f"the session binds to one upstream key: {sorted(bound_upstream)}")
+
+    # Change the key's attribution and its caller metadata, then rotate the key
+    # material. None of these are scheduling inputs, so the session binding must
+    # survive unchanged.
+    reassigned = ctx.manager.update_key(key_id, {"label": item["spec"]["label"], "enabled": True,
+                                                 "caller_id": "affinity-caller-b", "quota_micro_usd": 0,
+                                                 "daily_micro_usd": 0, "weekly_micro_usd": 0, "monthly_micro_usd": 0,
+                                                 "max_concurrent": 0, "allowed_models": []})
+    check_eq(reassigned.status, 200, f"caller reassignment {reassigned.text[:120]}")
+    check_eq(reassigned.json()["item"]["caller_id"], "affinity-caller-b", "the key now carries the new caller")
+    check_eq(ctx.manager.update_caller({"id": "affinity-caller-a", "display_name": "Affinity A", "enabled": False}).status,
+             200, "the old caller metadata is disabled")
+    rotated = ctx.manager.rotate(key_id)
+    check_eq(rotated.status, 200, f"key rotation {rotated.text[:120]}")
+    rotated_key = rotated.json()["key"]
+    check(rotated_key != key, "rotation changes the client material")
+    check_eq(_post(ctx, key, [{"role": "user", "content": "retired"}], {SESSION_HEADER: IDENTITY_SESSION_ID}).status,
+             401, "the retired client key is denied")
+
+    # Continue the identical session with the rotated key.
+    for turn in ("synthetic-identity-3", "synthetic-identity-4"):
+        check_eq(_post(ctx, rotated_key, [{"role": "user", "content": turn}], {SESSION_HEADER: IDENTITY_SESSION_ID}).status,
+                 200, "post-change session request succeeds")
+
+    items = ctx.wait_until(lambda: (_items(ctx, key_id) if len(_items(ctx, key_id)) >= 4 else None), timeout=15)
+    check(items is not None, f"expected four accounted requests, got {len(_items(ctx, key_id))}")
+    check_eq(len(items), 4, "four customer requests are accounted (one denied request is not admitted)")
+    executions = [item["executions"][0] for item in items if item.get("executions")]
+    check_eq(len(executions), 4, "every admitted request recorded an execution")
+    after_auth = {ex["auth_id"] for ex in executions}
+    upstream_after = {call["upstream_key"] for call in ctx.mock.calls_for("/chat/completions")}
+    check_eq(after_auth, bound_auth, f"the session credential is unchanged across the identity change: {after_auth}")
+    check_eq(upstream_after, bound_upstream,
+             f"the session upstream credential is unchanged: {sorted(upstream_after)}")
+    check_eq(sum(ex.get("cost_micro_usd") or 0 for ex in executions), 56, "four requests cost 56 microUSD")
+    check_eq(_spent(ctx, key_id), 56, "the rotated key retains the same ledger identity")
+    return {"bound_auth": sorted(bound_auth), "upstream": sorted(upstream_after), "requests": len(executions),
+            "spent": _spent(ctx, key_id)}
