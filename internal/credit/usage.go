@@ -253,11 +253,13 @@ func (s *Store) RecordUsage(ctx context.Context, usage Usage) error {
 		// supplies a trace, so an empty id must still replay idempotently.
 		usage.RequestID = req.id
 		// The billed service tier is the reported one, else the tier frozen at
-		// admission. It is resolved before the replay comparison because it is
-		// part of the replay identity: a replay that changes the tier must
-		// conflict instead of silently repricing the execution.
-		if tier := normalizeServiceTier(usage.ServiceTier); tier != "" {
-			usage.ServiceTier = tier
+		// admission. Only an *omitted* tier falls back: a reported tier that
+		// normalizes to "none" (for example "default" or "auto") is an explicit
+		// statement that no special tier applies, so inheriting the frozen one
+		// would overcharge. The normalized value is what is persisted, so a
+		// replay is compared against it instead of silently repricing.
+		if reported := strings.TrimSpace(usage.ServiceTier); reported != "" {
+			usage.ServiceTier = normalizeServiceTier(reported)
 		} else {
 			usage.ServiceTier = req.frozenServiceTier()
 		}
@@ -280,17 +282,25 @@ func (s *Store) RecordUsage(ctx context.Context, usage Usage) error {
 			return err
 		}
 		var cost *int64
-		if reliable && !req.price.IsPerImage() {
-			// Token prices settle from actual usage: the frozen service tier
-			// applies first, and the highest context tier matching the actual
-			// canonical prompt size applies otherwise. A per-image price is
-			// booked once per successful lifecycle instead (see
-			// bookPerImageOnProvenSuccess).
-			v, err := requestCost(req.price, req.tiers(), tokens, usage.ServiceTier)
-			if err != nil {
-				return err
+		if reliable {
+			if req.price.IsPerImage() {
+				// A reliable per-image attempt is *known* accounting worth zero:
+				// the frozen requested count is billed once for the whole
+				// successful lifecycle (see bookPerImageOnProvenSuccess), so a
+				// per-attempt cost stays an explicit zero rather than an unknown
+				// NULL, which would leave report and analytics at zero.
+				zero := int64(0)
+				cost = &zero
+			} else {
+				// Token prices settle from actual usage: the frozen service
+				// tier applies first, and the highest context tier matching the
+				// actual canonical prompt size applies otherwise.
+				v, err := requestCost(req.price, req.tiers(), tokens, usage.ServiceTier)
+				if err != nil {
+					return err
+				}
+				cost = &v
 			}
-			cost = &v
 		}
 		if _, err := tx.ExecContext(ctx, `INSERT INTO usages (`+usageColumns+`) VALUES
 			(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
@@ -309,10 +319,11 @@ func (s *Store) RecordUsage(ctx context.Context, usage Usage) error {
 				return err
 			}
 		}
-		// A trustworthy cost is booked in the same transaction that records it,
-		// even while the request stays open, so a later write-off can never
-		// discard a real charge.
-		if cost != nil {
+		// A trustworthy per-execution cost is booked in the same transaction
+		// that records it, even while the request stays open, so a later
+		// write-off can never discard a real charge. A per-image attempt has no
+		// per-execution charge: its single lifecycle charge is booked below.
+		if cost != nil && !req.price.IsPerImage() {
 			if err := s.applyCharge(ctx, tx, req, usage.ID, *cost); err != nil {
 				return err
 			}

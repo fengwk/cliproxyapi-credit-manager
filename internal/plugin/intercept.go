@@ -1,9 +1,11 @@
 package plugin
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"math/big"
 	"net/http"
 	"strings"
 	"time"
@@ -99,16 +101,20 @@ func (m *Manager) interceptBefore(req pluginapi.RequestInterceptRequest) plugina
 		// lifecycle completion, so it must not be admitted for billing.
 		return terminate(http.StatusBadRequest, "request trace is required")
 	}
+	// The requested image count is only a billing input for a per-image price;
+	// the ledger decides whether an unsupported declared value is refused.
+	imageCount, imageCountDeclared := requestImageCount(req.Body)
 	if _, errReserve := deps.store.Reserve(ctx, credit.ReserveInput{
-		ID:             strings.TrimSpace(req.RequestID),
-		TraceID:        traceID,
-		KeyID:          key.ID,
-		RequestedModel: model,
-		InputEstimate:  int64(len(req.Body)),
-		OutputEstimate: outputEstimate(req.Body),
-		ServiceTier:    requestServiceTier(req.Body),
-		ImageCount:     requestImageCount(req.Body),
-		At:             m.now(),
+		ID:                 strings.TrimSpace(req.RequestID),
+		TraceID:            traceID,
+		KeyID:              key.ID,
+		RequestedModel:     model,
+		InputEstimate:      int64(len(req.Body)),
+		OutputEstimate:     outputEstimate(req.Body),
+		ServiceTier:        requestServiceTier(req.Body),
+		ImageCount:         imageCount,
+		ImageCountDeclared: imageCountDeclared,
+		At:                 m.now(),
 	}); errReserve != nil {
 		if !isBusinessRejection(errReserve) {
 			// An unrecognized storage or transaction failure means admission can
@@ -248,36 +254,63 @@ func requestServiceTier(body []byte) string {
 }
 
 // requestImageCount reads the requested image count from the raw request body
-// without modifying it. It is the count the operator asked for, not the number
-// of images an upstream actually returned (the plugin never inspects the
-// response). Values are clamped to the same 1..32 range the ledger bills, and
-// an absent, non-integer or non-positive count reads as one image.
-func requestImageCount(body []byte) int64 {
-	const maxImages = 32
+// without modifying it. It returns the declared count and whether the request
+// declared one at all.
+//
+// The value is the count the operator asked for, not the number of images an
+// upstream actually returned (the plugin never inspects the response). It is
+// never clamped: the ledger refuses an unsupported count for a per-image price
+// so a request can not be billed for a different number of images than it
+// asked for. A present but unusable value (non-integer, fractional, or outside
+// the int64 range) reports declared with a zero count, which the ledger refuses
+// for a per-image price. A value that is irrelevant to the billing mode, such
+// as the sampling hint on a token request, never causes a rejection.
+func requestImageCount(body []byte) (int64, bool) {
 	if len(body) == 0 {
-		return 1
+		return 0, false
 	}
 	var fields map[string]json.RawMessage
 	if err := json.Unmarshal(body, &fields); err != nil {
-		return 1
+		return 0, false
 	}
 	for _, name := range []string{"n", "n_images", "num_images", "image_count"} {
 		raw, ok := fields[name]
 		if !ok {
 			continue
 		}
-		var value int64
-		if err := json.Unmarshal(raw, &value); err != nil {
-			continue
+		value, ok := integralInt64(raw)
+		if !ok {
+			return 0, true
 		}
-		if value > 0 {
-			if value > maxImages {
-				return maxImages
-			}
-			return value
-		}
+		return value, true
 	}
-	return 1
+	return 0, false
+}
+
+// integralInt64 decodes a JSON number that denotes an exact integer within the
+// int64 range. A string, fractional, non-numeric or out-of-range value is
+// rejected so the caller can fail closed instead of inventing a billable count.
+// Exponent and trailing-zero forms are accepted only when they denote an exact
+// integer (2.0 and 1e2 are integers, 2.5 and 1e30 are not).
+func integralInt64(raw json.RawMessage) (int64, bool) {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	var decoded any
+	if err := decoder.Decode(&decoded); err != nil {
+		return 0, false
+	}
+	number, ok := decoded.(json.Number)
+	if !ok {
+		return 0, false
+	}
+	if value, err := number.Int64(); err == nil {
+		return value, true
+	}
+	rational, ok := new(big.Rat).SetString(number.String())
+	if !ok || !rational.IsInt() || !rational.Num().IsInt64() {
+		return 0, false
+	}
+	return rational.Num().Int64(), true
 }
 
 // isBusinessRejection reports whether a credit failure refuses one request

@@ -113,7 +113,20 @@ func (h *harness) key(id string) Key {
 
 func (h *harness) request(id string) Request {
 	h.t.Helper()
+	for _, item := range h.report("").Items {
+		if item.ID == id {
+			return item
+		}
+	}
+	h.t.Fatalf("request %s not found in report", id)
+	return Request{}
+}
+
+// report reads the full test-window report, optionally narrowed to one key.
+func (h *harness) report(keyID string) Report {
+	h.t.Helper()
 	rep, err := h.store.Report(h.ctx(), Filter{
+		KeyID:    keyID,
 		From:     testEpoch.AddDate(-1, 0, 0),
 		To:       h.clock.now().Add(time.Hour),
 		Page:     1,
@@ -122,13 +135,7 @@ func (h *harness) request(id string) Request {
 	if err != nil {
 		h.t.Fatalf("report: %v", err)
 	}
-	for _, item := range rep.Items {
-		if item.ID == id {
-			return item
-		}
-	}
-	h.t.Fatalf("request %s not found in report", id)
-	return Request{}
+	return rep
 }
 
 func tokens(in, cr, cw, out, reasoning int64) Tokens {

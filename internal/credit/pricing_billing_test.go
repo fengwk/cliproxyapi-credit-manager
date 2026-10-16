@@ -119,7 +119,7 @@ func TestPerImageBillingOnceOnProvenSuccess(t *testing.T) {
 	if err := h.store.PutPrice(h.ctx(), Price{Model: "img", BillingMode: billingPerImage, PerImageMicroUSD: 50_000}); err != nil {
 		t.Fatal(err)
 	}
-	req := h.mustReserve(ReserveInput{ID: "r1", TraceID: "t1", KeyID: key.ID, RequestedModel: "img", ImageCount: 3})
+	req := h.mustReserve(ReserveInput{ID: "r1", TraceID: "t1", KeyID: key.ID, RequestedModel: "img", ImageCount: 3, ImageCountDeclared: true})
 	if req.HeldMicroUSD != 150_000 {
 		t.Fatalf("per-image hold = %d, want 150000", req.HeldMicroUSD)
 	}
@@ -146,7 +146,7 @@ func TestPerImageFailedLifecycleIsNotCharged(t *testing.T) {
 	if err := h.store.PutPrice(h.ctx(), Price{Model: "img", BillingMode: billingPerImage, PerImageMicroUSD: 50_000}); err != nil {
 		t.Fatal(err)
 	}
-	req := h.mustReserve(ReserveInput{ID: "r1", TraceID: "t1", KeyID: key.ID, RequestedModel: "img", ImageCount: 2})
+	req := h.mustReserve(ReserveInput{ID: "r1", TraceID: "t1", KeyID: key.ID, RequestedModel: "img", ImageCount: 2, ImageCountDeclared: true})
 	h.mustUsage(usageFor("u1", req, "img", tokens(1, 0, 0, 1, 0)))
 	h.mustComplete(Completion{ID: req.ID, TraceID: req.TraceID, Outcome: OutcomeFailed})
 	if key = h.key(key.ID); key.SpentMicroUSD != 0 || key.HeldMicroUSD != 0 {
@@ -162,7 +162,7 @@ func TestPerImageSucceededWithoutUsageStaysPending(t *testing.T) {
 	if err := h.store.PutPrice(h.ctx(), Price{Model: "img", BillingMode: billingPerImage, PerImageMicroUSD: 50_000}); err != nil {
 		t.Fatal(err)
 	}
-	req := h.mustReserve(ReserveInput{ID: "r1", TraceID: "t1", KeyID: key.ID, RequestedModel: "img", ImageCount: 2})
+	req := h.mustReserve(ReserveInput{ID: "r1", TraceID: "t1", KeyID: key.ID, RequestedModel: "img", ImageCount: 2, ImageCountDeclared: true})
 	h.mustComplete(Completion{ID: req.ID, TraceID: req.TraceID, Outcome: OutcomeSucceeded})
 	if got := h.request(req.ID); got.State != statePending {
 		t.Fatalf("state = %s, want pending while no usage proves the images", got.State)
@@ -184,7 +184,7 @@ func TestPerImageUnknownUsageStaysPending(t *testing.T) {
 	if err := h.store.PutPrice(h.ctx(), Price{Model: "img", BillingMode: billingPerImage, PerImageMicroUSD: 50_000}); err != nil {
 		t.Fatal(err)
 	}
-	req := h.mustReserve(ReserveInput{ID: "r1", TraceID: "t1", KeyID: key.ID, RequestedModel: "img", ImageCount: 1})
+	req := h.mustReserve(ReserveInput{ID: "r1", TraceID: "t1", KeyID: key.ID, RequestedModel: "img", ImageCount: 1, ImageCountDeclared: true})
 	unknown := usageFor("u-unknown", req, "img", Tokens{})
 	unknown.Quality = QualityUnknown
 	h.mustUsage(unknown)
@@ -291,5 +291,165 @@ func TestPricingMigrationUpgradesPopulatedBaseStore(t *testing.T) {
 	if key.SpentMicroUSD != 20 || key.HeldMicroUSD != 0 {
 		t.Fatalf("legacy settle spent=%d held=%d, want 20/0 from the stored rate columns",
 			key.SpentMicroUSD, key.HeldMicroUSD)
+	}
+}
+
+// TestUsageReportedDefaultTierStaysBase pins the presence semantics of the
+// reported service tier: an explicitly reported tier that means "no special
+// tier" must bill the base rate instead of inheriting the tier frozen at
+// admission. Inheriting the frozen priority tier would overcharge a request
+// whose upstream answered on the default tier, and it would also make the
+// persisted replay identity lie about what was billed.
+func TestUsageReportedDefaultTierStaysBase(t *testing.T) {
+	h, key := billingHarness(t)
+	h.mustRule(PricingRule{ID: "svc", MatchKind: MatchExact, Pattern: "m1", Priority: 5, Enabled: true,
+		Price: Price{Rates: Rates{Input: million, Output: 2 * million}},
+		Tiers: []PriceTier{{Kind: priceTierService, Service: "priority", Rates: Rates{Output: 9 * million}}}})
+
+	// The request asks for priority, so priority is frozen on the snapshot.
+	req := h.mustReserve(ReserveInput{ID: "r1", TraceID: "t1", KeyID: key.ID,
+		RequestedModel: "m1", ServiceTier: "priority"})
+
+	// The upstream explicitly reports the default tier: ten output tokens bill
+	// at the base rate (20), not at the frozen priority rate (90).
+	usage := usageFor("u1", req, "m1", tokens(0, 0, 0, 10, 0))
+	usage.ServiceTier = "default"
+	h.mustUsage(usage)
+	if key = h.key(key.ID); key.SpentMicroUSD != 20 {
+		t.Fatalf("reported default tier spent = %d, want 20: a reported default must not inherit frozen priority",
+			key.SpentMicroUSD)
+	}
+	if tier := h.request(req.ID).Executions[0].ServiceTier; tier != "" {
+		t.Fatalf("persisted tier = %q, want the normalized none", tier)
+	}
+	// The normalized value is the replay identity: another default alias
+	// normalizes to the same none, so a replay must still be idempotent.
+	replay := usage
+	replay.ServiceTier = "auto"
+	h.mustUsage(replay)
+	if key = h.key(key.ID); key.SpentMicroUSD != 20 {
+		t.Fatalf("normalized alias replay charged again: %d", key.SpentMicroUSD)
+	}
+	// An omitted tier is a different statement: it falls back to the frozen one.
+	req2 := h.mustReserve(ReserveInput{ID: "r2", TraceID: "t2", KeyID: key.ID,
+		RequestedModel: "m1", ServiceTier: "priority"})
+	h.mustUsage(usageFor("u2", req2, "m1", tokens(0, 0, 0, 10, 0)))
+	if key = h.key(key.ID); key.SpentMicroUSD != 110 {
+		t.Fatalf("omitted-tier spent = %d, want 110 (20 base + 90 frozen priority)", key.SpentMicroUSD)
+	}
+	if tier := h.request(req2.ID).Executions[0].ServiceTier; tier != "priority" {
+		t.Fatalf("persisted frozen tier = %q, want priority", tier)
+	}
+}
+
+// TestPerImageChargeReconcilesReportAndLedger pins the accounting conservation
+// contract: every per-image attempt is recorded as a known cost (zero for an
+// attempt), exactly one successful execution carries the single lifecycle
+// charge, and the report cost plus manual adjustments reconciles with the key
+// ledger that was actually charged.
+func TestPerImageChargeReconcilesReportAndLedger(t *testing.T) {
+	h, key := billingHarness(t)
+	if err := h.store.PutPrice(h.ctx(), Price{Model: "img", BillingMode: billingPerImage, PerImageMicroUSD: 50_000}); err != nil {
+		t.Fatal(err)
+	}
+	req := h.mustReserve(ReserveInput{ID: "r1", TraceID: "t1", KeyID: key.ID, RequestedModel: "img",
+		ImageCount: 2, ImageCountDeclared: true})
+	failed := usageFor("u-failed", req, "img", tokens(1, 0, 0, 1, 0))
+	failed.Failed = true
+	h.mustUsage(failed)
+	h.mustUsage(usageFor("u-ok", req, "img", tokens(1, 0, 0, 1, 0)))
+	h.mustComplete(Completion{ID: req.ID, TraceID: req.TraceID, Outcome: OutcomeSucceeded})
+
+	execs := h.request(req.ID).Executions
+	if len(execs) != 2 {
+		t.Fatalf("executions = %d, want 2", len(execs))
+	}
+	costs := map[string]*int64{}
+	for i := range execs {
+		costs[execs[i].ID] = execs[i].CostMicroUSD
+	}
+	if got := costs["u-failed"]; got == nil || *got != 0 {
+		t.Fatalf("failed attempt cost = %v, want a known 0", got)
+	}
+	if got := costs["u-ok"]; got == nil || *got != 100_000 {
+		t.Fatalf("successful execution cost = %v, want the booked 100000", got)
+	}
+	report := h.report(key.ID)
+	if report.Summary.CostMicroUSD != 100_000 || report.Summary.AdjustmentMicroUSD != 0 {
+		t.Fatalf("report cost=%d adjustments=%d, want 100000/0",
+			report.Summary.CostMicroUSD, report.Summary.AdjustmentMicroUSD)
+	}
+	if got := h.key(key.ID).SpentMicroUSD; got != report.Summary.CostMicroUSD+report.Summary.AdjustmentMicroUSD {
+		t.Fatalf("ledger spend %d != report cost %d + adjustments %d", got,
+			report.Summary.CostMicroUSD, report.Summary.AdjustmentMicroUSD)
+	}
+	// A replay of the successful attempt must not move the charge again.
+	h.mustUsage(usageFor("u-ok", req, "img", tokens(1, 0, 0, 1, 0)))
+	if got := h.key(key.ID).SpentMicroUSD; got != 100_000 {
+		t.Fatalf("replay changed the booked charge: %d", got)
+	}
+	// A manual charge on a still-pending per-image request stays an adjustment:
+	// it is neither hidden inside the execution cost nor double counted.
+	req2 := h.mustReserve(ReserveInput{ID: "r2", TraceID: "t2", KeyID: key.ID, RequestedModel: "img",
+		ImageCount: 1, ImageCountDeclared: true})
+	h.mustComplete(Completion{ID: req2.ID, TraceID: req2.TraceID, Outcome: OutcomeSucceeded})
+	if got := h.request(req2.ID).State; got != statePending {
+		t.Fatalf("succeeded-without-usage state = %s, want pending", got)
+	}
+	if err := h.store.Resolve(h.ctx(), req2.ID, Resolution{
+		Action: ActionCharge, AmountMicroUSD: 50_000, Reason: "manual adjustment"}); err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	report = h.report(key.ID)
+	if report.Summary.CostMicroUSD != 100_000 || report.Summary.AdjustmentMicroUSD != 50_000 {
+		t.Fatalf("report after adjustment cost=%d adjustments=%d, want 100000/50000",
+			report.Summary.CostMicroUSD, report.Summary.AdjustmentMicroUSD)
+	}
+	if got := h.key(key.ID).SpentMicroUSD; got != report.Summary.CostMicroUSD+report.Summary.AdjustmentMicroUSD {
+		t.Fatalf("ledger spend after adjustment %d != report cost %d + adjustments %d", got,
+			report.Summary.CostMicroUSD, report.Summary.AdjustmentMicroUSD)
+	}
+}
+
+// TestImageCountFailClosedAtAdmission pins that an unsupported explicit image
+// count is refused for a per-image price instead of being clamped to a billable
+// number, that an omitted count means one image, and that the same hint on a
+// token price is irrelevant rather than a rejection.
+func TestImageCountFailClosedAtAdmission(t *testing.T) {
+	h, key := billingHarness(t)
+	if err := h.store.PutPrice(h.ctx(), Price{Model: "img", BillingMode: billingPerImage, PerImageMicroUSD: 50_000}); err != nil {
+		t.Fatal(err)
+	}
+	for i, count := range []int64{0, -1, 33, 100, math.MaxInt64} {
+		if _, err := h.store.Reserve(h.ctx(), ReserveInput{ID: "bad" + string(rune('a'+i)), TraceID: "bt",
+			KeyID: key.ID, RequestedModel: "img", ImageCount: count, ImageCountDeclared: true}); !errors.Is(err, ErrInvalid) {
+			t.Fatalf("declared image count %d err = %v, want ErrInvalid", count, err)
+		}
+	}
+	if got := h.key(key.ID); got.HeldMicroUSD != 0 {
+		t.Fatalf("refused requests held = %d, want 0", got.HeldMicroUSD)
+	}
+	// The supported boundaries are accepted and billed exactly.
+	boundaries := []struct {
+		id    string
+		count int64
+	}{{"one", 1}, {"max", 32}}
+	for _, tc := range boundaries {
+		req := h.mustReserve(ReserveInput{ID: tc.id, TraceID: "tr-" + tc.id, KeyID: key.ID,
+			RequestedModel: "img", ImageCount: tc.count, ImageCountDeclared: true})
+		if want := tc.count * 50_000; req.HeldMicroUSD != want {
+			t.Fatalf("image count %d hold = %d, want %d", tc.count, req.HeldMicroUSD, want)
+		}
+	}
+	// An omitted count is one image, not a rejection.
+	req := h.mustReserve(ReserveInput{ID: "r-omit", TraceID: "t-omit", KeyID: key.ID, RequestedModel: "img"})
+	if req.HeldMicroUSD != 50_000 {
+		t.Fatalf("omitted count hold = %d, want 50000 for one image", req.HeldMicroUSD)
+	}
+	// A token price ignores the hint entirely: an image hint is not a billing
+	// input there, so it must never turn into a rejection.
+	if _, err := h.store.Reserve(h.ctx(), ReserveInput{ID: "r-tok", TraceID: "t-tok", KeyID: key.ID,
+		RequestedModel: "m1", ImageCount: 100, ImageCountDeclared: true}); err != nil {
+		t.Fatalf("token reserve with an irrelevant image hint err = %v, want nil", err)
 	}
 }

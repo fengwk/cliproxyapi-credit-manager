@@ -40,16 +40,22 @@ func resolveBillingMode(mode string) string {
 // IsPerImage reports whether the price bills per requested image.
 func (p Price) IsPerImage() bool { return resolveBillingMode(p.BillingMode) == billingPerImage }
 
-// clampImageCount normalizes a requested image count: at least one image and at
-// most maxImageCount images, both bounds inclusive.
-func clampImageCount(count int64) int64 {
-	if count < 1 {
-		return 1
+// imageCountFor resolves the billed image count of a per-image request.
+//
+// An omitted count means one image. An explicitly declared count must be one of
+// the supported 1..32 values: it is refused rather than silently billed as a
+// different number, so an unsupported request can never be under- or
+// over-charged. Token prices never call this, so an irrelevant image hint on a
+// token request is not rejected.
+func imageCountFor(in ReserveInput) (int64, error) {
+	if !in.ImageCountDeclared {
+		return 1, nil
 	}
-	if count > maxImageCount {
-		return maxImageCount
+	if in.ImageCount < 1 || in.ImageCount > maxImageCount {
+		return 0, fmt.Errorf("%w: requested image count %d is outside the supported 1..%d range",
+			ErrInvalid, in.ImageCount, maxImageCount)
 	}
-	return count
+	return in.ImageCount, nil
 }
 
 // normalizeServiceTier maps upstream service_tier spellings onto the billing
@@ -328,19 +334,24 @@ func overlayRates(base, overlay Rates) Rates {
 	return out
 }
 
-// perImageCost prices a frozen image count once, with overflow protection.
+// perImageCost prices a frozen image count once, with overflow protection. The
+// count is validated, never clamped: an unsupported count is an error so it can
+// not be silently billed as a different number.
 func perImageCost(price Price, imageCount int64) (int64, error) {
 	if price.PerImageMicroUSD < 0 {
 		return 0, fmt.Errorf("%w: negative per-image price", ErrInvalid)
 	}
-	count := clampImageCount(imageCount)
+	if imageCount < 1 || imageCount > maxImageCount {
+		return 0, fmt.Errorf("%w: image count %d is outside the supported 1..%d range",
+			ErrInvalid, imageCount, maxImageCount)
+	}
 	if price.PerImageMicroUSD == 0 {
 		return 0, nil
 	}
-	if price.PerImageMicroUSD > math.MaxInt64/count {
+	if price.PerImageMicroUSD > math.MaxInt64/imageCount {
 		return 0, fmt.Errorf("%w: per-image cost overflows int64", ErrInvalid)
 	}
-	return price.PerImageMicroUSD * count, nil
+	return price.PerImageMicroUSD * imageCount, nil
 }
 
 // requestCost prices the canonical tokens of one execution with the frozen

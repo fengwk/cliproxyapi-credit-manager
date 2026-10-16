@@ -68,12 +68,15 @@ type reqRow struct {
 	snapshot *priceSnapshot
 }
 
-// imageCount is the frozen requested image count of a per-image request.
+// imageCount is the frozen requested image count of a per-image request. The
+// stored value is authoritative and is never clamped: it was validated at
+// admission, so a corrupted value must fail settlement instead of being
+// silently billed as a different number.
 func (r *reqRow) imageCount() int64 {
 	if r.snapshot == nil {
 		return 1
 	}
-	return clampImageCount(r.snapshot.ImageCount)
+	return r.snapshot.ImageCount
 }
 
 // frozenServiceTier is the normalized service tier frozen at admission, used
@@ -388,6 +391,9 @@ func usageStats(ctx context.Context, q querier, requestID string) (usageAgg, err
 }
 
 // applyCharge books a known cost against the key and marks the usage charged.
+// The amount is written back to the usage row as well, so a charge that is not
+// visible in the per-execution column (the single per-image lifecycle charge)
+// still reconciles with the report and the key ledger.
 func (s *Store) applyCharge(ctx context.Context, tx *sql.Tx, req *reqRow, usageID string, amount int64) error {
 	if err := addMoney(ctx, tx, req.keyID, req.startedAt, amount); err != nil {
 		return err
@@ -395,7 +401,8 @@ func (s *Store) applyCharge(ctx context.Context, tx *sql.Tx, req *reqRow, usageI
 	if err := bumpKeyColumn(ctx, tx, req.keyID, "spent_micro_usd", amount); err != nil {
 		return err
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE usages SET charged = 1 WHERE id = ?`, usageID); err != nil {
+	if _, err := tx.ExecContext(ctx, `UPDATE usages SET charged = 1, cost_micro_usd = ? WHERE id = ?`,
+		amount, usageID); err != nil {
 		return fmt.Errorf("mark usage charged: %w", err)
 	}
 	if err := bumpRequestCharge(ctx, tx, req.id, amount); err != nil {

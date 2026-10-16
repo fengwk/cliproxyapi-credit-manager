@@ -13,6 +13,22 @@ func (h *harness) mustRule(r PricingRule) {
 	}
 }
 
+// TestPricingRuleScanKeepsCanonicalModel pins that a stored rule read back keeps
+// its canonical price label: the table has no separate price.model column, so it
+// is rebuilt from the pattern instead of being reported empty.
+func TestPricingRuleScanKeepsCanonicalModel(t *testing.T) {
+	h, _ := billingHarness(t)
+	h.mustRule(PricingRule{ID: "r1", MatchKind: MatchGlob, Pattern: "gpt-*", Priority: 1, Enabled: true,
+		Price: Price{Rates: Rates{Input: million}}})
+	rules, err := h.store.ListPricingRules(h.ctx())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rules) != 1 || rules[0].Price.Model != "gpt-*" {
+		t.Fatalf("listed rules = %+v, want one rule labelled gpt-*", rules)
+	}
+}
+
 // reserveRate reserves one model and returns the effective input rate frozen on
 // the request, which is what the operator sees as the price that will be used.
 func (h *harness) reserveRate(id, trace, model, keyID string) int64 {
