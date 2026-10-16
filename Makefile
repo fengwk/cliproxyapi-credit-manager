@@ -20,7 +20,7 @@ LDFLAGS := -s -w \
 	-X github.com/fengwk/cliproxyapi-credit-manager/internal/plugin.GitCommit=$(GIT_COMMIT) \
 	-X github.com/fengwk/cliproxyapi-credit-manager/internal/plugin.SDKVersion=$(SDK_VERSION)
 
-.PHONY: help build vet test race static package clean
+.PHONY: help build vet test race static browser package clean
 
 help:
 	@echo "cliproxyapi-credit-manager"
@@ -29,6 +29,7 @@ help:
 	@echo "  make test      go vet, go test and the discovered Node web tests"
 	@echo "  make static    dependency-free delivery checks (scripts + packaging)"
 	@echo "  make race      go test -race"
+	@echo "  make browser   isolated Chrome manager and customer lookup checks"
 	@echo "  make package   zip the built plugin for the current GOOS/GOARCH"
 	@echo "  make clean     remove dist/"
 	@echo ""
@@ -60,6 +61,10 @@ static:
 
 race:
 	go test -race ./...
+
+browser:
+	node tests/browser/run.mjs
+	node tests/browser/lookup.mjs
 
 package: build
 	bash scripts/package-plugin.sh "$(VERSION)" "$(GOOS)" "$(GOARCH)" "dist/pkg"

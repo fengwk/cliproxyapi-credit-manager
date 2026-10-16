@@ -340,17 +340,8 @@ def lazy_capture(ctx):
         return {"modal_chars": len(modal)}
 
 
-# NOTE: browser.lookup_own_key_capture is intentionally NOT registered.
-#
-# Its implementation is kept below so it can be enabled with a single @case once
-# an out-of-scope asset regression is fixed: the merged lookup.js calls
-# `CMCharts.normalizeCurrency(...)` in its formatMoney path, but the merged
-# charts.js does not export `normalizeCurrency` (restore-shell's charts.js did,
-# but the charts-slice merge dropped it). With the current assets the real lookup
-# page throws inside renderUsage, never calls showDashboard() and never persists
-# the session token, so no real-browser assertion of the lookup UI can pass. This
-# is a web-asset defect owned outside this file; re-register the case with
-# @case(...)(lookup_own_key_capture) after charts.js exports normalizeCurrency.
+@case("browser.lookup_own_key_capture",
+      "a customer opens its own redacted snapshot in a real browser without management credentials")
 def lookup_own_key_capture(ctx):
     root = Path(ctx.artifacts) / "host-browser-lookup"
     ctx.recreate_host("browser-lookup", root=root, plugin_config=_capture_config(root))

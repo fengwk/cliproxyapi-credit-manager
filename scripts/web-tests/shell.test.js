@@ -1,6 +1,6 @@
 'use strict';
 
-// 静态外壳检查：相对资源路径、无凭据落地、无 emoji、无 innerHTML、五个标签页齐全。
+// 静态外壳检查：相对资源路径、显式凭据存储、无 innerHTML、五个标签页齐全。
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { readAsset } = require('./helpers');
@@ -13,7 +13,7 @@ const EMOJI = /[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}\u{FE0F}\u{2B00}-\u{2BFF}]/u
 
 test('index.html 仅引用相对资源，且不含任何凭据或账务数据', () => {
   const refs = [...html.matchAll(/(?:href|src)="([^"]+)"/g)].map((m) => m[1]);
-  assert.deepEqual(refs.sort(), ['./app.js', './charts.js', './lookup.html', './style.css', './vendor/echarts-5.6.0.min.js']);
+  assert.deepEqual(refs.sort(), ['./app.js', './charts.js', './lookup.html', './numbers.js', './style.css', './vendor/echarts-5.6.0.min.js']);
   assert.ok(!/https?:\/\//.test(html), '静态外壳不得引用外部 CDN');
   assert.ok(!/sk-[A-Za-z0-9]{8,}/.test(html), '静态外壳不得内嵌密钥');
   assert.ok(!/Bearer\s+[A-Za-z0-9]{16,}/i.test(html), '静态外壳不得内嵌凭据');

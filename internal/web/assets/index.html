@@ -85,7 +85,7 @@
       <p class="hint">
         管理密钥在当前会话期间保留在内存中有效，用于向管理 API 发送 <code>Authorization</code> 请求头。勾选「记住管理密钥」后保存在本机浏览器的 localStorage 中以便后续自动填入；未勾选时仅在会话内存中保存，关闭页面后即失效。
       </p>
-      <form id="login-form" class="login-form" autocomplete="off" novalidate>
+      <form id="login-form" class="login-form" method="post" autocomplete="off" novalidate>
         <div class="field">
           <label for="management-key">管理密钥</label>
           <input id="management-key" name="management-key" type="password" autocomplete="off"
@@ -298,6 +298,7 @@
 </div>
 <script src="./vendor/echarts-5.6.0.min.js"></script>
 <script src="./charts.js"></script>
+<script src="./numbers.js"></script>
 <script src="./app.js" defer></script>
 </body>
 </html>

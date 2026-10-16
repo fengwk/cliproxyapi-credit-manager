@@ -47,10 +47,6 @@
     unknown: { label: '未知', tone: 'warn' },
   };
 
-  var BIG_INT_MARK = '\u0000CMINT:';
-  var BIG_INT_TAIL = '\u0000';
-  var BIG_INT_DIGITS = 16; // 超过 15 位（即 >= 16 位）的整数在 64 位 JSON 中可能超出 Number 精度
-
   /* ------------------------------------------------------------------ *
    * 精确整数与金额（全部走字符串/BigInt，不经过浮点）
    * ------------------------------------------------------------------ */
@@ -263,76 +259,16 @@
 
   // 扫描 JSON 文本，字符串原样跳过，仅对裸数字调用 replaceNumber。
   function rewriteNumbers(text, replaceNumber) {
-    var out = '';
-    var index = 0;
-    var length = text.length;
-    while (index < length) {
-      var ch = text.charAt(index);
-      if (ch === '"') {
-        var start = index;
-        index++;
-        while (index < length) {
-          var cur = text.charAt(index);
-          if (cur === '\\') {
-            index += 2;
-            continue;
-          }
-          index++;
-          if (cur === '"') break;
-        }
-        out += text.slice(start, index);
-        continue;
-      }
-      if (ch === '-' || (ch >= '0' && ch <= '9')) {
-        var numStart = index;
-        index++;
-        while (index < length && /[0-9eE+\-.]/.test(text.charAt(index))) index++;
-        out += replaceNumber(text.slice(numStart, index));
-        continue;
-      }
-      out += ch;
-      index++;
-    }
-    return out;
+    return global.CMNumbers.rewriteNumbers(text, replaceNumber);
   }
 
   function isBigIntegerLiteral(literal) {
-    var text = String(literal);
-    if (!/^-?\d+$/.test(text)) return false;
-    var digits = text.charAt(0) === '-' ? text.slice(1) : text;
-    return digits.length >= BIG_INT_DIGITS;
-  }
-
-  function reviveBigInts(value) {
-    if (typeof value === 'string') {
-      if (value.length > BIG_INT_MARK.length + 1 &&
-          value.indexOf(BIG_INT_MARK) === 0 &&
-          value.slice(-1) === BIG_INT_TAIL) {
-        var digits = value.slice(BIG_INT_MARK.length, -1);
-        if (isIntegerText(digits)) return intVal(digits);
-      }
-      return value;
-    }
-    if (Array.isArray(value)) {
-      for (var i = 0; i < value.length; i++) value[i] = reviveBigInts(value[i]);
-      return value;
-    }
-    if (value && typeof value === 'object') {
-      var keys = Object.keys(value);
-      for (var k = 0; k < keys.length; k++) value[keys[k]] = reviveBigInts(value[keys[k]]);
-      return value;
-    }
-    return value;
+    return global.CMNumbers.isBigIntegerLiteral(literal);
   }
 
   // 与 JSON.parse 行为一致，但超出 Number 精度的整数会保留为精确文本（CMInt）。
   function parseJSON(text) {
-    var source = String(text == null ? '' : text);
-    var rewritten = rewriteNumbers(source, function (literal) {
-      if (!isBigIntegerLiteral(literal)) return literal;
-      return JSON.stringify(BIG_INT_MARK + literal + BIG_INT_TAIL);
-    });
-    return reviveBigInts(JSON.parse(rewritten));
+    return global.CMNumbers.parse(text);
   }
 
   function numberLiteral(value) {
@@ -3988,6 +3924,14 @@
   }
 
   function boot() {
+    // 依赖缺失时阻断提交，避免把不精确的账务数据当作有效结果展示。
+    if (!global.CMNumbers || !global.CMCharts || !global.echarts) {
+      $('login-form').addEventListener('submit', function (event) { event.preventDefault(); });
+      $('login-button').disabled = true;
+      $('login-error').textContent = '界面资源加载失败，请刷新页面或检查插件资源。';
+      $('login-error').hidden = false;
+      return;
+    }
     // 未预期的脚本错误不能静默失败：至少给出可见提示，便于排查。
     global.addEventListener('error', function (event) {
       notify('界面发生未预期错误：' + ((event && event.message) || '未知错误'), 'error');

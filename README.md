@@ -4,7 +4,7 @@ CLIProxyAPI v8 的**原生插件**：用插件自建的客户端 Key 做前端�
 并提供一个中文财务管理界面。
 
 - **它做什么**：独占式客户端鉴权、按模型单价记账、Key/额度/价格管理、用量报表、
-  可选的一次性请求快照（诊断用）。
+  请求/Token/费用趋势、客户自助查询、可选的请求 Header/Body 快照（诊断用）。
 - **它不做什么**：不接管普通模型请求的执行、路由或调度；不修改转发给上游的报文、请求头
   或账号选择；不管理上游凭据；不改动任何其它 provider 的页面或表单。
   可选后台预热默认关闭，启用后会通过宿主执行真实探测请求。
@@ -81,8 +81,10 @@ plugins:
 http://<cpa-host>:8317/v0/resource/plugins/cliproxyapi-credit-manager/index.html
 ```
 
-用 CPA 的**管理密钥**登录（只在内存中保存），然后在「客户端 Key」页建第一把 Key。
+用 CPA 的**管理密钥**登录，然后在「客户端 Key」页建第一把 Key。
 明文只显示一次，请立即保存。
+默认在当前标签的 `sessionStorage` 保持登录，刷新无需重输；显式勾选「记住密钥」
+才写入 `localStorage`。不要在共享设备上记住管理密钥。
 
 > 两个 id 容易混淆：界面的**财务 API 前缀是固定的**
 > `/v0/management/plugins/credit-manager/api/...`（插件声明的路由段）；
@@ -147,6 +149,23 @@ curl -sS 'http://127.0.0.1:8317/v0/management/plugins/credit-manager/api/usage?f
 其它接口：`GET /api/keys`、`PUT /api/keys`、`POST /api/rotate`、`GET /api/prices`、
 `GET /api/capture?id=<请求id>`、`POST /api/resolve`、`GET /api/health`。
 
+## 界面、趋势与客户日志
+
+- 管理界面恢复原版 CM 标识与 CPA `white` / `light` / `dark` / `auto` 主题联动；
+  图表使用本地打包的 ECharts，不依赖 CDN。
+- 请求/执行次数、五类互斥 Token、执行费用/人工补记分别展示；支持 UTC 时、日、
+  **自然月**聚合。统计与图表来自同一筛选范围，不拿当前页冒充全量趋势。
+- 支持 Token 单位与 USD/CNY 展示换算；汇率由用户手动设定，不声称实时汇率，
+  账本与价格输入仍是整数微美元或美元，不随展示币种改变。
+- 客户入口：`/v0/resource/plugins/cliproxyapi-credit-manager/lookup.html`。
+  客户输入自己的插件 Key，无需 CPA 管理密钥，只能查询自己的额度、用量、趋势及快照。
+  该 Key 只通过 Bearer 请求头发送；停用、过期、轮换旧 Key 都不能继续查询。
+- 快照默认关闭；启用 `request_capture.enabled` 后，管理员在请求详情中查看，
+  客户在自助页查看自己请求的 Header/Body。到期或容量淘汰后可能不可用。
+
+与原版的已知差异、未移植能力及验收入口见
+[`docs/restoration.md`](docs/restoration.md)。本项目不是原版所有管理接口/数据库的兼容替身。
+
 ## 计费口径（核心规则）
 
 - 单价是**整数 µUSD / 每 100 万 tokens**，不使用浮点美元。
@@ -169,12 +188,14 @@ curl -sS 'http://127.0.0.1:8317/v0/management/plugins/credit-manager/api/usage?f
   为空可能放行匿名请求；分发原生 Key 则允许绕过插件计费，二者都不安全。
 - **客户端 Key 只存在于插件内**：数据库里保存的是 HMAC 校验值，明文不落库；校验依赖
   数据目录中的 `pepper`（权限 0600，首次启动自动生成）。
-- **管理密钥只存在于内存**：界面不写 `localStorage`/`sessionStorage`/Cookie，也不放进
-  URL。刷新页面需重新输入。
+- **凭据存储由用户选择**：默认 `sessionStorage`，显式记住才写入 `localStorage`；
+  登出或鉴权失效会清理。管理密钥和客户查询 Key 使用不同存储前缀，不读取或猜测 CPA
+  登录凭据；不写 Cookie/URL。Web Storage 可被同源脚本访问，记住密钥并不能防御 XSS。
 - **快照不是 DLP**：请求快照只做已知敏感字段脱敏（`Authorization`、`X-Api-Key`、
   `X-Goog-Api-Key`、`Cookie`、`Set-Cookie` 及常见 JSON 敏感键），不是匿名化承诺，也可能
   因保留期或容量限制提前被丢弃；**不要把它当作财务凭证**。
-- 财务 API 只挂在受管理的 management 路由下；公开资源路由只返回内嵌的静态外壳。
+- 管理 API 只挂在受宿主管理鉴权的 management 路由下；资源路由除静态文件外，
+  只开放自行校验客户 Key 的 `lookup/data` 与 `lookup/capture`，不开放管理写操作。
 
 更完整的运维与备份要求见 [`docs/operations.md`](docs/operations.md)。
 
@@ -186,6 +207,7 @@ make build    # 构建当前平台的原生库到 dist/<os>/<arch>/
 make test     # go vet + go test + Node 界面测试
 make race     # go test -race
 make static   # 无需 C 工具链的交付检查（脚本语法、打包、校验器、工作流契约）
+make browser  # 隔离 Chrome：管理页与客户自助页自动化验收
 make package  # 打包当前平台的 zip（含 metadata.json 与 sha256）
 ```
 
@@ -194,7 +216,7 @@ make package  # 打包当前平台的 zip（含 metadata.json 与 sha256）
 `-buildmode=c-shared` 需要 CGO 交叉工具链，**本项目不提供也不声称支持伪造的交叉编译**，
 本地只会构建当前平台。
 
-端到端验收（真实 CPA 宿主 + 真实插件库 + 环回上游 mock，共 42 个用例，含浏览器检查）
+端到端验收（真实 CPA 宿主 + 真实插件库 + 环回上游 mock，含浏览器检查）
 见 [`tests/integration/README.md`](tests/integration/README.md)。
 
 ## 发布产物

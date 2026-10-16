@@ -51,7 +51,7 @@ type managementRequest struct {
 // handleManagementRegister declares the management API routes and the public
 // resource shell. Management paths are fixed under web.BasePath (which the host
 // authenticates); resource paths are resolved under the host-provided resource
-// base and only expose static assets.
+// base and expose static assets plus customer-authenticated read-only lookup.
 func (m *Manager) handleManagementRegister(request []byte) ([]byte, error) {
 	var req pluginapi.ManagementRegistrationRequest
 	if len(request) > 0 {
@@ -138,9 +138,9 @@ func managementRouteDescription(method, suffix string) string {
 // handleManagement dispatches one management or public resource request.
 //
 // Management requests are delegated unchanged to the authenticated financial
-// handler. Resource requests are never authenticated and can only return the
-// embedded static shell; any other path is rejected, so no URL shape can reach
-// the financial API without management authentication.
+// handler. Resource requests expose embedded assets or the two explicitly
+// customer-authenticated lookup endpoints. No resource path reaches an
+// administrative API without host management authentication.
 func (m *Manager) handleManagement(request []byte) (resp []byte, err error) {
 	defer func() {
 		if recovered := recover(); recovered != nil {

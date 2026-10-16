@@ -31,6 +31,7 @@ func TestShellIsSelfContained(t *testing.T) {
 		"./lookup.html":                 true,
 		"./vendor/echarts-5.6.0.min.js": true,
 		"./charts.js":                   true,
+		"./numbers.js":                  true,
 		"./app.js":                      true,
 	}
 	if len(refs) == 0 {

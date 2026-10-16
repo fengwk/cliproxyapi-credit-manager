@@ -137,8 +137,12 @@ which is the point, and it never excludes or reserves an account on its own.
 Base `/v0/management/plugins/credit-manager` (the plugin's own fixed, declared
 route segment, distinct from the host plugin instance/library id), all API paths
 management-authenticated.
-Resources `/v0/resource/plugins/<library-id>/` serve public static shell ONLY.
-Never put financial APIs in resources or localStorage any credentials.
+Resources `/v0/resource/plugins/<library-id>/` serve an exact embedded-asset
+allow list plus GET `lookup/data` and `lookup/capture`. These two read-only
+customer endpoints authenticate an explicit customer Bearer key, force the
+authenticated KeyID, omit operator credential identifiers, and prove request
+ownership before returning a snapshot. Foreign and unknown snapshot IDs share
+one 404 response. No resource route exposes administrative writes.
 Envelope errors `{"error":"safe message"}`.
 - GET `/api/keys` => `{"items":[Key]}`
 - POST `/api/keys` KeySpec => `{"item":Key,"key":"one-time plaintext"}`
@@ -146,17 +150,24 @@ Envelope errors `{"error":"safe message"}`.
 - POST `/api/rotate` `{"id":id,"key":"optional custom"}` => item,key
 - GET `/api/prices` => `{"items":[Price]}`; PUT `/api/prices` Price => `{"ok":true}`
 - GET `/api/usage` query from/to RFC3339,key_id,model,provider,auth_id,result,
-  search,page,page_size,bucket(hour/day) => Report (summary/trend/items/all-match total).
+  search,page,page_size,bucket(hour/day/month) => Report (summary/trend/items/all-match total).
 - GET `/api/capture?id=<lifecycle-id>` => Detail. Click only, never list body.
 - POST `/api/resolve` `{"id":id,"action":"release|charge","amount_micro_usd":N,
   "reason":"mandatory"}` => `{"ok":true}`
 - GET `/api/health` => `{"status":"ok|degraded","version":string,"capture":Stats,
   "retention_months":3,"capture_enabled":bool,"last_error":string}`
 
-Frontend plain HTML/CSS/JS, no bundler/runtime/CDN. Chinese. Responsive tabs:
-usage,keys,prices,credentials,health. UI accepts management key only in memory.
+Frontend plain HTML/CSS/JS, no bundler/CDN; ECharts 5.6.0 is vendored with license.
+Chinese. Responsive tabs: usage,keys,prices,credentials,health.
+Credentials default to per-tab sessionStorage; explicit remember mirrors to
+localStorage. Management and customer keys use separate storage prefixes;
+never use Cookie/URL or consume CPA's stored login. Logout/auth failure clears
+private DOM and chart instances; epochs reject late responses from old sessions.
 Static shell never embeds credentials. One-time key dialog.
 Charts/totals/list share Report; include explicit pending and quality states.
+Hour/day/month buckets are UTC; month means calendar month, not 30 days.
+Token and money display/tooltip values use exact integers/decimal arithmetic;
+only chart geometry may use floats. USD/CNY is display-only at a manual rate.
 Request model top, execution model and actual declared response model separately;
 only known opencode-go/commandcode namespace is normalized for display, never
 bill/access control. Body modal lazy fetch, textContent, lexical JSON formatting
@@ -169,7 +180,8 @@ Do not implement key import/OAuth form changes or modify other provider pages.
 
 v0.1.0 initial release only after unit/race/vet, real isolated native CPA/mock
 auth+retry+cancel+providers probes and browser checks. ZIPs linux/amd64,
-linux/arm64,darwin/arm64 + checksums.txt. Metadata version/full commit/sdk.
+linux/arm64,darwin/arm64 + checksums.txt. Registration version is bare release
+number for CPA store comparison; health and package metadata retain full commit/sdk.
 Curated notes live at `docs/release-notes-<tag>.md`; the release workflow refuses
 to publish a tag without them. Config example and operations guidance live in
 `config.example.yaml` and `docs/operations.md`.

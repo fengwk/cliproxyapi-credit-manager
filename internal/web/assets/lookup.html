@@ -26,7 +26,7 @@
   <section id="login-gate" class="gate">
     <h2>查询密钥额度</h2>
     <p class="hint">密钥只通过 Authorization 请求头发送，不会写进页面地址栏；勾选“记住密钥”后才会保存在本机浏览器，方便下次自动填入。</p>
-    <form id="lookup-form" class="login-form">
+    <form id="lookup-form" class="login-form" method="post">
       <label class="field" for="key">密钥
         <input id="key" name="key" type="password" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="粘贴你的密钥" required>
       </label>
@@ -126,7 +126,7 @@
               <th scope="col">模型</th>
               <th scope="col">状态</th>
               <th scope="col" class="num">Token</th>
-              <th scope="col" class="num">成本</th>
+              <th scope="col" class="num">执行成本（不含人工补记）</th>
               <th scope="col">快照</th>
             </tr>
           </thead>

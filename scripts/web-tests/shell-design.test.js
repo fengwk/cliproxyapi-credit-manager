@@ -57,6 +57,7 @@ test('脚本按正确顺序加载 vendor echarts、charts.js 与 app.js', () => 
   assert.deepEqual(scripts, [
     './vendor/echarts-5.6.0.min.js',
     './charts.js',
+    './numbers.js',
     './app.js'
   ]);
 });

@@ -16,9 +16,10 @@ function readAsset(name) {
 // 同时保证断言可以严格比较（同 realm 原型一致）。
 function loadCM() {
   const charts = require(path.join(ASSETS_DIR, 'charts.js'));
+  const numbers = require(path.join(ASSETS_DIR, 'numbers.js'));
   const source = readAsset('app.js');
   const factory = new Function('window', 'document', 'require', source + '\n//# sourceURL=app.js');
-  const win = { CMCharts: charts };
+  const win = { CMCharts: charts, CMNumbers: numbers };
   factory(win, undefined, require);
   if (!win.CM) throw new Error('app.js 未导出 window.CM');
   return win.CM;

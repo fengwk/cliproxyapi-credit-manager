@@ -15,6 +15,7 @@
 - 实例 id：`cliproxyapi-credit-manager`
 - 配置块：`plugins.configs.cliproxyapi-credit-manager`
 - 界面地址：`/v0/resource/plugins/cliproxyapi-credit-manager/index.html`
+- 客户自助地址：`/v0/resource/plugins/cliproxyapi-credit-manager/lookup.html`
 - **财务 API 前缀是插件自己声明的固定值**：`/v0/management/plugins/credit-manager/api/…`
   （与实例 id 不是同一个字符串，不要混用）
 
@@ -137,6 +138,7 @@ data_dir/
   “复活”这些请求；跨保留期的旧 `Reserve` 也不再支持。
 
 维护按固定节拍（约每分钟）自动执行，不需要人工干预。
+这是删除过期历史并回收空间，不是压缩归档备份；需要长期审计时须自行受控备份。
 
 ## 6. 未决请求与管理员裁决
 
@@ -167,6 +169,9 @@ data_dir/
 
 - 默认**关闭**。开启后抓取的是**执行入口的诊断快照**（请求 ID、入站请求头、入站请求
   体），**不是**最终发给上游的网络原始报文，也不是上游返回。
+- 请求体在保留期间以 gzip 压缩保存；到期或超容量后删除，而非无限保留压缩档案。
+- 管理员从使用统计请求详情查看；客户可用自己的插件 Key 在 `lookup.html` 查询，
+  只返回该 Key 所属的请求。没有快照不代表没有计费记录。
 - 单个快照体积上限、保留时长、物理上限见配置表；快照库的物理占用按**数据库文件 + WAL**
   统计，并预留一定余量，压力大时会**先淘汰最旧的快照**。
 - 快照状态可能是：`disabled`（未开启）、`captured`、`oversize`（超限被跳过）、

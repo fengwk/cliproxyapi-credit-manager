@@ -113,14 +113,15 @@ Each case's host lives at `<artifacts>/host-<n>-<case>/` with `config.yaml`,
 | `auth` | Five credential locations, invalid/absent denial with no upstream call, invalid Bearer + valid Google fallback, first-candidate-wins on conflict, original CPA key rejected while exclusive, custom (non `sk-`) prefix key. Deployment fail-closed: a plugin-managed key is accepted at all five locations while the plugin is loaded, and with `plugins.enabled: false` (library not loaded) all five are denied with no upstream call while the plugin instance stays unregistered. |
 | `capture` | Disabled vs unavailable vs captured states, lazy fetch, header + JSON redaction, 64-bit integer fidelity, adjustable body limit (oversize skipped). |
 | `report` | `from/to/key_id/model/result/search/page/page_size/bucket` filters, pagination, trend sums equal the summary, full-UUID trace ids searchable. |
-| `resources` | Public resource base serves only the embedded static shell, unauthenticated and credential-free; resource paths cannot reach the financial API. |
+| `resources` | Public static assets are embedded and credential-free; resource paths cannot reach administrative APIs. |
+| `lookup` | Explicit customer Bearer, own-key-only reports, foreign/unknown snapshot 404 equivalence, natural-month trends and exact amounts. |
 | `namespace` | Request model vs execution/response model are kept distinct for an aliased model; billing uses the requested model's price. |
 | `lifecycle` | Unknown usage stays pending (never free); client cancel does not hang and keeps the hold; restart retains the settled balance and keeps unfinished work pending. |
 | `retry` | A 429 on the first upstream credential fails over, one client request, two independent per-attempt usage rows (failed-unknown not written off), hold retained; all-failures never bill as free. |
 | `warmup` | Background warmup: default-off issues no background activity; enabled issues a *real* pinned host model execution (upstream 1, host log shows credential selection with no client scope) that creates no customer ledger row/hold/charge; an unknown `AuthID` fails with no host-side fallback; with a single bound credential a customer request runs alongside the worker on the *exact same AuthID* and is billed; a forged warmup session header is still billed in full; reconfiguring to disabled leaves no residual worker. |
 | `affinity` | Native CPA session-affinity scheduling (`routing.session-affinity: true`, default round-robin, two synthetic credentials): an explicit `X-Session-ID` shared by three requests with different user content, and a grown conversation prefix (system+user stable, assistant+user appended) with **no** session header, each keep every request on one credential (identical `AuthID` and upstream key) and bill 3 x 14 = 42. Unrelated requests without a session do alternate the two credentials, so the binding is not a default. |
 | `gemini` | Native `generateContent` and `streamGenerateContent` (`alt=sse`) authenticate, forward the upstream Google key and bill. |
-| `browser` | Real isolated-context Chromium: in-memory login, usage render, no localStorage/sessionStorage/cookie/URL credential persistence, lazy capture-body modal with redaction and 64-bit fidelity. |
+| `browser` | Real isolated Chromium: per-tab session login, optional remembered reload, logout clearing storage/charts, real ECharts/month query, lazy capture-body modal with redaction/64-bit fidelity, customer own-key snapshot lookup. |
 
 ## Environment notes
 
