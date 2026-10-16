@@ -863,6 +863,140 @@ table.data tbody tr.row-main:hover td {
   grid-column: 1 / -1;
 }
 
+/* ---------- 紧凑请求明细 ---------- */
+
+#usage-items {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+#usage-items > .card {
+  margin: 0;
+  padding: 12px 14px;
+  border-radius: 10px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  box-shadow: 0 1px 4px rgba(0, 0, 0, .02);
+  transition: border-color .15s ease, box-shadow .15s ease;
+}
+
+#usage-items > .card:hover {
+  border-color: #cbd5cc;
+  box-shadow: 0 3px 12px rgba(41, 57, 46, .05);
+}
+
+#usage-items .row-title {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 8px;
+  margin: 0 0 8px;
+  font-size: 12.5px;
+}
+
+#usage-items .row-title .key-label {
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--text);
+}
+
+#usage-items .row-title .pill-note {
+  font-size: 11px;
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  color: var(--muted);
+}
+
+#usage-items .row-title .pill-note.is-warn {
+  color: var(--warn);
+  border-color: rgba(183, 123, 29, 0.35);
+  background: rgba(183, 123, 29, 0.08);
+}
+
+#usage-items .btn-row {
+  margin-bottom: 8px;
+  gap: 6px;
+}
+
+#usage-items .request-meta {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px 14px;
+  margin: 6px 0 8px;
+  padding: 8px 12px;
+  background: var(--panel-2);
+  border-radius: 6px;
+  border: 1px solid var(--line);
+  font-size: 12px;
+}
+
+#usage-items .request-meta .kv {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  align-content: start;
+  gap: 3px;
+}
+
+#usage-items .request-meta .kv-k {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--muted);
+}
+
+#usage-items .request-meta .kv-v {
+  font-size: 12px;
+  color: var(--text);
+  word-break: normal;
+  overflow-wrap: anywhere;
+}
+
+#usage-items .request-meta .kv-wide {
+  grid-column: 1 / -1;
+  display: flex;
+  flex-direction: row;
+  align-items: baseline;
+  gap: 8px;
+  padding-top: 4px;
+  border-top: 1px dashed var(--line);
+}
+
+#usage-items .table-scroll {
+  margin-top: 6px;
+  border-radius: 6px;
+  border: 1px solid var(--line);
+}
+
+#usage-items table.data {
+  font-size: 12px;
+}
+
+#usage-items table.data th {
+  padding: 6px 8px;
+  font-size: 11px;
+  font-weight: 600;
+  background: var(--table-head);
+  color: var(--table-muted);
+}
+
+#usage-items table.data td {
+  padding: 6px 8px;
+  font-size: 12px;
+  vertical-align: middle;
+}
+
+#usage-items .token-lines {
+  min-width: 140px;
+  gap: 0;
+}
+
+#usage-items .token-line {
+  font-size: 11px;
+  line-height: 1.35;
+}
+
 /* ---------- 徽标 ---------- */
 
 .badge {
@@ -909,35 +1043,27 @@ table.data tbody tr.row-main:hover td {
 
 .usage-charts-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(420px, 1fr));
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 16px;
   margin: 16px 0;
 }
 
 .chart-card {
   margin-bottom: 0;
+  min-width: 0;
+}
+
+.chart-card.chart-card-requests {
+  grid-column: 1 / -1;
 }
 
 .chart {
   width: 100%;
-  overflow-x: auto;
-  -webkit-overflow-scrolling: touch;
+  height: 280px;
+  min-height: 280px;
+  box-sizing: border-box;
+  position: relative;
 }
-
-.chart svg {
-  display: block;
-  width: 100%;
-  height: auto;
-  min-width: 720px;
-}
-
-.chart .grid-line { stroke: var(--line); stroke-width: 1; }
-.chart .axis-label { fill: var(--muted); font-size: 10px; font-family: var(--mono); }
-.chart .bar-requests { fill: #4c8dff; }
-.chart .bar-executions { fill: #2f6b52; }
-.chart .cost-line { fill: none; stroke: var(--warn); stroke-width: 2; }
-.chart .cost-dot { fill: var(--warn); }
-.chart .axis-line { stroke: var(--line); stroke-width: 1; }
 
 .legend {
   display: flex;
@@ -1217,6 +1343,13 @@ pre.code {
   .usage-charts-grid {
     grid-template-columns: 1fr;
   }
+  .chart-card.chart-card-requests {
+    grid-column: auto;
+  }
+  .chart {
+    height: 260px;
+    min-height: 260px;
+  }
   .modal {
     padding: 14px;
   }
@@ -1236,9 +1369,6 @@ pre.code {
     grid-template-columns: minmax(0, 1fr);
   }
   .table-scroll {
-    overflow-x: auto;
-  }
-  .chart {
     overflow-x: auto;
   }
 }

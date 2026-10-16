@@ -69,3 +69,20 @@ test('样式表具备完整 CPA 配色、主题变量与响应式无溢出保证
   assert.ok(css.includes('@media (max-width: 720px)'), '缺少移动端断点');
   assert.ok(css.includes('overflow-x: auto'), '缺少横向防溢出滚动定义');
 });
+
+test('图表容器具备显式高度与响应式栅格，并移除陈旧手工 SVG 样式', () => {
+  assert.ok(css.includes('height: 280px'), 'ECharts 容器需显式 280px 左右高度');
+  assert.ok(!css.includes('.chart svg'), '不得保留影响 ECharts 画布的 .chart svg 规则');
+  assert.ok(!css.includes('.chart .grid-line'), '需移除陈旧的手工 SVG 样式');
+  assert.ok(css.includes('.chart-card.chart-card-requests'), '缺少请求整行卡片选择器');
+  assert.ok(css.includes('grid-column: 1 / -1'), '请求趋势图需占满整行');
+  assert.ok(html.includes('chart-card-requests'));
+  assert.ok(html.includes('chart-card-tokens'));
+  assert.ok(html.includes('chart-card-cost'));
+});
+
+test('请求明细卡片具备紧凑高信息密度样式', () => {
+  assert.ok(css.includes('#usage-items > .card'), '缺少紧凑明细卡片样式');
+  assert.ok(css.includes('#usage-items .request-meta'), '缺少紧凑元数据网格样式');
+  assert.ok(css.includes('#usage-items table.data'), '缺少紧凑表格样式');
+});
