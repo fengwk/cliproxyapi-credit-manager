@@ -123,8 +123,21 @@ func (s *Store) Reserve(ctx context.Context, in ReserveInput) (Request, error) {
 }
 
 func (s *Store) checkMoneyLimits(ctx context.Context, tx *sql.Tx, key *keyRow, at time.Time, hold int64) error {
+	// A soft deleted key must never admit new work. This is the single
+	// admission gate for deleted keys: money limits are always evaluated, even
+	// when no monetary limit is configured, before any execution is admitted.
+	if key.deletedAt != nil {
+		return ErrUnauthorized
+	}
 	if quota := key.spec.QuotaMicroUSD; quota > 0 {
-		committed, err := checkedAdd(key.spent, key.held)
+		// Effective usage is the durable lifetime spend minus the operator
+		// reset baseline. A reset therefore clears quota headroom without ever
+		// erasing the true ledger total.
+		effective, err := effectiveMoney(ctx, tx, key.id, windowTotal, periodOf(windowTotal, at), key.spent)
+		if err != nil {
+			return err
+		}
+		committed, err := checkedAdd(effective, key.held)
 		if err != nil {
 			return err
 		}
@@ -148,13 +161,18 @@ func (s *Store) checkMoneyLimits(ctx context.Context, tx *sql.Tx, key *keyRow, a
 		if l.limit <= 0 {
 			continue
 		}
-		spent, err := moneyCounter(ctx, tx, key.id, l.win, periodOf(l.win, at))
+		raw, err := moneyCounter(ctx, tx, key.id, l.win, periodOf(l.win, at))
+		if err != nil {
+			return err
+		}
+		spent, err := effectiveMoney(ctx, tx, key.id, l.win, periodOf(l.win, at), raw)
 		if err != nil {
 			return err
 		}
 		// Unresolved requests admitted in this same period still hold budget
 		// that has not been charged yet; without them two concurrent requests
-		// could each pass the check and jointly exceed the limit.
+		// could each pass the check and jointly exceed the limit. A reset never
+		// touches these holds, so late or unknown obligations keep counting.
 		held, err := periodHold(ctx, tx, key.id, l.win, at)
 		if err != nil {
 			return err
@@ -244,7 +262,14 @@ func (s *Store) checkTokenLimits(ctx context.Context, tx *sql.Tx, key *keyRow, m
 		if err != nil {
 			return err
 		}
-		total, err := checkedAdd(used, admit)
+		// Effective token usage subtracts the operator reset baseline for this
+		// window/period. Reserved estimates of unresolved requests are never
+		// baselined, so a reset cannot forgive an unknown obligation.
+		effective, err := effectiveToken(ctx, tx, key.id, model, w.win, periodOf(w.win, at), used)
+		if err != nil {
+			return err
+		}
+		total, err := checkedAdd(effective, admit)
 		if err != nil {
 			return err
 		}

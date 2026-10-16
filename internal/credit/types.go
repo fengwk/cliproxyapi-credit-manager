@@ -28,9 +28,12 @@ type Options struct {
 }
 
 type KeySpec struct {
-	Label            string            `json:"label"`
-	Material         string            `json:"key,omitempty"`
-	Enabled          bool              `json:"enabled"`
+	Label    string `json:"label"`
+	Material string `json:"key,omitempty"`
+	Enabled  bool   `json:"enabled"`
+	// CallerID is an optional attribution to a caller record. It is metadata
+	// only: it never changes the key's identity, scope or scheduling.
+	CallerID         string            `json:"caller_id,omitempty"`
 	QuotaMicroUSD    int64             `json:"quota_micro_usd"`
 	DailyMicroUSD    int64             `json:"daily_micro_usd"`
 	WeeklyMicroUSD   int64             `json:"weekly_micro_usd"`
@@ -50,14 +53,28 @@ type ModelTokenLimit struct {
 }
 
 type Key struct {
-	ID            string    `json:"id"`
-	Principal     string    `json:"principal"`
-	Scope         string    `json:"scope"`
-	Fingerprint   string    `json:"fingerprint"`
-	Spec          KeySpec   `json:"spec"`
-	SpentMicroUSD int64     `json:"spent_micro_usd"`
-	HeldMicroUSD  int64     `json:"held_micro_usd"`
-	CreatedAt     time.Time `json:"created_at"`
+	ID          string  `json:"id"`
+	Principal   string  `json:"principal"`
+	Scope       string  `json:"scope"`
+	Fingerprint string  `json:"fingerprint"`
+	Spec        KeySpec `json:"spec"`
+	// SpentMicroUSD is the raw, durable lifetime charge. It is never reduced by
+	// a quota reset so existing consumers keep observing the true ledger total.
+	SpentMicroUSD int64 `json:"spent_micro_usd"`
+	HeldMicroUSD  int64 `json:"held_micro_usd"`
+	// QuotaUsedMicroUSD is the effective lifetime usage: it subtracts the
+	// operator reset baseline from SpentMicroUSD and is what quota admission
+	// enforces. The per period fields are the same view for day/week/month.
+	QuotaUsedMicroUSD   int64  `json:"quota_used_micro_usd"`
+	DailyUsedMicroUSD   int64  `json:"daily_used_micro_usd"`
+	WeeklyUsedMicroUSD  int64  `json:"weekly_used_micro_usd"`
+	MonthlyUsedMicroUSD int64  `json:"monthly_used_micro_usd"`
+	CallerID            string `json:"caller_id,omitempty"`
+	// DeletedAt marks a soft deleted key. A soft deleted key keeps its records,
+	// ledger and unresolved requests but can no longer be re-enabled, rotated or
+	// authenticated.
+	DeletedAt *time.Time `json:"deleted_at,omitempty"`
+	CreatedAt time.Time  `json:"created_at"`
 }
 
 type Rates struct {
