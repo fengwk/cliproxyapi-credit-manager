@@ -702,6 +702,249 @@ async function main() {
     check('高级定价规则列表渲染', await cdp.evaluate("document.querySelectorAll('#pricing-rules-list table').length > 0"));
     const rulesText = await cdp.text('#pricing-rules-list');
     check('规则列表展示规则 ID 与匹配模式', rulesText.includes('rule-') || rulesText.includes('gpt-4o'));
+    // 表格必须读取嵌套 rates：回退到扁平别名时这里会显示 0 / 0。
+    check('规则表格读取嵌套 price.rates', rulesText.includes('入/出: 1,000,000 / 3,000,000'), rulesText.replace(/\n/g, ' ').slice(0, 240));
+    check('规则表格展示缓存与阶梯摘要', rulesText.includes('缓存读/写: 100,000 / 2,000,000') && rulesText.includes('1 级 (上下文: >128,000)'), rulesText.replace(/\n/g, ' ').slice(0, 240));
+    check('缺失思考费率显示为继承输出', rulesText.includes('思考: 继承输出'));
+    check('显式 0 思考费率与按图费率如实展示', rulesText.includes('思考: 0') && rulesText.includes('按图: 50,000 µUSD/张'), rulesText.replace(/\n/g, ' ').slice(0, 240));
+
+    /* --- 7b-1. 新建/编辑高级规则必须符合真实后端嵌套契约 --- */
+    await cdp.click('#rules-create');
+    await cdp.waitFor("document.querySelector('.modal #rule-pattern')", 10000, '新增高级规则弹窗');
+    check(
+      '规则编辑弹窗使用嵌套费率字段',
+      await cdp.evaluate("!!document.querySelector('.modal #rule-input-rate') && !!document.querySelector('.modal #rule-cache-write-rate') && !!document.querySelector('.modal #rule-reasoning-rate')")
+    );
+    await cdp.setValue('.modal #rule-pattern', 'fresh-*');
+    await cdp.clickText('.modal button', '保存规则');
+    await sleep(250);
+    check('基础费率留空时拒绝提交', (await cdp.text('.modal .inline-error')).includes('不能为空'), await cdp.text('.modal .inline-error'));
+
+    await cdp.setValue('.modal #rule-id', 'rule-ui-new');
+    await cdp.setValue('.modal #rule-pattern', 'fresh-*');
+    await cdp.setValue('.modal #rule-priority', '15');
+    // 超过 2^53 的 64 位整数必须逐字精确下发。
+    await cdp.setValue('.modal #rule-input-rate', '9007199254740993');
+    await cdp.setValue('.modal #rule-output-rate', '2000000');
+    await cdp.setValue('.modal #rule-cache-read-rate', '0');
+    await cdp.setValue('.modal #rule-cache-write-rate', '3000000');
+    // 思考费率留空 = 继承输出单价。
+    await cdp.clickText('.modal button', '保存规则');
+    await cdp.waitFor("!document.querySelector('.modal #rule-pattern')", 10000, '规则保存后弹窗关闭');
+    await sleep(300);
+
+    const rulePutRaw = (await debug('rules:put')).body;
+    const rulePut = JSON.parse(rulePutRaw);
+    check(
+      '规则请求体使用嵌套 price.rates',
+      rulePut.price && rulePut.price.rates && rulePut.price.rates.output === 2000000 && rulePut.price.rates.cache_write === 3000000 && rulePut.price.rates.cache_read === 0,
+      JSON.stringify(rulePut.price)
+    );
+    check(
+      '规则请求体不含扁平费率别名与旧计费模式',
+      !('input_rate' in rulePut.price) && !('output_rate' in rulePut.price) && !('cache_read_rate' in rulePut.price) && !('cache_write_rate' in rulePut.price) && !('reasoning_rate' in rulePut.price) && rulePut.price.billing_mode === 'token',
+      JSON.stringify(rulePut.price)
+    );
+    check('规则请求体保留 64 位精确费率', rulePutRaw.includes('"input":9007199254740993'), rulePutRaw);
+    check('思考费率留空不下发 reasoning 字段', !('reasoning' in rulePut.price.rates), JSON.stringify(rulePut.price.rates));
+    check('tiers 以数组提交', Array.isArray(rulePut.tiers) && rulePut.tiers.length === 0, JSON.stringify(rulePut.tiers));
+
+    // 写入必须真的被严格 mock 接受（否则 400 会让下面的列表断言失败）。
+    await cdp.waitFor(
+      "[...document.querySelectorAll('#pricing-rules-list tbody tr')].some((tr) => tr.textContent.includes('rule-ui-new'))",
+      10000,
+      '新规则进入列表'
+    );
+    check('严格契约校验通过并写入成功', true);
+
+    // 原样保存「继承思考单价」的规则：reasoning 必须继续缺省。
+    await cdp.evaluate(
+      "(() => { const row = [...document.querySelectorAll('#pricing-rules-list tbody tr')].find((tr) => tr.textContent.includes('rule-ui-new')); row.querySelector('button').click(); return true; })()"
+    );
+    await cdp.waitFor("document.querySelector('.modal #rule-pattern')", 10000, '编辑规则弹窗');
+    check('编辑时缺失的思考费率保持留空（继承）', (await cdp.evaluate("document.querySelector('.modal #rule-reasoning-rate').value")) === '');
+    await cdp.clickText('.modal button', '保存规则');
+    await sleep(400);
+    const inheritRaw = (await debug('rules:put')).body;
+    check('原样保存不得把继承改写成显式免费', !inheritRaw.includes('"reasoning"'), inheritRaw);
+
+    // 显式 0 的思考费率必须保留为 0。
+    await cdp.evaluate(
+      "(() => { const row = [...document.querySelectorAll('#pricing-rules-list tbody tr')].find((tr) => tr.textContent.includes('rule-free-reasoning')); row.querySelector('button').click(); return true; })()"
+    );
+    await cdp.waitFor("document.querySelector('.modal #rule-pattern')", 10000, '编辑显式免费规则');
+    check('显式 0 思考费率预填为 0', (await cdp.evaluate("document.querySelector('.modal #rule-reasoning-rate').value")) === '0');
+    await cdp.clickText('.modal button', '保存规则');
+    await sleep(400);
+    const freePut = JSON.parse((await debug('rules:put')).body);
+    check('显式免费的思考费率保留为 0', freePut.price.rates.reasoning === 0, JSON.stringify(freePut.price.rates));
+
+    // 阶梯：添加/移除不得丢失已输入内容，cache_write 必须一并提交。
+    await cdp.click('#rules-create');
+    await cdp.waitFor("document.querySelector('.modal #rule-pattern')", 10000, '新增阶梯规则弹窗');
+    await cdp.setValue('.modal #rule-id', 'rule-ui-tier');
+    await cdp.setValue('.modal #rule-pattern', 'tier-*');
+    await cdp.setValue('.modal #rule-priority', '5');
+    await cdp.setValue('.modal #rule-input-rate', '1');
+    await cdp.setValue('.modal #rule-output-rate', '2');
+    await cdp.setValue('.modal #rule-cache-read-rate', '0');
+    await cdp.setValue('.modal #rule-cache-write-rate', '0');
+    await cdp.clickText('.modal .tiers-editor-head button', '+ 添加阶梯');
+    await cdp.waitFor("document.querySelectorAll('.modal .tier-item-card').length === 1", 10000, '第一条阶梯');
+    await cdp.setValue('.modal .tier-item-card:nth-child(1) .tier-threshold', '64000');
+    await cdp.setValue('.modal .tier-item-card:nth-child(1) .tier-rate-input', '111');
+    await cdp.setValue('.modal .tier-item-card:nth-child(1) .tier-rate-cache-write', '7777777');
+    await cdp.clickText('.modal .tiers-editor-head button', '+ 添加阶梯');
+    await cdp.waitFor("document.querySelectorAll('.modal .tier-item-card').length === 2", 10000, '第二条阶梯');
+    check(
+      '添加阶梯不丢失未保存的输入',
+      (await cdp.evaluate("document.querySelectorAll('.modal .tier-item-card')[0].querySelector('.tier-threshold').value")) === '64000' &&
+        (await cdp.evaluate("document.querySelectorAll('.modal .tier-item-card')[0].querySelector('.tier-rate-cache-write').value")) === '7777777'
+    );
+    await cdp.evaluate("document.querySelectorAll('.modal .tier-item-card')[1].querySelector('button').click()");
+    await cdp.waitFor("document.querySelectorAll('.modal .tier-item-card').length === 1", 10000, '移除第二条阶梯');
+    check('移除阶梯后保留其余阶梯的输入', (await cdp.evaluate("document.querySelectorAll('.modal .tier-item-card')[0].querySelector('.tier-threshold').value")) === '64000');
+    await cdp.clickText('.modal button', '保存规则');
+    await sleep(400);
+    const tierPut = JSON.parse((await debug('rules:put')).body);
+    check(
+      '阶梯以嵌套 rates 提交且包含 cache_write',
+      tierPut.tiers.length === 1 && tierPut.tiers[0].kind === 'context' && tierPut.tiers[0].threshold === 64000 && tierPut.tiers[0].rates.input === 111 && tierPut.tiers[0].rates.cache_write === 7777777,
+      JSON.stringify(tierPut.tiers)
+    );
+    check('阶梯未填写的思考费率表示继承', !('reasoning' in tierPut.tiers[0].rates), JSON.stringify(tierPut.tiers[0].rates));
+
+    // 删除规则使用结构化确认弹窗，不使用浏览器原生 alert/confirm。
+    await cdp.waitFor(
+      "[...document.querySelectorAll('#pricing-rules-list tbody tr')].some((tr) => tr.textContent.includes('rule-ui-tier'))",
+      10000,
+      '阶梯规则进入列表'
+    );
+    const deletesBefore = (await hits()).filter((h) => h.startsWith('POST ') && h.includes('/api/delete-price-rule')).length;
+    await cdp.evaluate(
+      "(() => { const row = [...document.querySelectorAll('#pricing-rules-list tbody tr')].find((tr) => tr.textContent.includes('rule-ui-tier')); row.querySelectorAll('button')[1].click(); return true; })()"
+    );
+    await cdp.waitFor("document.querySelector('.modal #confirm-checkbox')", 10000, '删除确认弹窗');
+    await cdp.clickText('.modal button', '删除');
+    await sleep(150);
+    check('删除规则需要勾选确认', (await cdp.text('.modal .inline-error')).includes('勾选'), await cdp.text('.modal .inline-error'));
+    check(
+      '未确认时没有发出删除请求',
+      (await hits()).filter((h) => h.startsWith('POST ') && h.includes('/api/delete-price-rule')).length === deletesBefore
+    );
+    await cdp.evaluate("document.querySelector('.modal #confirm-checkbox').checked = true");
+    await cdp.clickText('.modal button', '删除');
+    await cdp.waitFor("!document.querySelector('.modal #confirm-checkbox')", 10000, '删除确认弹窗关闭');
+    await cdp.waitFor(
+      "[...document.querySelectorAll('#pricing-rules-list tbody tr')].every((tr) => !tr.textContent.includes('rule-ui-tier'))",
+      10000,
+      '规则已从列表移除'
+    );
+    check('确认后删除规则', (await hits()).filter((h) => h.startsWith('POST ') && h.includes('/api/delete-price-rule')).length === deletesBefore + 1);
+
+    /* --- 7b-2. 模型目录：分页、过期标注与显式确认导入 --- */
+    const rulePutsBeforeCatalog = (await hits()).filter((h) => h.startsWith('PUT ') && h.includes('/api/pricing-rules')).length;
+    await cdp.click('#btn-load-model-catalog');
+    await cdp.waitFor("document.querySelector('.modal .catalog-row')", 10000, '目录弹窗');
+    check('目录最多渲染一页 50 行', (await cdp.count('.modal .catalog-row')) === 50, String(await cdp.count('.modal .catalog-row')));
+    check('目录分页展示模型总数', (await cdp.text('.modal .catalog-pager')).includes('共 132 个模型'), await cdp.text('.modal .catalog-pager'));
+    const catalogStatus = await cdp.text('.modal .catalog-status');
+    check('目录如实标注上游刷新失败与来源', catalogStatus.includes('上游刷新失败') && catalogStatus.includes('models.dev') && catalogStatus.includes('i/o timeout'), catalogStatus);
+    check('过期目录不得标注为最新', !catalogStatus.includes('最新'), catalogStatus);
+    check('目录为只读 GET', (await getHitsOf('/api/model-catalog')).length === 1, (await hitsOf('/api/model-catalog')).join(' | '));
+
+    await cdp.setValue('.modal #catalog-search', 'opencode-go/glm-5');
+    await cdp.waitFor("document.querySelectorAll('.modal .catalog-row').length === 1", 10000, '目录搜索结果');
+    check('目录搜索保留 provider 限定名', (await cdp.text('.modal .catalog-row')).includes('opencode-go/glm-5'), await cdp.text('.modal .catalog-row'));
+    await cdp.clickText('.modal .catalog-row button', '选用');
+    await cdp.waitFor("document.querySelector('.modal #rule-pattern')", 10000, '目录导入预览');
+    check('导入预览保留 provider 限定模型名', (await cdp.evaluate("document.querySelector('.modal #rule-pattern').value")) === 'opencode-go/glm-5');
+    check(
+      '导入预览带出目录费率（含缓存写）',
+      (await cdp.evaluate("document.querySelector('.modal #rule-input-rate').value")) === '1000000' &&
+        (await cdp.evaluate("document.querySelector('.modal #rule-cache-write-rate').value")) === '2000000' &&
+        (await cdp.evaluate("document.querySelector('.modal #rule-reasoning-rate').value")) === '4000000'
+    );
+    check('导入必须显式勾选确认', await cdp.evaluate("!!document.querySelector('.modal #rule-confirm')"));
+    check('导入说明注明数据可能过期', (await cdp.text('.modal .rule-source-note')).includes('可能已过期'), await cdp.text('.modal .rule-source-note'));
+    await cdp.clickText('.modal button', '保存规则');
+    await sleep(250);
+    check('未勾选确认时拒绝写入', (await cdp.text('.modal .inline-error')).includes('勾选确认'), await cdp.text('.modal .inline-error'));
+    check(
+      '未确认时没有发出写入请求',
+      (await hits()).filter((h) => h.startsWith('PUT ') && h.includes('/api/pricing-rules')).length === rulePutsBeforeCatalog,
+      (await hitsOf('/api/pricing-rules')).join(' | ')
+    );
+
+    await cdp.evaluate("document.querySelector('.modal #rule-confirm').checked = true");
+    await cdp.clickText('.modal button', '保存规则');
+    await cdp.waitFor("!document.querySelector('.modal #rule-pattern')", 10000, '目录导入后弹窗关闭');
+    await sleep(300);
+    const imported = JSON.parse((await debug('rules:put')).body);
+    check(
+      '目录导入为精确 PricingRule 且费率嵌套',
+      imported.match_kind === 'exact' &&
+        imported.pattern === 'opencode-go/glm-5' &&
+        imported.price.model === 'opencode-go/glm-5' &&
+        imported.price.rates.input === 1000000 &&
+        imported.price.rates.cache_write === 2000000 &&
+        imported.price.rates.reasoning === 4000000,
+      JSON.stringify(imported)
+    );
+    check(
+      '目录阶梯以嵌套 rates 导入且跳过不完整阶梯',
+      imported.tiers.length === 1 && imported.tiers[0].kind === 'context' && imported.tiers[0].threshold === 128000 && imported.tiers[0].rates.cache_write === 2500000 && !('reasoning' in imported.tiers[0].rates),
+      JSON.stringify(imported.tiers)
+    );
+
+    // 缺失费率的模型：必须手工显式填写，绝不静默按 0 导入。
+    const putsBeforeMissing = (await hits()).filter((h) => h.startsWith('PUT ') && h.includes('/api/pricing-rules')).length;
+    await cdp.click('#btn-load-model-catalog');
+    await cdp.waitFor("document.querySelector('.modal .catalog-row')", 10000, '目录再次打开');
+    await cdp.setValue('.modal #catalog-search', 'anthropic/claude-missing-rates');
+    await cdp.waitFor("document.querySelectorAll('.modal .catalog-row').length === 1", 10000, '缺失费率模型');
+    await cdp.clickText('.modal .catalog-row button', '选用');
+    await cdp.waitFor("document.querySelector('.modal #rule-pattern')", 10000, '缺失费率导入预览');
+    check(
+      '缺失的目录费率留空等待手工填写',
+      (await cdp.evaluate("document.querySelector('.modal #rule-cache-read-rate').value")) === '' &&
+        (await cdp.evaluate("document.querySelector('.modal #rule-cache-write-rate').value")) === ''
+    );
+    await cdp.evaluate("document.querySelector('.modal #rule-confirm').checked = true");
+    await cdp.clickText('.modal button', '保存规则');
+    await sleep(250);
+    check('缺失费率不得静默按 0 导入', (await cdp.text('.modal .inline-error')).includes('缓存读取费率 不能为空'), await cdp.text('.modal .inline-error'));
+    check(
+      '缺失费率时不发出写入请求',
+      (await hits()).filter((h) => h.startsWith('PUT ') && h.includes('/api/pricing-rules')).length === putsBeforeMissing
+    );
+    await cdp.clickText('.modal button', '取消');
+
+    /* --- 7b-3. 严格 mock：扁平费率 / 未知字段必须被拒绝 --- */
+    const managerAPI = `${origin}/v0/management/plugins/credit-manager/api/pricing-rules`;
+    const strictHeaders = { Authorization: 'Bearer ' + MANAGEMENT_KEY, 'Content-Type': 'application/json' };
+    const validPrice = { model: 'strict', billing_mode: 'token', per_image_micro_usd: 0, rates: { input: 1, output: 2, cache_read: 0, cache_write: 0 } };
+    const flatResponse = await fetch(managerAPI, {
+      method: 'PUT',
+      headers: strictHeaders,
+      body: JSON.stringify({ id: 'flat-rule', match_kind: 'exact', pattern: 'strict', priority: 1, enabled: true, price: Object.assign({}, validPrice, { input_rate: 1, output_rate: 2, cache_read_rate: 0, cache_write_rate: 0, reasoning_rate: 0 }), tiers: [] }),
+    });
+    check('mock 严格拒绝扁平费率请求体', flatResponse.status === 400, 'status=' + flatResponse.status);
+    check('mock 明确指出未知字段', String((await flatResponse.json()).error).includes('unknown field'));
+    const unknownResponse = await fetch(managerAPI, {
+      method: 'PUT',
+      headers: strictHeaders,
+      body: JSON.stringify({ id: 'unknown-rule', match_kind: 'exact', pattern: 'strict', priority: 1, enabled: true, price: validPrice, tiers: [], surprise: true }),
+    });
+    check('mock 严格拒绝未知顶层字段', unknownResponse.status === 400, 'status=' + unknownResponse.status);
+    const validResponse = await fetch(managerAPI, {
+      method: 'PUT',
+      headers: strictHeaders,
+      body: JSON.stringify({ id: 'strict-ok', match_kind: 'exact', pattern: 'strict', priority: 1, enabled: true, price: validPrice, tiers: [{ kind: 'context', threshold: 1000, label: '', rates: { input: 5, output: 0, cache_read: 0, cache_write: 0 } }] }),
+    });
+    check('mock 接受符合真实契约的请求体', validResponse.status === 200, 'status=' + validResponse.status);
+    const flatHits = (await hits()).filter((h) => h === 'PUT /v0/management/plugins/credit-manager/api/pricing-rules').length;
+    check('严格校验未影响页面自身的写入路径', flatHits >= 3, 'puts=' + flatHits);
 
     /* --- 7c. 调用方管理 --- */
     await cdp.click('#tab-callers');

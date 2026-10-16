@@ -135,6 +135,9 @@ const AUDIT_EVENTS = [
   },
 ];
 
+// 高级定价规则 fixture：与 internal/credit.PricingRule 的真实 JSON 完全一致——
+// 费率嵌套在 price.rates 下，阶梯挂在规则顶层且自带嵌套 rates。
+// 扁平别名（input_rate/...）在这里会被 PUT 校验直接拒绝，因此不能出现在 fixture 中。
 const PRICING_RULES = [
   {
     id: 'rule-1',
@@ -144,22 +147,94 @@ const PRICING_RULES = [
     enabled: true,
     price: {
       model: 'opencode-go/*',
-      billing_mode: 'standard',
-      input_rate: 1000000,
-      output_rate: 3000000,
-      cache_read_rate: 100000,
-      cache_write_rate: 2000000,
-      reasoning_rate: 4000000,
+      billing_mode: 'token',
       per_image_micro_usd: 0,
+      // reasoning 缺失 = 按输出单价（继承）；显式 0 才是「思考免费」。
+      rates: { input: 1000000, output: 3000000, cache_read: 100000, cache_write: 2000000 },
+    },
+    tiers: [
+      {
+        kind: 'context',
+        threshold: 128000,
+        label: '长上下文',
+        service: '',
+        rates: { input: 2000000, output: 4000000, cache_read: 0, cache_write: 0 },
+      },
+    ],
+  },
+  {
+    id: 'rule-image',
+    match_kind: 'exact',
+    pattern: 'gpt-image-1',
+    priority: 20,
+    enabled: true,
+    price: {
+      model: 'gpt-image-1',
+      billing_mode: 'per_image',
+      per_image_micro_usd: 50000,
+      rates: { input: 0, output: 0, cache_read: 0, cache_write: 0 },
+    },
+    tiers: [],
+  },
+  {
+    id: 'rule-free-reasoning',
+    match_kind: 'regexp',
+    pattern: '^free-.*$',
+    priority: 1,
+    enabled: false,
+    price: {
+      model: '^free-.*$',
+      billing_mode: 'token',
+      per_image_micro_usd: 0,
+      rates: { input: 0, output: 0, reasoning: 0, cache_read: 0, cache_write: 0 },
     },
     tiers: [],
   },
 ];
 
-const CATALOG_MODELS = [
-  { model: 'gpt-4o', provider: 'openai', input_rate: 2500000, output_rate: 10000000, cache_read_rate: 1250000 },
-  { model: 'claude-3-5-sonnet', provider: 'anthropic', input_rate: 3000000, output_rate: 15000000, cache_read_rate: 300000 },
-];
+// 模型目录 fixture：真实后端返回 catalog.Snapshot{items,source,fetched_at,cached,stale,error}。
+// 条目数刻意超过一页（每页最多 50 行），用于验证界面不会一次性渲染近万个模型；
+// stale=true 用于验证界面如实标注「缓存数据可能已过期」而不是谎称「最新」。
+const CATALOG_MODELS = (() => {
+  const items = [];
+  for (let index = 0; index < 130; index++) {
+    items.push({
+      id: 'vendor' + (index % 3) + '/model-' + String(index).padStart(4, '0'),
+      provider: 'vendor' + (index % 3),
+      name: 'Model ' + index,
+      rates: { input: 1000000 + index, output: 2000000 + index, cache_read: 100000, cache_write: 200000 },
+    });
+  }
+  items.push({
+    // provider 限定名必须原样保留（不得自动剥离 provider 前缀）。
+    id: 'opencode-go/glm-5',
+    provider: 'opencode-go',
+    name: 'GLM-5',
+    rates: { input: 1000000, output: 3000000, cache_read: 100000, cache_write: 2000000, reasoning: 4000000 },
+    context_tiers: [
+      { threshold: 128000, label: '128K', rates: { input: 2000000, output: 4000000, cache_read: 200000, cache_write: 2500000 } },
+      // 费率不完整的阶梯不得被导入（缺失 != 0）。
+      { threshold: 200000, label: '200K', rates: { input: 3000000, output: 5000000 } },
+    ],
+  });
+  items.push({
+    // 缺失 cache_read/cache_write：导入时必须要求手工显式填写，绝不静默补 0。
+    id: 'anthropic/claude-missing-rates',
+    provider: 'anthropic',
+    name: 'Claude Missing Rate',
+    rates: { input: 3000000, output: 15000000 },
+  });
+  return items;
+})();
+
+const CATALOG_SNAPSHOT = {
+  items: CATALOG_MODELS,
+  source: 'models.dev',
+  fetched_at: '2026-10-16T00:00:00Z',
+  cached: true,
+  stale: true,
+  error: 'models.dev: dial tcp 1.2.3.4:443: i/o timeout',
+};
 
 const REQUESTS_PAGE_1 = [
   {
@@ -442,6 +517,130 @@ const QUOTA_GOOD = {
 };
 
 const recorded = { usage: [], last: {}, hits: [] };
+
+/* ------------------------------------------------------------------ *
+ * 严格 schema 校验
+ *
+ * 真实后端 internal/web/handler.go 的 decode 使用 DisallowUnknownFields，
+ * 且 credit.normalizePricingRule 要求嵌套费率、非负整数与合法的阶梯。
+ * mock 在这里用同一套约束拒绝请求，任何扁平费率别名或多余字段都无法
+ * 蒙混过关——未被测试覆盖的契约不匹配会直接表现为 4xx。
+ * ------------------------------------------------------------------ */
+
+const RULE_KEYS = ['id', 'match_kind', 'pattern', 'priority', 'enabled', 'price', 'tiers'];
+const PRICE_KEYS = ['model', 'rates', 'billing_mode', 'per_image_micro_usd', 'version'];
+const RATE_KEYS = ['input', 'output', 'cache_read', 'cache_write', 'reasoning'];
+const TIER_KEYS = ['kind', 'threshold', 'service', 'label', 'rates'];
+const REQUIRED_RATE_KEYS = ['input', 'output', 'cache_read', 'cache_write'];
+
+function isInt(value) {
+  return typeof value === 'number' && Number.isInteger(value);
+}
+
+function firstUnknownKey(obj, allowed) {
+  for (const key of Object.keys(obj)) {
+    if (allowed.indexOf(key) < 0) return key;
+  }
+  return '';
+}
+
+function validateTier(tier) {
+  if (!tier || typeof tier !== 'object' || Array.isArray(tier)) {
+    return 'invalid: price tier must be a JSON object';
+  }
+  const unknown = firstUnknownKey(tier, TIER_KEYS);
+  if (unknown) return 'invalid: json: unknown field "' + unknown + '"';
+  if (tier.kind !== 'context' && tier.kind !== 'service') {
+    return 'invalid: unknown price tier kind ' + JSON.stringify(tier.kind);
+  }
+  if (!tier.rates || typeof tier.rates !== 'object' || Array.isArray(tier.rates)) {
+    return 'invalid: price tier rates are required';
+  }
+  const unknownRate = firstUnknownKey(tier.rates, RATE_KEYS);
+  if (unknownRate) return 'invalid: json: unknown field "' + unknownRate + '"';
+  for (const key of RATE_KEYS) {
+    const value = tier.rates[key];
+    if (value === undefined || value === null) continue;
+    if (!isInt(value) || value < 0) {
+      return 'invalid: price tier rate ' + key + ' must be a non-negative integer';
+    }
+  }
+  if (tier.kind === 'context') {
+    if (!isInt(tier.threshold) || tier.threshold <= 0) {
+      return 'invalid: context price tier threshold must be positive';
+    }
+  } else if (typeof tier.service !== 'string' || tier.service.trim() === '') {
+    return 'invalid: service price tier must name a service';
+  }
+  return '';
+}
+
+// 返回错误字符串；空串表示请求体合法。
+function validatePricingRule(rule) {
+  if (!rule || typeof rule !== 'object' || Array.isArray(rule)) {
+    return 'invalid: pricing rule must be a JSON object';
+  }
+  const unknown = firstUnknownKey(rule, RULE_KEYS);
+  if (unknown) return 'invalid: json: unknown field "' + unknown + '"';
+  if (typeof rule.id !== 'string' || rule.id.trim() === '') return 'invalid: pricing rule id is required';
+  if (typeof rule.pattern !== 'string' || rule.pattern.trim() === '') return 'invalid: pricing rule pattern is required';
+  if (rule.match_kind !== undefined && ['exact', 'glob', 'regexp'].indexOf(rule.match_kind) < 0) {
+    return 'invalid: unknown match kind ' + JSON.stringify(rule.match_kind);
+  }
+  if (rule.priority !== undefined && !isInt(rule.priority)) return 'invalid: priority must be an integer';
+  if (rule.enabled !== undefined && typeof rule.enabled !== 'boolean') return 'invalid: enabled must be a boolean';
+
+  const price = rule.price;
+  if (!price || typeof price !== 'object' || Array.isArray(price)) return 'invalid: price is required';
+  const unknownPrice = firstUnknownKey(price, PRICE_KEYS);
+  if (unknownPrice) return 'invalid: json: unknown field "' + unknownPrice + '"';
+
+  // 费率必须嵌套在 price.rates 下：扁平别名会在这里被明确拒绝。
+  if (!price.rates || typeof price.rates !== 'object' || Array.isArray(price.rates)) {
+    return 'invalid: price.rates is required (flat rate fields are not accepted)';
+  }
+  const unknownRate = firstUnknownKey(price.rates, RATE_KEYS);
+  if (unknownRate) return 'invalid: json: unknown field "' + unknownRate + '"';
+  for (const key of REQUIRED_RATE_KEYS) {
+    if (!isInt(price.rates[key]) || price.rates[key] < 0) {
+      return 'invalid: price.rates.' + key + ' must be a non-negative integer';
+    }
+  }
+  if (price.rates.reasoning !== undefined && price.rates.reasoning !== null) {
+    if (!isInt(price.rates.reasoning) || price.rates.reasoning < 0) {
+      return 'invalid: price.rates.reasoning must be a non-negative integer or null';
+    }
+  }
+  if (price.billing_mode !== undefined && ['', 'token', 'per_image'].indexOf(price.billing_mode) < 0) {
+    return 'invalid: unknown billing mode ' + JSON.stringify(price.billing_mode);
+  }
+  if (price.per_image_micro_usd !== undefined && (!isInt(price.per_image_micro_usd) || price.per_image_micro_usd < 0)) {
+    return 'invalid: price.per_image_micro_usd must be a non-negative integer';
+  }
+  if (price.billing_mode === 'per_image' && !price.per_image_micro_usd) {
+    return 'invalid: a per-image price requires per_image_micro_usd';
+  }
+
+  const tiers = rule.tiers === undefined ? [] : rule.tiers;
+  if (!Array.isArray(tiers)) return 'invalid: tiers must be an array';
+  if (tiers.length > 16) return 'invalid: at most 16 price tiers';
+  for (const tier of tiers) {
+    const tierError = validateTier(tier);
+    if (tierError) return tierError;
+  }
+  return '';
+}
+
+// 模拟 scanPricingRule/normalizePricingRule 的规范化结果：price.model 由 pattern 决定。
+function canonicalPricingRule(rule) {
+  const stored = JSON.parse(JSON.stringify(rule));
+  stored.match_kind = stored.match_kind || 'exact';
+  stored.enabled = stored.enabled !== false;
+  stored.tiers = stored.tiers || [];
+  stored.price.model = stored.pattern;
+  stored.price.billing_mode = stored.price.billing_mode === 'per_image' ? 'per_image' : 'token';
+  return stored;
+}
 
 function serialize(payload) {
   return JSON.stringify(payload).replace(/"\u00abBIG:(\d+)\u00bb"/g, '$1');
@@ -822,14 +1021,24 @@ async function handle(req, res) {
     }
     if (endpoint === '/api/pricing-rules' && req.method === 'PUT') {
       const body = await readBody(req);
-      const parsed = JSON.parse(body || '{}');
-      const existing = PRICING_RULES.findIndex((r) => r.id === parsed.id);
-      if (existing >= 0) {
-        PRICING_RULES[existing] = parsed;
-      } else {
-        PRICING_RULES.push(parsed);
+      recorded.last['rules:put'] = { body };
+      let parsed = null;
+      try {
+        parsed = JSON.parse(body);
+      } catch (err) {
+        json(res, 400, { error: 'invalid: request body must be JSON' });
+        return;
       }
-      json(res, 200, { item: parsed });
+      const invalid = validatePricingRule(parsed);
+      if (invalid) {
+        json(res, 400, { error: invalid });
+        return;
+      }
+      const stored = canonicalPricingRule(parsed);
+      const at = PRICING_RULES.findIndex((rule) => rule.id === stored.id);
+      if (at >= 0) PRICING_RULES[at] = stored;
+      else PRICING_RULES.push(stored);
+      json(res, 200, { item: stored });
       return;
     }
     if (endpoint === '/api/delete-price-rule' && req.method === 'POST') {
@@ -841,7 +1050,9 @@ async function handle(req, res) {
       return;
     }
     if (endpoint === '/api/model-catalog') {
-      json(res, 200, { models: CATALOG_MODELS });
+      // 只读目录：真实后端返回 catalog.Snapshot，且绝不会因为一次拉取就改写价格。
+      recorded.last['model-catalog'] = { refresh: query.get('refresh') };
+      json(res, 200, CATALOG_SNAPSHOT);
       return;
     }
     if (endpoint === '/api/exchange-rate') {
