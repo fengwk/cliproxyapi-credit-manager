@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="zh-CN">
+<html lang="zh-CN" data-palette="dark">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -25,7 +25,7 @@
 
   <section id="login-gate" class="gate">
     <h2>查询密钥额度</h2>
-    <p class="hint">密钥只用于本次查询请求，不会写进页面地址栏；勾选“记住密钥”后才会保存在本机浏览器，方便下次自动填入。</p>
+    <p class="hint">密钥只通过 Authorization 请求头发送，不会写进页面地址栏；勾选“记住密钥”后才会保存在本机浏览器，方便下次自动填入。</p>
     <form id="lookup-form" class="login-form">
       <label class="field" for="key">密钥
         <input id="key" name="key" type="password" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="粘贴你的密钥" required>
@@ -42,6 +42,14 @@
         <span id="key-state" class="muted"></span>
       </div>
       <div id="quotas" class="cards"></div>
+    </div>
+
+    <div class="section">
+      <div class="section-head">
+        <h2>模型 Token 限额</h2>
+        <span id="token-limits-state" class="muted"></span>
+      </div>
+      <div id="token-limits" class="cards"></div>
     </div>
 
     <div class="section">
@@ -79,6 +87,13 @@
             <option value="wan">万 (w)</option>
             <option value="m">百万 (m)</option>
           </select>
+          <label class="inline" for="currency">货币</label>
+          <select id="currency">
+            <option value="USD" selected>美元 (USD)</option>
+            <option value="CNY">人民币 (CNY)</option>
+          </select>
+          <label class="inline" for="rate" id="rate-label" hidden>汇率 (USD→CNY)</label>
+          <input id="rate" type="number" min="0.0001" step="0.0001" value="7.2" hidden>
         </div>
       </div>
       <div class="chart-grid">
@@ -137,6 +152,7 @@
 
 <script src="./vendor/echarts-5.6.0.min.js" defer></script>
 <script src="./charts.js" defer></script>
+<script src="./numbers.js" defer></script>
 <script src="./lookup.js" defer></script>
 </body>
 </html>

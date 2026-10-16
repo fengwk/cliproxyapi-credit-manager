@@ -26,6 +26,7 @@ var exactAssets = []string{
 	"lookup.css",
 	"lookup.html",
 	"lookup.js",
+	"numbers.js",
 	"style.css",
 	"vendor/echarts-5.6.0.min.js",
 }
@@ -44,7 +45,7 @@ func TestAssetAllowListIsExact(t *testing.T) {
 		}
 	}
 
-	for _, name := range []string{"index.html", "app.js", "style.css", "lookup.html", "lookup.css", "lookup.js"} {
+	for _, name := range []string{"index.html", "app.js", "style.css", "lookup.html", "lookup.css", "lookup.js", "numbers.js"} {
 		data, mime, ok := Asset(name)
 		if !ok || len(data) == 0 {
 			t.Fatalf("declared asset %s is not served", name)
@@ -95,7 +96,7 @@ func TestLookupAssetsAreSelfContainedAndSharedChartsWired(t *testing.T) {
 	for _, match := range refs {
 		got = append(got, match[1])
 	}
-	want := []string{"./lookup.css", "./vendor/echarts-5.6.0.min.js", "./charts.js", "./lookup.js"}
+	want := []string{"./lookup.css", "./vendor/echarts-5.6.0.min.js", "./charts.js", "./numbers.js", "./lookup.js"}
 	if strings.Join(got, ",") != strings.Join(want, ",") {
 		t.Fatalf("lookup.html references = %v, want %v", got, want)
 	}
@@ -131,6 +132,64 @@ func TestLookupAssetsAreSelfContainedAndSharedChartsWired(t *testing.T) {
 		if !strings.Contains(js, option) {
 			t.Errorf("lookup.js must pass chart option %s", option)
 		}
+	}
+
+	// The shared renderer reuses the ECharts instance bound to a container, so
+	// the container must not be emptied before the shared render call: doing so
+	// detaches the instance and leaves a blank chart on every later refresh.
+	start := strings.Index(js, "function renderTrend()")
+	if start < 0 {
+		t.Fatal("lookup.js is missing renderTrend")
+	}
+	cut := strings.Index(js[start:], "shared.render(")
+	if cut < 0 {
+		t.Fatal("renderTrend must call the shared renderer")
+	}
+	if head := js[start : start+cut]; strings.Contains(head, "clear(") {
+		t.Error("renderTrend must not clear the chart containers before reusing ECharts")
+	}
+
+	// Amounts and token counts are 64-bit values: the JSON body is parsed with
+	// the lossless shared helper instead of response.json(), which would round
+	// every integer above 2^53.
+	if !strings.Contains(js, "CMNumbers") || !strings.Contains(js, "parseBody(") {
+		t.Error("lookup.js must parse responses with the lossless CMNumbers helper")
+	}
+	if strings.Contains(js, "response.json()") {
+		t.Error("lookup.js must not use response.json(): it loses 64-bit precision")
+	}
+	// The chosen grain is sent to the server as-is (true calendar months), and
+	// late responses from a superseded request are dropped.
+	for _, want := range []string{"normalizeGrain(state.grain)", "AbortController", "epoch"} {
+		if !strings.Contains(js, want) {
+			t.Errorf("lookup.js must contain %s", want)
+		}
+	}
+	if strings.Contains(js, "serverBucket") {
+		t.Error("the trend grain must not be remapped to a coarser server bucket")
+	}
+	// Theme switches must recolour already rendered charts, and the page reads
+	// the CPA theme key itself instead of depending on another preferences
+	// module asset.
+	if !strings.Contains(js, "refreshTheme") {
+		t.Error("lookup.js must refresh charts when the CPA theme changes")
+	}
+	if !strings.Contains(js, "'cli-proxy-theme'") {
+		t.Error("lookup.js must read the CPA theme key directly")
+	}
+	if strings.Contains(js, "CMPreferences") || strings.Contains(html, "preferences.js") {
+		t.Error("the lookup page must not depend on a separate preferences asset")
+	}
+
+	// The backend returns the key's configured model token limits; the page
+	// must surface them instead of dropping the field.
+	for _, want := range []string{`id="token-limits"`, `id="token-limits-state"`} {
+		if !strings.Contains(html, want) {
+			t.Errorf("lookup.html is missing model token limit section %s", want)
+		}
+	}
+	if !strings.Contains(js, "model_token_limits") {
+		t.Error("lookup.js must render the model token limits returned by the backend")
 	}
 
 	// The key is sent as an explicit bearer header and never read from the URL.
