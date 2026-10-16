@@ -178,7 +178,7 @@ make package  # 打包当前平台的 zip（含 metadata.json 与 sha256）
 `-buildmode=c-shared` 需要 CGO 交叉工具链，**本项目不提供也不声称支持伪造的交叉编译**，
 本地只会构建当前平台。
 
-端到端验收（真实 CPA 宿主 + 真实插件库 + 环回上游 mock，共 41 个用例，含浏览器检查）
+端到端验收（真实 CPA 宿主 + 真实插件库 + 环回上游 mock，共 42 个用例，含浏览器检查）
 见 [`tests/integration/README.md`](tests/integration/README.md)。
 
 ## 发布产物
@@ -207,6 +207,7 @@ metadata.json                            # id/name/version/goos/goarch/sdk/commi
 | 文档 | 内容 |
 | --- | --- |
 | [`docs/operations.md`](docs/operations.md) | 安装/升级、配置、备份恢复、保留与清理、快照、预热、故障处理 |
+| [`docs/release-notes-v0.1.2.md`](docs/release-notes-v0.1.2.md) | v0.1.2 计费、快照隐私、边界校验与管理界面修复 |
 | [`docs/release-notes-v0.1.1.md`](docs/release-notes-v0.1.1.md) | v0.1.1 请求详情布局修复 |
 | [`docs/release-notes-v0.1.0.md`](docs/release-notes-v0.1.0.md) | 首次发布功能与保证边界 |
 | [`docs/IMPLEMENTATION.md`](docs/IMPLEMENTATION.md) | 实现契约（评审/维护用） |
