@@ -1,11 +1,33 @@
 <!doctype html>
-<html lang="zh-CN">
+<html lang="zh-CN" data-theme="auto" data-palette="white">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="referrer" content="no-referrer">
 <meta name="robots" content="noindex">
-<title>信用管理 · credit-manager</title>
+<title>信用管理 · Credit Manager</title>
+<script>
+// Boot shim: runs before first paint. Applies the CPA theme early (no white flash
+// in dark mode), reads CPA cli-proxy-theme and respects prefers-color-scheme.
+(function () {
+  var root = document.documentElement;
+  function stored(key, field) {
+    var raw = '';
+    try { raw = localStorage.getItem(key) || ''; } catch (_) { return ''; }
+    try {
+      var parsed = JSON.parse(raw);
+      return parsed && typeof parsed === 'object' ? ((parsed.state || parsed)[field] || '') : parsed;
+    } catch (_) { return raw; }
+  }
+  try {
+    var theme = String(stored('cli-proxy-theme', 'theme') || 'auto').toLowerCase();
+    if (['auto', 'white', 'light', 'dark'].indexOf(theme) < 0) theme = 'auto';
+    var dark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
+    root.setAttribute('data-theme', theme);
+    root.setAttribute('data-palette', theme === 'auto' ? (dark ? 'dark' : 'white') : theme);
+  } catch (_) {}
+})();
+</script>
 <link rel="stylesheet" href="./style.css">
 </head>
 <body>
@@ -13,49 +35,85 @@
 
   <header class="topbar">
     <div class="brand">
-      <span class="brand-mark" aria-hidden="true">CM</span>
-      <span class="brand-text">
-        <span class="brand-title">信用与额度管理</span>
-        <span class="brand-sub">credit-manager 插件管理界面</span>
+      <span class="brand-mark" aria-hidden="true">
+        <svg viewBox="0 0 512 512"><rect width="512" height="512" rx="72" fill="#F7F5F0"/><g fill="none" stroke="#26313D" stroke-linecap="round" stroke-linejoin="round" stroke-width="16"><path d="M230 180c-63 0-102 32-102 76s39 76 102 76"/><path d="M276 332V180l60 94 60-94v152"/></g></svg>
       </span>
+      <div class="brand-text">
+        <span class="brand-title">Credit Manager</span>
+        <span class="brand-sub">额度与账单仪表盘</span>
+      </div>
     </div>
-    <div class="topbar-actions">
-      <span id="session-status" class="session-status" role="status">未登录</span>
-      <button id="logout-button" class="btn btn-ghost" type="button" hidden>清除密钥</button>
+    <div class="topbar-controls">
+      <div class="unit-controls" role="group" aria-label="显示单位与汇率">
+        <div class="unit-switch" role="group" aria-label="Token 显示单位">
+          <label for="token-unit" class="unit-switch-label">Token</label>
+          <select id="token-unit" aria-label="Token 显示单位">
+            <option value="raw" selected>原始 (个)</option>
+            <option value="k">千 (k)</option>
+            <option value="wan">万</option>
+            <option value="m">百万 (m)</option>
+          </select>
+        </div>
+        <div class="unit-switch" role="group" aria-label="费用显示货币">
+          <label for="currency-unit" class="unit-switch-label">费用</label>
+          <select id="currency-unit" aria-label="费用显示货币">
+            <option value="USD" selected>USD</option>
+            <option value="CNY">CNY</option>
+          </select>
+        </div>
+        <div class="rate-field" id="currency-rate-wrap">
+          <label for="currency-rate" class="rate-label">汇率（手动设定）</label>
+          <input id="currency-rate" type="number" min="0.0001" step="0.0001" value="7.2" placeholder="7.2" aria-label="美元兑人民币汇率（手动设定）">
+        </div>
+      </div>
+      <div class="topbar-actions">
+        <a href="./lookup.html" class="btn btn-ghost" id="lookup-link">自助查询</a>
+        <span id="session-status" class="session-status" role="status">未登录</span>
+        <button id="logout-button" class="btn btn-ghost" type="button" hidden>清除密钥</button>
+      </div>
     </div>
   </header>
 
   <section id="login-view" class="login-view" aria-labelledby="login-title">
     <div class="login-card">
-      <h2 id="login-title">输入管理密钥</h2>
+      <div class="login-brand-header">
+        <span class="brand-mark login-mark" aria-hidden="true">
+          <svg viewBox="0 0 512 512"><rect width="512" height="512" rx="72" fill="#F7F5F0"/><g fill="none" stroke="#26313D" stroke-linecap="round" stroke-linejoin="round" stroke-width="16"><path d="M230 180c-63 0-102 32-102 76s39 76 102 76"/><path d="M276 332V180l60 94 60-94v152"/></g></svg>
+        </span>
+        <h2 id="login-title">输入管理密钥</h2>
+      </div>
       <p class="hint">
-        管理密钥仅保留在当前页面的内存中，用于向管理 API 发送 <code>Authorization</code> 请求头。
-        界面不会把密钥写入 localStorage、sessionStorage、Cookie 或 URL，刷新页面后需重新输入。
+        管理密钥在当前会话期间保留在内存中有效，用于向管理 API 发送 <code>Authorization</code> 请求头。勾选「记住管理密钥」后保存在本机浏览器的 localStorage 中以便后续自动填入；未勾选时仅在会话内存中保存，关闭页面后即失效。
       </p>
       <form id="login-form" class="login-form" autocomplete="off" novalidate>
         <div class="field">
           <label for="management-key">管理密钥</label>
           <input id="management-key" name="management-key" type="password" autocomplete="off"
-                 spellcheck="false" autocapitalize="off" required>
+                 spellcheck="false" autocapitalize="off" required placeholder="Bearer management secret">
         </div>
-        <button id="login-button" class="btn btn-primary" type="submit">登录</button>
+        <div class="field remember-field">
+          <label for="remember-management-key" class="remember-label">
+            <input id="remember-management-key" name="remember-management-key" type="checkbox">
+            <span>记住管理密钥</span>
+          </label>
+        </div>
+        <button id="login-button" class="btn btn-primary" type="submit">登录并加载</button>
       </form>
       <p id="login-error" class="inline-error" role="alert" hidden></p>
       <p class="hint hint-warn">
-        连续 5 次提交错误的密钥会导致当前客户端 IP 被临时封禁约 30 分钟，因此本界面不会自动重试登录；
-        请确认密钥正确后再提交。
+        连续 5 次提交错误的密钥会导致当前客户端 IP 被临时封禁约 30 分钟，因此本界面不会自动重试登录；请确认密钥正确后再提交。
       </p>
     </div>
   </section>
 
   <div id="main-view" hidden>
 
-    <nav class="tabs" role="tablist" aria-label="管理功能">
+    <nav class="tabs" id="tabs" role="tablist" aria-label="管理功能">
       <button class="tab" type="button" role="tab" id="tab-usage" data-tab="usage" aria-controls="panel-usage" aria-selected="true" tabindex="0">使用统计</button>
       <button class="tab" type="button" role="tab" id="tab-keys" data-tab="keys" aria-controls="panel-keys" aria-selected="false" tabindex="-1">客户端 Key</button>
-      <button class="tab" type="button" role="tab" id="tab-prices" data-tab="prices" aria-controls="panel-prices" aria-selected="false" tabindex="-1">价格</button>
+      <button class="tab" type="button" role="tab" id="tab-prices" data-tab="prices" aria-controls="panel-prices" aria-selected="false" tabindex="-1">价格规则</button>
       <button class="tab" type="button" role="tab" id="tab-credentials" data-tab="credentials" aria-controls="panel-credentials" aria-selected="false" tabindex="-1">上游凭据与额度</button>
-      <button class="tab" type="button" role="tab" id="tab-health" data-tab="health" aria-controls="panel-health" aria-selected="false" tabindex="-1">状态</button>
+      <button class="tab" type="button" role="tab" id="tab-health" data-tab="health" aria-controls="panel-health" aria-selected="false" tabindex="-1">运行状态</button>
     </nav>
 
     <main class="panels">
@@ -117,6 +175,7 @@
             <select id="usage-bucket">
               <option value="day" selected>按天</option>
               <option value="hour">按小时</option>
+              <option value="month">按月</option>
             </select>
           </div>
           <div class="field">
@@ -129,7 +188,7 @@
           </div>
           <div class="filter-actions">
             <button id="usage-apply" class="btn btn-primary" type="submit">查询</button>
-            <button id="usage-reset" class="btn" type="button">重置</button>
+            <button id="usage-reset" class="btn btn-ghost" type="button">重置</button>
           </div>
         </form>
 
@@ -139,13 +198,31 @@
         <div id="usage-summary" class="card-grid" aria-label="汇总"></div>
         <p id="usage-quality-note" class="note"></p>
 
-        <section class="card" aria-labelledby="usage-chart-title">
-          <div class="card-head">
-            <h3 id="usage-chart-title">趋势</h3>
-            <div id="usage-legend" class="legend"></div>
-          </div>
-          <div id="usage-chart" class="chart"></div>
-        </section>
+        <div class="usage-charts-grid">
+          <section class="card chart-card" aria-labelledby="usage-chart-title">
+            <div class="card-head">
+              <h3 id="usage-chart-title">请求与执行趋势</h3>
+              <div id="usage-legend" class="legend"></div>
+            </div>
+            <div id="usage-chart" class="chart"></div>
+          </section>
+
+          <section class="card chart-card" aria-labelledby="usage-token-chart-title">
+            <div class="card-head">
+              <h3 id="usage-token-chart-title">Token 趋势</h3>
+              <div id="usage-token-legend" class="legend"></div>
+            </div>
+            <div id="usage-token-chart" class="chart"></div>
+          </section>
+
+          <section class="card chart-card" aria-labelledby="usage-cost-chart-title">
+            <div class="card-head">
+              <h3 id="usage-cost-chart-title">费用趋势</h3>
+              <div id="usage-cost-legend" class="legend"></div>
+            </div>
+            <div id="usage-cost-chart" class="chart"></div>
+          </section>
+        </div>
 
         <section class="card" aria-labelledby="usage-items-title">
           <div class="card-head">
@@ -161,7 +238,7 @@
       <section id="panel-keys" class="panel" role="tabpanel" aria-labelledby="tab-keys" tabindex="0" hidden>
         <div class="toolbar">
           <button id="keys-create" class="btn btn-primary" type="button">新建 Key</button>
-          <button id="keys-refresh" class="btn" type="button">刷新</button>
+          <button id="keys-refresh" class="btn btn-ghost" type="button">刷新</button>
         </div>
         <p id="keys-status" class="status-line" role="status"></p>
         <div id="keys-error" class="error-box" role="alert" hidden></div>
@@ -171,7 +248,7 @@
       <section id="panel-prices" class="panel" role="tabpanel" aria-labelledby="tab-prices" tabindex="0" hidden>
         <div class="toolbar">
           <button id="prices-create" class="btn btn-primary" type="button">新增价格</button>
-          <button id="prices-refresh" class="btn" type="button">刷新</button>
+          <button id="prices-refresh" class="btn btn-ghost" type="button">刷新</button>
         </div>
         <p class="hint">
           价格一律以「微美元 / 每 100 万 tokens」的整数保存（1 USD = 1,000,000 微美元），界面同时给出等值美元换算供核对，不做浮点换算。
@@ -183,7 +260,7 @@
 
       <section id="panel-credentials" class="panel" role="tabpanel" aria-labelledby="tab-credentials" tabindex="0" hidden>
         <div class="toolbar">
-          <button id="credentials-refresh" class="btn" type="button">刷新凭据列表</button>
+          <button id="credentials-refresh" class="btn btn-primary" type="button">刷新凭据列表</button>
         </div>
         <p class="hint">
           本页只读取 CPA 的凭据列表与插件额度接口，不修改上游凭据、不导入原生密钥、不发起 OAuth 流程。
@@ -196,7 +273,7 @@
 
       <section id="panel-health" class="panel" role="tabpanel" aria-labelledby="tab-health" tabindex="0" hidden>
         <div class="toolbar">
-          <button id="health-refresh" class="btn" type="button">刷新状态</button>
+          <button id="health-refresh" class="btn btn-primary" type="button">刷新状态</button>
         </div>
         <p id="health-status" class="status-line" role="status"></p>
         <div id="health-error" class="error-box" role="alert" hidden></div>
@@ -213,12 +290,14 @@
   </div>
 
   <footer class="footer">
-    <span class="muted">credit-manager · 管理界面为静态页面，所有数据实时从管理 API 读取。</span>
+    <span class="muted">Credit Manager · 管理界面为自包含静态页面，所有数据实时从管理 API 读取。</span>
   </footer>
 
   <div id="modal-root" class="modal-root" hidden></div>
   <div id="toast-root" class="toast-root" role="status" aria-live="polite"></div>
 </div>
+<script src="./vendor/echarts-5.6.0.min.js"></script>
+<script src="./charts.js"></script>
 <script src="./app.js" defer></script>
 </body>
 </html>
