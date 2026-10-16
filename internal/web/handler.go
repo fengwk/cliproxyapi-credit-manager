@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/fengwk/cliproxyapi-credit-manager/internal/capture"
+	"github.com/fengwk/cliproxyapi-credit-manager/internal/catalog"
 	"github.com/fengwk/cliproxyapi-credit-manager/internal/config"
 	"github.com/fengwk/cliproxyapi-credit-manager/internal/credit"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
@@ -31,10 +32,22 @@ type Handler struct {
 	cfg      config.Config
 	version  string
 	health   func() string
+	// catalog and fx back the read-only management catalog preview and the
+	// live FX display. They are per-Handler instances so no global cache is
+	// shared between handlers (or between tests).
+	catalog modelCatalogSource
+	fx      exchangeRateSource
 }
 
 func New(db credit.Backend, captures *capture.Store, cfg config.Config) *Handler {
-	return &Handler{db: db, captures: captures, cfg: cfg, version: "dev"}
+	return &Handler{
+		db:       db,
+		captures: captures,
+		cfg:      cfg,
+		version:  "dev",
+		catalog:  catalog.NewService(nil),
+		fx:       catalog.NewFXService(nil),
+	}
 }
 
 // SetStatus connects immutable runtime diagnostics before serving requests.
@@ -260,6 +273,10 @@ func (h *Handler) Handle(req pluginapi.ManagementRequest) pluginapi.ManagementRe
 			status = "degraded"
 		}
 		return response(200, map[string]any{"status": status, "version": h.version, "capture": stats, "retention_months": h.cfg.RetentionMonths, "capture_enabled": h.cfg.Capture.Enabled, "last_error": message, "config": h.cfg})
+	case "GET /api/model-catalog":
+		return h.handleModelCatalog(ctx, req)
+	case "GET /api/exchange-rate":
+		return h.handleExchangeRate(ctx, req)
 	default:
 		return response(404, map[string]string{"error": "not found"})
 	}
