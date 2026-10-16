@@ -249,7 +249,8 @@
   function localDatetimeValue(date) {
     return (
       date.getFullYear() + '-' + pad2(date.getMonth() + 1) + '-' + pad2(date.getDate()) +
-      'T' + pad2(date.getHours()) + ':' + pad2(date.getMinutes())
+      'T' + pad2(date.getHours()) + ':' + pad2(date.getMinutes()) + ':' +
+      pad2(date.getSeconds()) + '.' + ('00' + date.getMilliseconds()).slice(-3)
     );
   }
 
@@ -2607,6 +2608,12 @@
   function submitUsageFilters(event) {
     if (event) event.preventDefault();
     var filters = collectUsageFilters();
+    var range = quickRangeFilters(filters.quick);
+    if (range) {
+      filters.from = range.from;
+      filters.to = range.to;
+      applyUsageFiltersToForm(filters);
+    }
     filters.page = 1;
     state.usage.filters = filters;
     loadUsage(true);
@@ -3677,7 +3684,7 @@
     allowedInput.value = (spec.allowed_models || []).join('\n');
     var limitsInput = el('textarea', { id: 'key-limits', rows: 6, placeholder: '[{"model":"gpt-5","total":1000000,"daily":0,"weekly":0,"monthly":0}]' });
     limitsInput.value = modelTokenLimitsToText(spec.model_token_limits);
-    var expiresInput = el('input', { type: 'datetime-local', id: 'key-expires' });
+    var expiresInput = el('input', { type: 'datetime-local', step: 'any', id: 'key-expires' });
     if (spec.expires_at) {
       var expiresDate = new Date(spec.expires_at);
       if (!isNaN(expiresDate.getTime())) expiresInput.value = localDatetimeValue(expiresDate);

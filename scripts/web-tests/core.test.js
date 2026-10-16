@@ -87,13 +87,14 @@ test('分页切换保留其余过滤器', () => {
 });
 
 test('快捷范围按当前时间回推并同步输入框', () => {
-  // datetime-local 精确到分钟，期望值同样截断到分钟。
-  const now = new Date('2026-03-04T05:06:07Z');
-  const minute = new Date(Math.floor(now.getTime() / 60000) * 60000);
+  const now = new Date('2026-03-04T05:06:07.890Z');
   const range = CM.quickRangeFilters('7d', now);
   assert.equal(range.quick, '7d');
-  assert.equal(range.to, CM.localDatetimeValue(minute));
-  assert.equal(range.from, CM.localDatetimeValue(new Date(minute.getTime() - 7 * 24 * 60 * 60 * 1000)));
+  assert.equal(range.to, CM.localDatetimeValue(now));
+  assert.equal(range.from, CM.localDatetimeValue(new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000)));
+  assert.equal(new Date(range.to).getTime(), now.getTime(), '不得截断当前分钟/秒而漏掉最新请求');
+  const params = new URLSearchParams(CM.buildUsageQuery(CM.defaultUsageFilters(now)));
+  assert.equal(new Date(params.get('to')).getTime(), now.getTime(), '默认查询也保留毫秒边界');
   assert.equal(CM.quickRangeFilters('nope', now), null);
 });
 
