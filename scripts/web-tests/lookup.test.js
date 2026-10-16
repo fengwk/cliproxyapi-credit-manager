@@ -290,3 +290,19 @@ test('页面只引用第一方相对资源，且不含内联凭据', () => {
   assert.ok(html.includes('id="token-limits"'), '必须展示后端返回的模型 Token 限额');
   assert.ok(html.includes('data-grain="month"') && html.includes('data-grain="hour"'));
 });
+
+test('lookup.js 模型分析与额度基线：无未定义函数，退出清理模型区与 Donut', () => {
+  const code = readAsset('lookup.js');
+  // 确保没有误用全局未定义变量
+  assert.ok(!code.includes('formatMicroUSD(') || code.includes('function formatMicroUSD('), 'formatMicroUSD 必须有合法定义');
+  assert.ok(!code.includes('formatTokens(') || code.includes('function formatTokens('), 'formatTokens 必须有合法定义');
+
+  const resetFn = code.slice(code.indexOf('function resetPrivateUI()'), code.indexOf('function dropSession('));
+  assert.ok(resetFn.includes('lookup-models-section'), 'resetPrivateUI 必须隐藏模型分析区域');
+  assert.ok(resetFn.includes('lookup-model-share'), 'resetPrivateUI 必须清理模型分布图容器');
+  assert.ok(resetFn.includes('lookup-model-rank'), 'resetPrivateUI 必须清空模型排行列表');
+
+  const quotasFn = code.slice(code.indexOf('function renderQuotas('), code.indexOf('function renderTokenLimits('));
+  assert.ok(quotasFn.includes('quota_used_micro_usd'), 'renderQuotas 必须支持周期生效配额字段');
+  assert.ok(quotasFn.includes('累计消费') || quotasFn.includes('累计支出'), 'renderQuotas 必须明确标注累计消费');
+});

@@ -935,6 +935,7 @@ async function handle(req, res) {
             ttft_ms: 1200,
             ttft_samples: 4,
             output_tokens: 500000000000000,
+            measured_output_tokens: 500000000000000,
           },
           {
             model: 'gpt-5',
@@ -952,6 +953,7 @@ async function handle(req, res) {
             ttft_ms: 800,
             ttft_samples: 1,
             output_tokens: 300000000000000,
+            measured_output_tokens: 300000000000000,
           },
         ],
         retention_from: '2026-07-01T00:00:00Z',

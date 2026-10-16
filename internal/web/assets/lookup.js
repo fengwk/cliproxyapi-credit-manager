@@ -155,6 +155,18 @@
     return charts().formatMoneyMicro(micro, currency, rate);
   }
 
+  function intString(value) {
+    return intText(value);
+  }
+
+  function formatMicroUSD(micro) {
+    return formatMoney(micro, state.currency, state.rate);
+  }
+
+  function formatTokens(value, unit) {
+    return formatToken(value, unit);
+  }
+
   // 共享模块不再导出日期格式化，这里保留一个最小的本地实现。
   function formatMoment(value) {
     if (!value) return '—';
@@ -498,14 +510,20 @@
     ['quotas', 'token-limits', 'stats', 'recent-body'].forEach(function (id) {
       clear(el(id));
     });
-    ['key-label', 'key-state', 'retention', 'recent-state', 'token-limits-state', 'page-info'].forEach(function (id) {
+    ['key-label', 'key-state', 'retention', 'recent-state', 'token-limits-state', 'page-info', 'lookup-models-count'].forEach(function (id) {
       if (el(id)) el(id).textContent = '';
     });
+    var modelsSection = el('lookup-models-section');
+    if (modelsSection) modelsSection.hidden = true;
+    var modelShare = el('lookup-model-share');
+    if (modelShare) clear(modelShare);
+    var modelRank = el('lookup-model-rank');
+    if (modelRank) clear(modelRank);
     el('trend-empty').hidden = true;
     el('prev').disabled = true;
     el('next').disabled = true;
     disposeCharts();
-    ['trend-requests', 'trend-tokens', 'trend-cost'].forEach(function (id) {
+    ['trend-requests', 'trend-tokens', 'trend-cost', 'lookup-model-share'].forEach(function (id) {
       clear(el(id));
     });
     closeSnapshot();
@@ -636,7 +654,8 @@
   function renderQuotas(key) {
     var quotas = el('quotas');
     clear(quotas);
-    quotas.appendChild(card('已用额度', formatMoney(key.spent_micro_usd, state.currency, state.rate)));
+    var effectiveSpent = key.quota_used_micro_usd !== undefined ? key.quota_used_micro_usd : key.spent_micro_usd;
+    quotas.appendChild(card('已用额度', formatMoney(effectiveSpent, state.currency, state.rate)));
     quotas.appendChild(card('在途预占', formatMoney(key.held_micro_usd, state.currency, state.rate)));
     quotas.appendChild(card('总额度', key.quota_micro_usd ? formatMoney(key.quota_micro_usd, state.currency, state.rate) : '不限'));
     quotas.appendChild(card('日额度', key.daily_micro_usd ? formatMoney(key.daily_micro_usd, state.currency, state.rate) : '不限'));
@@ -647,6 +666,9 @@
       quotas.appendChild(card('允许模型', key.allowed_models.join('、')));
     } else {
       quotas.appendChild(card('允许模型', '不限'));
+    }
+    if (key.spent_micro_usd !== undefined && key.spent_micro_usd !== null) {
+      quotas.appendChild(card('累计消费', formatMoney(key.spent_micro_usd, state.currency, state.rate)));
     }
   }
 
@@ -744,11 +766,11 @@
     var shareContainer = el('lookup-model-share');
     if (shareContainer && charts().renderDonut) {
       var items = models.map(function (m) {
-        var req = Number(intString(m.requests || 0));
+        var req = Number(intText(m.requests || 0));
         return {
           name: m.model || 'unknown',
           value: req,
-          displayValue: formatInt(req) + ' 次',
+          displayValue: formatInt(m.requests || 0) + ' 次',
         };
       });
       var totalReq = items.reduce(function (a, b) { return a + b.value; }, 0);
@@ -762,7 +784,26 @@
     var rankContainer = el('lookup-model-rank');
     if (rankContainer) {
       clear(rankContainer);
-      models.forEach(function (m, idx) {
+      var ranked = [];
+      if (charts() && typeof charts().computeModelRankings === 'function') {
+        ranked = charts().computeModelRankings(models, 'value', {
+          tokenUnit: state.tokenUnit,
+          currency: state.currency,
+          rate: state.rate,
+        });
+      } else {
+        ranked = models.map(function (m) {
+          return {
+            model: m.model || 'unknown',
+            requestsText: intText(m.requests || 0),
+            tokensText: intText(m.tokens && m.tokens.total !== undefined ? m.tokens.total : m.tokens || 0),
+            costMicroText: intText(m.cost_micro_usd || 0),
+            display: '—',
+          };
+        });
+      }
+
+      ranked.forEach(function (m, idx) {
         var row = document.createElement('div');
         row.className = 'model-rank-item';
         var idxEl = document.createElement('div');
@@ -777,19 +818,29 @@
         nameSpan.textContent = m.model || 'unknown';
         var valSpan = document.createElement('span');
         valSpan.className = 'rank-value mono';
-        var costMicro = Number(intString(m.cost_micro_usd || 0));
-        valSpan.textContent = formatMicroUSD(costMicro);
+        valSpan.textContent = formatMoney(m.costMicroText, state.currency, state.rate);
         headEl.appendChild(nameSpan);
         headEl.appendChild(valSpan);
         var metaEl = document.createElement('div');
         metaEl.className = 'rank-meta muted';
         var reqSpan = document.createElement('span');
-        reqSpan.textContent = formatInt(m.requests || 0) + ' 次调用';
+        reqSpan.textContent = formatInt(m.requestsText) + ' 次调用';
         var tokSpan = document.createElement('span');
-        var tokVal = m.tokens && m.tokens.total !== undefined ? m.tokens.total : m.tokens;
-        tokSpan.textContent = formatTokens(tokVal || 0, state.tokenUnit) + ' ' + state.tokenUnit;
+        tokSpan.textContent = formatToken(m.tokensText, state.tokenUnit);
         metaEl.appendChild(reqSpan);
         metaEl.appendChild(tokSpan);
+
+        var orig = (models || []).find(function (item) { return item.model === m.model; }) || {};
+        var measuredOut = intText(orig.measured_output_tokens !== undefined ? orig.measured_output_tokens : (orig.output_tokens || 0));
+        var latMs = Number(intText(orig.latency_ms || 0));
+        var mOut = Number(measuredOut);
+        if (latMs > 0 && mOut > 0) {
+          var tpsVal = (mOut / (latMs / 1000)).toFixed(1);
+          var tpsSpan = document.createElement('span');
+          tpsSpan.textContent = tpsVal + ' tokens/s (累计吞吐)';
+          metaEl.appendChild(tpsSpan);
+        }
+
         infoEl.appendChild(headEl);
         infoEl.appendChild(metaEl);
         row.appendChild(idxEl);

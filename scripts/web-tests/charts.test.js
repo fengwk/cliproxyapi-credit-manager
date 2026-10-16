@@ -552,3 +552,81 @@ test('renderDonut 初始化环形图并使用 svg 渲染器，支持空数据清
   assert.equal(echarts.__count('dispose'), 1);
   CMCharts.disposeAll();
 });
+
+test('formatDecimalRatio 与 formatRatioPercent 保持大整数无损除法与百分比', () => {
+  const BIG_A = '900719925474099300';
+  const BIG_B = '300000000000';
+  const ratio = CMCharts.formatDecimalRatio(BIG_A, BIG_B, 2);
+  assert.equal(ratio, '3,002,399.75');
+
+  const pct = CMCharts.formatRatioPercent(1, 3, 2);
+  assert.equal(pct, '33.33');
+
+  assert.equal(CMCharts.formatDecimalRatio(10, 0, 2), null);
+  assert.equal(CMCharts.formatRatioPercent(10, 0, 2), null);
+});
+
+test('computeModelRankings 支持 BigInt 精度、单次成本完整性判定与真实测得 TPS', () => {
+  const models = [
+    {
+      model: 'm-incomplete',
+      requests: 5,
+      executions: 5,
+      complete_executions: 4, // 计量未完整
+      pending: 0,
+      cost_micro_usd: '1000000',
+      tokens: { total: '5000000' },
+      latency_ms: 1000,
+      output_tokens: 500,
+      measured_output_tokens: 400,
+    },
+    {
+      model: 'm-pending',
+      requests: 2,
+      executions: 2,
+      complete_executions: 2,
+      pending: 1, // 存在在途/未结算
+      cost_micro_usd: '0',
+      tokens: { total: '2000000' },
+      latency_ms: 2000,
+      output_tokens: 800,
+      measured_output_tokens: 600,
+    },
+    {
+      model: 'm-complete',
+      requests: 10,
+      executions: 10,
+      complete_executions: 10,
+      pending: 0,
+      cost_micro_usd: '20000000',
+      tokens: { total: '900719925474099300' }, // > 2^53
+      latency_ms: 5000,
+      output_tokens: 20000,
+      measured_output_tokens: 15000,
+      cache_read_ratio: 0.45,
+    },
+  ];
+
+  // 1. unit 单次成本排行：仅完全计量且 pending=0 的模型才计算，其余显示 —（计量未完整），绝不误标为免费 0
+  const unitRank = CMCharts.computeModelRankings(models, 'unit', { currency: 'USD' });
+  const completeItem = unitRank.find((it) => it.model === 'm-complete');
+  assert.equal(completeItem.display, '2 USD / 次');
+  const incItem = unitRank.find((it) => it.model === 'm-incomplete');
+  assert.equal(incItem.display, '—（计量未完整）');
+  const pendItem = unitRank.find((it) => it.model === 'm-pending');
+  assert.equal(pendItem.display, '—（计量未完整）');
+
+  // 2. value 性价比排行：大整数无损比较，超精度 token 保持精确
+  const valueRank = CMCharts.computeModelRankings(models, 'value', { tokenUnit: 'raw' });
+  assert.equal(valueRank[0].model, 'm-pending'); // 免费模型优先排在前列
+  assert.equal(valueRank[0].display, '∞ (免费)');
+  const compValItem = valueRank.find((it) => it.model === 'm-complete');
+  assert.ok(compValItem.display.includes('/ USD'));
+  assert.equal(compValItem.tokensText, '900719925474099300');
+
+  // 3. tps 吞吐率排行：使用 measured_output_tokens 搭配 latency_ms，标注累计吞吐
+  const tpsRank = CMCharts.computeModelRankings(models, 'tps');
+  const tpsItem = tpsRank.find((it) => it.model === 'm-complete');
+  // 15000 / 5s = 3000.0 tokens/s
+  assert.equal(tpsItem.display, '3000.0 tokens/s (累计吞吐)');
+});

@@ -173,6 +173,14 @@
     return usdText + ' USD';
   }
 
+  function formatMoneyMicro(micro, currency, rate) {
+    var charts = getChartsApi();
+    if (charts && typeof charts.formatMoneyMicro === 'function') {
+      return charts.formatMoneyMicro(micro, currency || state.currency, rate || state.currencyRate);
+    }
+    return formatMicroUSD(micro);
+  }
+
   function formatMicroUSDPair(micro) {
     var moneyText = formatMicroUSD(micro);
     if (moneyText === '—') return '—';
@@ -1829,6 +1837,19 @@
     state.usage.requestedQuery = '';
     state.usage.loadedAt = null;
     state.usage.loadSeq = 0;
+    state.overview = {
+      data: null,
+      loading: false,
+      error: '',
+      loadSeq: 0,
+      requestedQuery: '',
+      loadedAt: null,
+      filters: defaultOverviewFilters(),
+      modelShareMetric: 'requests',
+      modelRankMetric: 'value',
+    };
+    state.callers = { items: null, loading: false, error: '', loadSeq: 0 };
+    state.audit = { items: null, total: 0, loading: false, error: '', loadSeq: 0, requestedQuery: '', loadedAt: null };
     state.keys = { items: null, loading: false, error: '', loadSeq: 0 };
     state.prices = { items: null, loading: false, error: '', loadSeq: 0 };
     state.credentials = { items: null, loading: false, error: '', quota: {}, loadSeq: 0 };
@@ -1837,6 +1858,17 @@
 
   // 已渲染的私有内容：登出/会话失效时必须从 DOM 中抹掉，不能只隐藏容器。
   var PRIVATE_RENDER_TARGETS = [
+    'overview-status',
+    'overview-summary',
+    'overview-retention',
+    'overview-token-chart',
+    'overview-cost-chart',
+    'overview-model-share',
+    'overview-model-share-legend',
+    'overview-model-count',
+    'overview-model-rank',
+    'overview-rank-count',
+    'overview-rank-hint',
     'usage-status',
     'usage-summary',
     'usage-quality-note',
@@ -1852,8 +1884,13 @@
     'usage-pagination',
     'keys-status',
     'keys-list',
+    'callers-status',
+    'callers-list',
     'prices-status',
     'prices-list',
+    'audit-status',
+    'audit-list',
+    'audit-pagination',
     'credentials-status',
     'credentials-list',
     'health-status',
@@ -1861,7 +1898,16 @@
     'health-extra',
   ];
 
-  var PRIVATE_ERROR_TARGETS = ['usage-error', 'keys-error', 'prices-error', 'credentials-error', 'health-error'];
+  var PRIVATE_ERROR_TARGETS = [
+    'overview-error',
+    'usage-error',
+    'keys-error',
+    'callers-error',
+    'prices-error',
+    'audit-error',
+    'credentials-error',
+    'health-error',
+  ];
 
   function clearRenderedPrivateContent() {
     var charts = getChartsApi();
@@ -1880,6 +1926,11 @@
       replace(keySelect, [el('option', { value: '', text: '全部' })]);
       keySelect.value = '';
     }
+    var overviewKeySelect = $('overview-key');
+    if (overviewKeySelect) {
+      replace(overviewKeySelect, [el('option', { value: '', text: '全部' })]);
+      overviewKeySelect.value = '';
+    }
   }
 
   function handleSessionExpired(message) {
@@ -1889,6 +1940,9 @@
     clearSessionState();
     clearRenderedPrivateContent();
     closeDialog();
+    if (global.CMAdminPricing && typeof global.CMAdminPricing.dispose === 'function') {
+      try { global.CMAdminPricing.dispose(); } catch (_) {}
+    }
     showLoginView();
     var errorNode = $('login-error');
     if (errorNode) {
@@ -1906,6 +1960,29 @@
       return true;
     }
     return false;
+  }
+
+  function initAdminPricing() {
+    if (global.CMAdminPricing && typeof global.CMAdminPricing.init === 'function') {
+      try {
+        global.CMAdminPricing.init({
+          api: function (path, opts) {
+            var options = opts || {};
+            var url = path.indexOf('/') === 0 ? managerPath(path) : managerPath('/' + path);
+            return request(url, options);
+          },
+          el: el,
+          toast: notify,
+          showModal: openDialog,
+          closeModal: closeDialog,
+          onExactApplied: function () {
+            loadPrices(false);
+          },
+        });
+      } catch (err) {
+        console.warn('CMAdminPricing.init 失败', err);
+      }
+    }
   }
 
   function autoConnectSavedCredential(savedToken, wasRemembered) {
@@ -1927,6 +2004,7 @@
         var box = $('remember-management-key');
         if (box) box.checked = Boolean(wasRemembered);
         persistCredential(savedToken, Boolean(wasRemembered));
+        initAdminPricing();
         showMainView();
         activateTab('overview', false);
         state.overview.filters = defaultOverviewFilters();
@@ -1985,6 +2063,7 @@
         if (button) button.disabled = false;
         if (input) input.value = '';
         persistCredential(key, remember);
+        initAdminPricing();
         showMainView();
         activateTab('overview', false);
         state.overview.filters = defaultOverviewFilters();
@@ -2270,6 +2349,12 @@
       container.textContent = '';
       return;
     }
+    var execCost = intString(summary.cost_micro_usd || 0);
+    var adjCost = intString(summary.adjustment_micro_usd || 0);
+    var totalCostBig = BigInt(execCost) + BigInt(adjCost);
+    var totalCostText = totalCostBig.toString();
+    var hasAdj = adjCost !== '0';
+
     var cards = [
       el('div', { class: 'card stat-card metric-card' }, [
         el('div', { class: 'stat-label metric-label', text: '总请求数' }),
@@ -2283,8 +2368,8 @@
       ]),
       el('div', { class: 'card stat-card metric-card' }, [
         el('div', { class: 'stat-label metric-label', text: '总费用支出（总成本）' }),
-        el('div', { class: 'stat-value mono', text: formatMicroUSD(summary.cost_micro_usd || 0) }),
-        el('div', { class: 'stat-sub muted', text: (summary.adjustment_micro_usd && intString(summary.adjustment_micro_usd) !== '0') ? '含人工补记 ' + formatMicroUSD(summary.adjustment_micro_usd) : '法币折合 ' + formatMoneyMicro(summary.cost_micro_usd || 0, state.currency, state.currencyRate) }),
+        el('div', { class: 'stat-value mono', text: formatMicroUSD(totalCostText) }),
+        el('div', { class: 'stat-sub muted', text: hasAdj ? '执行成本 ' + formatMicroUSD(execCost) + ' · 独立人工补记 ' + formatMicroUSD(adjCost) : '法币折合 ' + formatMoneyMicro(totalCostText, state.currency, state.currencyRate) }),
       ]),
       el('div', { class: 'card stat-card metric-card' }, [
         el('div', { class: 'stat-label metric-label', text: '缓存读取率' }),
@@ -2293,8 +2378,8 @@
       ]),
       el('div', { class: 'card stat-card metric-card' }, [
         el('div', { class: 'stat-label metric-label', text: '异常请求' }),
-        el('div', { class: 'stat-value mono' + ((summary.failed || summary.pending) ? ' text-warn' : ''), text: formatInt((summary.failed || 0) + (summary.pending || 0)) }),
-        el('div', { class: 'stat-sub muted', text: '失败 ' + formatInt(summary.failed || 0) + ' · 待定 ' + formatInt(summary.pending || 0) }),
+        el('div', { class: 'stat-value mono' + ((Number(intString(summary.failed || 0)) > 0 || Number(intString(summary.pending || 0)) > 0) ? ' text-warn' : ''), text: formatInt(summary.failed || 0) + ' 失败 · ' + formatInt(summary.pending || 0) + ' 待定' }),
+        el('div', { class: 'stat-sub muted', text: '两类状态存在重叠，独立计数不累加' }),
       ]),
     ];
     replace(container, cards);
@@ -2413,90 +2498,33 @@
     var metric = state.overview.modelRankMetric || 'value';
     var hintMap = {
       value: '按每美元产出 Token 排序，越高越省',
-      unit: '按单次调用平均成本排序，越低越轻量',
+      unit: '按单次调用平均成本排序，越低越轻量（仅完整计量）',
       cache: '按缓存读取占比排序，越高缓存效率越好',
-      tps: '按每秒生成 Token 吞吐率排序，越高生成越快',
+      tps: '按累计测得吞吐率（Token/s）排序，非瞬时速率',
       latency: '按平均响应延迟排序，越低响应越快',
     };
     if (hint) hint.textContent = hintMap[metric] || '';
 
-    var list = models.map(function (m) {
-      var score = null;
-      var display = '—';
-      var requests = Number(intString(m.requests || 0));
-      var executions = Number(intString(m.complete_executions || m.executions || 0));
-      var costMicro = Number(intString(m.cost_micro_usd || 0));
-      var tokens = Number(intString(m.tokens && m.tokens.total !== undefined ? m.tokens.total : m.tokens || 0));
-      var outputTokens = Number(intString(m.output_tokens || 0));
-      var latencyMs = Number(intString(m.latency_ms || 0));
-      var latencySamples = Number(intString(m.latency_samples || 0));
-
-      if (metric === 'value') {
-        if (costMicro > 0) {
-          var costUSD = costMicro / 1000000;
-          score = tokens / costUSD;
-          display = formatTokens(Math.round(score), state.tokenUnit) + ' / USD';
-        } else if (tokens > 0) {
-          score = Infinity;
-          display = '∞ (免费)';
-        } else {
-          score = null;
-          display = '—';
-        }
-      } else if (metric === 'unit') {
-        var count = executions > 0 ? executions : requests;
-        if (count > 0 && costMicro >= 0) {
-          score = costMicro / count;
-          display = formatMicroUSD(Math.round(score)) + ' / 次';
-        } else {
-          score = null;
-          display = '—';
-        }
-      } else if (metric === 'cache') {
-        if (m.cache_read_ratio !== undefined && m.cache_read_ratio !== null) {
-          score = Number(m.cache_read_ratio);
-          display = (score * 100).toFixed(1) + '%';
-        } else {
-          score = null;
-          display = '—';
-        }
-      } else if (metric === 'tps') {
-        if (latencyMs > 0 && outputTokens > 0) {
-          score = outputTokens / (latencyMs / 1000);
-          display = score.toFixed(1) + ' tokens/s';
-        } else {
-          score = null;
-          display = '—';
-        }
-      } else if (metric === 'latency') {
-        if (latencySamples > 0 && latencyMs > 0) {
-          score = latencyMs / latencySamples;
-          display = score >= 1000 ? (score / 1000).toFixed(2) + ' s' : Math.round(score) + ' ms';
-        } else {
-          score = null;
-          display = '—';
-        }
-      }
-
-      return {
-        model: m.model || 'unknown',
-        score: score,
-        display: display,
-        requests: requests,
-        tokens: tokens,
-        costMicro: costMicro,
-      };
-    });
-
-    list.sort(function (a, b) {
-      if (a.score === null && b.score === null) return 0;
-      if (a.score === null) return 1;
-      if (b.score === null) return -1;
-      if (metric === 'unit' || metric === 'latency') {
-        return a.score - b.score;
-      }
-      return b.score - a.score;
-    });
+    var charts = getChartsApi();
+    var list = [];
+    if (charts && typeof charts.computeModelRankings === 'function') {
+      list = charts.computeModelRankings(models, metric, {
+        tokenUnit: state.tokenUnit,
+        currency: state.currency,
+        rate: state.currencyRate,
+      });
+    } else {
+      list = (models || []).map(function (m) {
+        return {
+          model: m.model || 'unknown',
+          score: null,
+          display: '—',
+          requestsText: intString(m.requests || 0),
+          tokensText: intString(m.tokens && m.tokens.total !== undefined ? m.tokens.total : m.tokens || 0),
+          costMicroText: intString(m.cost_micro_usd || 0),
+        };
+      });
+    }
 
     container.textContent = '';
     list.forEach(function (item, idx) {
@@ -2508,9 +2536,9 @@
             el('span', { class: 'rank-value mono', text: item.display }),
           ]),
           el('div', { class: 'rank-meta muted' }, [
-            el('span', { text: formatInt(item.requests) + ' 次调用' }),
-            el('span', { text: formatTokens(item.tokens, state.tokenUnit) + ' tokens' }),
-            el('span', { text: formatMicroUSD(item.costMicro) }),
+            el('span', { text: formatInt(item.requestsText) + ' 次调用' }),
+            el('span', { text: formatTokens(item.tokensText, state.tokenUnit) + ' tokens' }),
+            el('span', { text: formatMicroUSD(item.costMicroText) }),
           ]),
         ]),
       ]);
@@ -3426,7 +3454,7 @@
   function quotaProgress(key) {
     var spec = key.spec || {};
     var limit = intString(spec.quota_micro_usd);
-    var spent = intString(key.spent_micro_usd);
+    var spent = intString(key.quota_used_micro_usd !== undefined ? key.quota_used_micro_usd : key.spent_micro_usd);
     if (limit === '0') return el('span', { class: 'pill-note', text: '总额度不限' });
     var percent = ratioPercent(spent, limit);
     return el('div', {}, [
@@ -5068,26 +5096,28 @@
           .then(function (res) {
             fxBtn.disabled = false;
             if (res && res.rate) {
+              var rateText = String(res.rate);
               state.currencyRate = Number(res.rate);
               var cr = $('currency-rate');
-              if (cr) cr.value = String(res.rate);
-              notify('实时汇率已刷新：1 USD = ' + res.rate + ' ' + (res.currency || 'CNY'), 'ok');
+              if (cr) cr.value = rateText;
+              var isStale = Boolean(res.stale);
+              var isCached = Boolean(res.cached);
+              var msg = '汇率已刷新：1 USD = ' + rateText + ' ' + (res.quote || res.currency || 'CNY');
+              if (isStale) {
+                msg += '（已过期缓存）';
+                notify(msg, 'warn');
+              } else if (isCached) {
+                msg += '（来自缓存）';
+                notify(msg, 'ok');
+              } else {
+                notify(msg, 'ok');
+              }
               rerenderAfterUnitChange();
             }
           })
-          .catch(function () {
+          .catch(function (err) {
             fxBtn.disabled = false;
-            var custom = prompt('无法自动获取最新汇率，请输入自定义 USD/CNY 汇率：', String(state.currencyRate));
-            if (custom) {
-              var num = Number(custom);
-              if (num > 0 && isFinite(num)) {
-                state.currencyRate = num;
-                var cr = $('currency-rate');
-                if (cr) cr.value = String(num);
-                notify('已设置汇率：1 USD = ' + num + ' CNY', 'ok');
-                rerenderAfterUnitChange();
-              }
-            }
+            notify('实时汇率刷新失败，已保留当前汇率 ' + state.currencyRate + '（' + describeError(err) + '）', 'warn');
           });
       });
     }
@@ -5141,22 +5171,7 @@
     applyUsageFiltersToForm(state.usage.filters);
     renderUsageStatus();
 
-    if (global.CMAdminPricing && typeof global.CMAdminPricing.init === 'function') {
-      global.CMAdminPricing.init({
-        api: function (path, opts) {
-          var options = opts || {};
-          var url = path.indexOf('/') === 0 ? managerPath(path) : managerPath('/' + path);
-          return request(url, options);
-        },
-        el: el,
-        toast: notify,
-        showModal: openDialog,
-        closeModal: closeDialog,
-        onExactApplied: function () {
-          loadPrices(false);
-        },
-      });
-    }
+    initAdminPricing();
 
     var saved = readStoredCredential();
     var rememberBox = $('remember-management-key');
