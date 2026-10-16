@@ -31,6 +31,21 @@
 
   var ctx = null;
   var rules = [];
+  // 会话世代：init/dispose 都 +1。异步回调只有世代未变才允许写回界面或发起后续动作，
+  // 因此登出后到达的响应（含错误）一律被丢弃，也不会串到重新登录后的新会话。
+  var generation = 0;
+
+  function session() {
+    return { ctx: ctx, generation: generation };
+  }
+
+  function stale(snap) {
+    return !snap || !snap.ctx || snap.generation !== generation;
+  }
+
+  function errText(err) {
+    return err && err.message ? err.message : String(err);
+  }
 
   /* ------------------------------------------------------------------ *
    * 基础工具
@@ -383,29 +398,45 @@
 
   function load() {
     if (!ctx || !ctx.api) return Promise.resolve();
+    var snap = session();
     var listEl = document.getElementById('pricing-rules-list');
     var countEl = document.getElementById('rules-count');
     if (countEl) countEl.textContent = '加载中...';
 
-    return ctx.api('/api/pricing-rules')
-      .then(function (res) {
+    return snap.ctx.api('/api/pricing-rules').then(
+      function (res) {
+        if (stale(snap)) return;
         rules = (res && res.items) || [];
         renderRules(rules);
-      })
-      .catch(function (err) {
+      },
+      function (err) {
+        // 会话已变更时连错误都不允许写回界面。
+        if (stale(snap)) return;
         if (listEl) {
           listEl.textContent = '';
           var errBox = elNode('div', 'error-box');
-          errBox.textContent = '加载高级规则失败：' + (err && err.message ? err.message : err);
+          errBox.textContent = '加载高级规则失败：' + errText(err);
           listEl.appendChild(errBox);
         }
         if (countEl) countEl.textContent = '加载失败';
-      });
+      }
+    );
   }
 
+  // 登出：作废在途回调，清空本模块自己的待展示界面并解绑按钮。
   function dispose() {
+    generation++;
     rules = [];
     ctx = null;
+    clearRulesUI();
+    bindButtons(null);
+  }
+
+  function clearRulesUI() {
+    var listEl = document.getElementById('pricing-rules-list');
+    if (listEl) listEl.textContent = '';
+    var countEl = document.getElementById('rules-count');
+    if (countEl) countEl.textContent = '';
   }
 
   function renderRules(items) {
@@ -495,8 +526,8 @@
 
   // 规则删除使用结构化确认弹窗（与 app.js confirmDialog 相同的约定：
   // #confirm-checkbox + 「请先勾选确认项」），绝不使用浏览器原生 alert/confirm/prompt。
-  function confirmDeleteRule(rule) {
-    if (!ctx || !ctx.showModal) return Promise.resolve(false);
+  function confirmDeleteRule(rule, snap) {
+    if (!ctx || !ctx.showModal || stale(snap)) return Promise.resolve(false);
     return new Promise(function (resolve) {
       var chk = document.createElement('input');
       chk.type = 'checkbox';
@@ -516,7 +547,7 @@
       field.appendChild(chk);
       body.push(field);
 
-      var modal = ctx.showModal({ title: '删除高级定价规则' });
+      var modal = snap.ctx.showModal({ title: '删除高级定价规则' });
       modal.setBody(body);
       modal.setFooter([
         buttonNode('取消', 'btn', function () {
@@ -524,6 +555,10 @@
           resolve(false);
         }),
         buttonNode('删除', 'btn btn-danger', function () {
+          if (stale(snap)) {
+            resolve(false);
+            return;
+          }
           if (!chk.checked) {
             modal.setError('请先勾选确认项');
             return;
@@ -537,16 +572,23 @@
 
   function deleteRule(rule) {
     if (!ctx || !ctx.api) return;
-    confirmDeleteRule(rule).then(function (confirmed) {
-      if (!confirmed) return;
-      return ctx.api('/api/delete-price-rule', { method: 'POST', body: { id: rule.id } })
-        .then(function () {
-          if (ctx.toast) ctx.toast('规则已删除', 'ok');
-          load();
-        })
-        .catch(function (err) {
-          if (ctx.toast) ctx.toast('删除失败：' + (err && err.message ? err.message : err), 'error');
-        });
+    var snap = session();
+    confirmDeleteRule(rule, snap).then(function (confirmed) {
+      if (!confirmed || stale(snap)) return;
+      return snap.ctx
+        .api('/api/delete-price-rule', { method: 'POST', body: { id: rule.id } })
+        .then(
+          function () {
+            if (stale(snap)) return;
+            if (snap.ctx.toast) snap.ctx.toast('规则已删除', 'ok');
+            load();
+          },
+          function (err) {
+            // 会话已变更：不弹提示，也不刷新新会话的列表。
+            if (stale(snap)) return;
+            if (snap.ctx.toast) snap.ctx.toast('删除失败：' + errText(err), 'error');
+          }
+        );
     });
   }
 
@@ -586,14 +628,16 @@
   // 打开（新建或编辑）一条高级定价规则。
   // options.asNew           : 强制按「新建」打开（例如从目录导入）。
   // options.requireConfirm  : 必须勾选确认才能写入。
+  // options.overwrite       : 已存在的同 ID 规则；要求额外勾选覆盖确认。
   // options.note            : 弹窗顶部的数据来源/风险说明。
   function openRuleModal(existing, options) {
     if (!ctx || !ctx.showModal) return null;
+    var snap = session();
     var opts = options || {};
     var isEdit = Boolean(existing) && !opts.asNew;
     var state = ruleToEditorState(existing || defaultRule());
 
-    var modal = ctx.showModal({
+    var modal = snap.ctx.showModal({
       title: isEdit ? '编辑高级定价规则 · ' + state.id : '新增高级定价规则',
       wide: true,
     });
@@ -833,6 +877,24 @@
       form.appendChild(confirmSection);
     }
 
+    // PUT 是按 ID upsert（后端没有单独的创建接口）：同 ID 已存在时要求额外确认覆盖。
+    var chkOverwrite = null;
+    if (opts.overwrite) {
+      var existingRule = opts.overwrite;
+      var overwriteWrap = elNode('label', 'checkbox-label rule-overwrite');
+      chkOverwrite = document.createElement('input');
+      chkOverwrite.type = 'checkbox';
+      chkOverwrite.id = 'rule-overwrite';
+      overwriteWrap.appendChild(chkOverwrite);
+      overwriteWrap.appendChild(
+        document.createTextNode(' 我确认覆盖已存在的规则 ' + existingRule.id + '（原匹配表达式: ' + existingRule.pattern + '）')
+      );
+      var overwriteSection = elNode('p', 'hint hint-warn');
+      overwriteSection.style.gridColumn = '1 / -1';
+      overwriteSection.appendChild(overwriteWrap);
+      form.appendChild(overwriteSection);
+    }
+
     function readEditorState() {
       captureTiers();
       return {
@@ -856,8 +918,13 @@
 
     var btnSave = buttonNode('保存规则', 'btn btn-primary');
     btnSave.onclick = function () {
+      if (stale(snap)) return;
       if (chkConfirm && !chkConfirm.checked) {
         modal.setError('请先勾选确认项，明确该写入会立即影响后续计费。');
+        return;
+      }
+      if (chkOverwrite && !chkOverwrite.checked) {
+        modal.setError('请先勾选确认覆盖已存在的规则（相同 ID 会被覆盖）。');
         return;
       }
       var errors = [];
@@ -868,16 +935,20 @@
       }
       btnSave.disabled = true;
       modal.setError('');
-      ctx.api('/api/pricing-rules', { method: 'PUT', body: payload })
-        .then(function () {
-          if (ctx.toast) ctx.toast('高级定价规则已保存', 'ok');
+      snap.ctx.api('/api/pricing-rules', { method: 'PUT', body: payload }).then(
+        function () {
+          // 会话已变更：不提示、不关弹窗、不刷新新会话列表。
+          if (stale(snap)) return;
+          if (snap.ctx.toast) snap.ctx.toast('高级定价规则已保存', 'ok');
           modal.close();
           load();
-        })
-        .catch(function (err) {
+        },
+        function (err) {
+          if (stale(snap)) return;
           btnSave.disabled = false;
-          modal.setError('保存失败：' + (err && err.message ? err.message : err));
-        });
+          modal.setError('保存失败：' + errText(err));
+        }
+      );
     };
 
     var btnCancel = buttonNode('取消', 'btn btn-ghost', modal.close);
@@ -935,9 +1006,18 @@
   }
 
   // 目录里的 id 已经带 provider 前缀，规则 id 只是稳定标识，绝不改写模型名。
+  // 该 slug 不是单射（'a/b' 与 'a-b' 会撞成同一 ID），因此导入前必须检测同 ID 冲突。
   function catalogRuleID(model) {
     var slug = trimText(model).replace(/[^A-Za-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '');
     return 'catalog-' + (slug || 'model');
+  }
+
+  function findRuleByID(list, id) {
+    if (!Array.isArray(list)) return null;
+    for (var i = 0; i < list.length; i++) {
+      if (list[i] && list[i].id === id) return list[i];
+    }
+    return null;
   }
 
   // 目录阶梯费率只有在四个基础桶都齐全时才可导入（缺失不等于 0，绝不静默补零）。
@@ -956,13 +1036,25 @@
     };
   }
 
+  // 契约限制：阶梯费率 0 在规则阶梯里表示「继承基础费率」，无法表达「阶梯免费」。
+  // 目录里显式 0（区别于缺失）会被照搬成继承，导入提示必须说明。
+  function tierHasExplicitZero(rates) {
+    if (!rates) return false;
+    var fields = ['input', 'output', 'cache_read', 'cache_write'];
+    for (var i = 0; i < fields.length; i++) {
+      if (rates[fields[i]] === 0) return true;
+    }
+    return false;
+  }
+
   // 把目录条目映射为一条「精确匹配」的 PricingRule 草稿。
-  function catalogEntryToRule(entry, snapshot) {
+  function catalogEntryToRule(entry, snapshot, existingRules) {
     var model = entry || {};
     var pattern = trimText(model.id);
     var rates = model.rates || {};
     var tiers = [];
     var skipped = 0;
+    var zeroTiers = 0;
     var sourceTiers = Array.isArray(model.context_tiers) ? model.context_tiers : [];
     sourceTiers.forEach(function (tier) {
       if (!tier) {
@@ -974,6 +1066,7 @@
         skipped++;
         return;
       }
+      if (tierHasExplicitZero(mapped)) zeroTiers++;
       tiers.push({
         kind: 'context',
         threshold: tier.threshold,
@@ -1002,7 +1095,14 @@
       },
       tiers: tiers,
     };
-    return { rule: rule, skippedTiers: skipped, totalTiers: sourceTiers.length, snapshot: snapshot || null };
+    return {
+      rule: rule,
+      skippedTiers: skipped,
+      totalTiers: sourceTiers.length,
+      zeroTiers: zeroTiers,
+      conflict: findRuleByID(existingRules, rule.id),
+      snapshot: snapshot || null,
+    };
   }
 
   function catalogImportNote(mapping) {
@@ -1017,8 +1117,15 @@
       parts.push('目录来自本次实时获取（来源: ' + source + '）。');
     }
     parts.push('导入会写入一条精确匹配 (exact) 的高级定价规则；目录只读，获取目录本身绝不会改写任何价格。');
+    parts.push('保存是按规则 ID upsert（后端没有单独的创建接口）：相同 ID 已存在的规则会被覆盖。');
+    if (mapping && mapping.conflict) {
+      parts.push('⚠ 已存在同 ID 的规则 ' + mapping.conflict.id + '（当前匹配表达式: ' + mapping.conflict.pattern + '），继续将覆盖它。');
+    }
     if (mapping && mapping.totalTiers > 0) {
       parts.push('已带入 ' + (mapping.totalTiers - mapping.skippedTiers) + '/' + mapping.totalTiers + ' 条上下文阶梯（费率不完整的阶梯已跳过）。');
+    }
+    if (mapping && mapping.zeroTiers > 0) {
+      parts.push('⚠ 有 ' + mapping.zeroTiers + ' 条阶梯的费率为显式 0：规则阶梯中 0 表示继承基础费率（无法表达阶梯免费），请核对原始费率。');
     }
     parts.push('基础费率缺失时必须手工显式填写（0 = 免费）；思考费率留空表示按输出单价。');
     return parts.join(' ');
@@ -1026,7 +1133,8 @@
 
   function openCatalogModal() {
     if (!ctx || !ctx.api || !ctx.showModal) return null;
-    var modal = ctx.showModal({ title: '模型价格目录 (Model Catalog)', wide: true });
+    var snap = session();
+    var modal = snap.ctx.showModal({ title: '模型价格目录 (Model Catalog)', wide: true });
 
     var statusEl = elNode('p', 'status-line catalog-status');
     var searchField = elNode('div', 'field');
@@ -1122,10 +1230,12 @@
         var tdAction = document.createElement('td');
         var btnUse = buttonNode('选用', 'btn btn-small btn-primary');
         btnUse.onclick = function () {
-          var mapping = catalogEntryToRule(model, snapshot);
+          if (stale(snap)) return;
+          var mapping = catalogEntryToRule(model, snapshot, rules);
           openRuleModal(mapping.rule, {
             asNew: true,
             requireConfirm: true,
+            overwrite: mapping.conflict,
             note: catalogImportNote(mapping),
           });
         };
@@ -1171,16 +1281,22 @@
     };
 
     statusEl.textContent = '正在获取模型价格目录…';
-    ctx.api('/api/model-catalog?refresh=1')
-      .then(function (res) {
-        state.snapshot = res || {};
-        state.page = 1;
-        renderTable();
-      })
-      .catch(function (err) {
-        modal.setError('获取价格库失败：' + (err && err.message ? err.message : err));
-        statusEl.textContent = '';
-      });
+    snap.ctx
+      .api('/api/model-catalog?refresh=1')
+      .then(
+        function (res) {
+          // 会话已变更（登出/重新登录）：不渲染、不清错、不改成新会话的状态。
+          if (stale(snap)) return;
+          state.snapshot = res || {};
+          state.page = 1;
+          renderTable();
+        },
+        function (err) {
+          if (stale(snap)) return;
+          modal.setError('获取价格库失败：' + errText(err));
+          statusEl.textContent = '';
+        }
+      );
 
     modal.setFooter([buttonNode('关闭', 'btn btn-ghost', modal.close)]);
     return modal;
@@ -1190,20 +1306,30 @@
    * 初始化
    * ------------------------------------------------------------------ */
 
-  function init(options) {
-    ctx = options || {};
+  // handler 为 null 时解绑：登出后按钮不得再触发任何动作（重新登录时 init 会再绑定）。
+  function bindButtons(handler) {
     var btnCreateRule = document.getElementById('rules-create');
     if (btnCreateRule) {
-      btnCreateRule.onclick = function () {
-        openRuleModal(null);
-      };
+      btnCreateRule.onclick = handler
+        ? function () {
+          openRuleModal(null);
+        }
+        : null;
     }
     var btnLoadCatalog = document.getElementById('btn-load-model-catalog');
     if (btnLoadCatalog) {
-      btnLoadCatalog.onclick = function () {
-        openCatalogModal();
-      };
+      btnLoadCatalog.onclick = handler
+        ? function () {
+          openCatalogModal();
+        }
+        : null;
     }
+  }
+
+  function init(options) {
+    ctx = options || {};
+    generation++;
+    bindButtons(true);
   }
 
   global.CMAdminPricing = {
@@ -1224,6 +1350,7 @@
       filterCatalog: filterCatalog,
       paginate: paginate,
       catalogRuleID: catalogRuleID,
+      findRuleByID: findRuleByID,
       completeTierRates: completeTierRates,
       catalogEntryToRule: catalogEntryToRule,
       catalogImportNote: catalogImportNote,
