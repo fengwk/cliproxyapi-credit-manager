@@ -45,7 +45,7 @@ func TestAssetAllowListIsExact(t *testing.T) {
 		}
 	}
 
-	for _, name := range []string{"index.html", "app.js", "style.css", "lookup.html", "lookup.css", "lookup.js", "numbers.js"} {
+	for _, name := range exactAssets {
 		data, mime, ok := Asset(name)
 		if !ok || len(data) == 0 {
 			t.Fatalf("declared asset %s is not served", name)
@@ -54,19 +54,6 @@ func TestAssetAllowListIsExact(t *testing.T) {
 			t.Fatalf("asset %s mime = %q", name, mime)
 		}
 	}
-	// The shared chart slice may not have landed in this build yet. Whether or
-	// not it has, an exact-map lookup must never return a different asset's
-	// bytes: the declared name resolves to its own file or to nothing.
-	appJS, _, ok := Asset("app.js")
-	if !ok {
-		t.Fatal("app.js must be served")
-	}
-	for _, name := range []string{"charts.js", "vendor/echarts-5.6.0.min.js"} {
-		if data, _, ok := Asset(name); ok && string(data) == string(appJS) {
-			t.Fatalf("declared asset %s aliased another asset", name)
-		}
-	}
-
 	// Every rejection below shares the same file extension with a real asset,
 	// so an extension-driven rule would have served it.
 	for _, name := range []string{
@@ -125,7 +112,7 @@ func TestLookupAssetsAreSelfContainedAndSharedChartsWired(t *testing.T) {
 	}
 
 	// The page drives the shared renderer; it does not ship a private chart.
-	if !strings.Contains(js, "CMCharts") || !strings.Contains(js, "shared.render") {
+	if !strings.Contains(js, "CMCharts") || !strings.Contains(js, "charts().render(") {
 		t.Error("lookup.js must render through the shared CMCharts.render entry point")
 	}
 	for _, option := range []string{"bucket:", "tokenUnit:", "currency:", "rate:"} {

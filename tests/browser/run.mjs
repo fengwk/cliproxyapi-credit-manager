@@ -256,7 +256,7 @@ async function main() {
     await cdp.waitFor("document.querySelector('#login-view') && !document.querySelector('#login-view').hidden", 10000, '登录界面出现');
     check('静态外壳先显示登录界面', true);
     const loginText = await cdp.text('#login-view');
-    check('登录界面说明密钥仅存于内存', loginText.includes('内存') && loginText.includes('localStorage'));
+    check('登录界面说明会话保持与显式记住密钥', loginText.includes('sessionStorage') && loginText.includes('localStorage') && loginText.includes('勾选'));
     check('登录界面含失败封禁提示', loginText.includes('30 分钟'));
     const shellText = await cdp.text('body');
     check('静态外壳不含密钥与账务数据', !shellText.includes('sk-') && !shellText.includes('µUSD'));
