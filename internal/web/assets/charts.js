@@ -153,47 +153,85 @@
     return (neg ? '-' : '') + whole.toString() + (fracText ? '.' + fracText : '');
   }
 
+  // 拆出符号与数字部分；调用方分别处理符号，避免乘除时丢号。
   function decimalParts(text) {
     var raw = String(text == null ? '' : text).trim();
-    if (raw.charAt(0) === '-') raw = raw.slice(1);
-    else if (raw.charAt(0) === '+') raw = raw.slice(1);
+    var neg = false;
+    if (raw.charAt(0) === '-') {
+      neg = true;
+      raw = raw.slice(1);
+    } else if (raw.charAt(0) === '+') {
+      raw = raw.slice(1);
+    }
     var match = /^(\d*)(?:\.(\d*))?$/.exec(raw);
     if (!match || (match[1] === '' && (match[2] === undefined || match[2] === ''))) return null;
-    return { int: match[1] || '0', frac: match[2] || '' };
+    return { neg: neg, int: match[1] || '0', frac: match[2] || '' };
   }
 
   function pow10Big(count) {
     return BigInt('1' + new Array(count + 1).join('0'));
   }
 
-  // 两个十进制字符串相乘，四舍五入到 fracLimit 位小数（用于 CNY = USD * rate）。
+  function trimZeros(parts) {
+    return { int: parts.int.replace(/^0+(?=\d)/, ''), frac: parts.frac.replace(/0+$/, '') };
+  }
+
+  // 两个十进制字符串相乘，四舍五入到 fracLimit 位小数，符号由两个操作数决定
+  // （用于 CNY = USD * rate，也可用于负金额）。取绝对值四舍五入后补回符号。
   function multiplyDecimal(a, b, fracLimit) {
     var pa = decimalParts(a);
     var pb = decimalParts(b);
     if (!pa || !pb) return null;
     var limit = typeof fracLimit === 'number' && fracLimit >= 0 ? fracLimit : 6;
-    var an = BigInt(pa.int + pa.frac);
-    var bn = BigInt(pb.int + pb.frac);
-    var product = an * bn;
+    var product = BigInt(pa.int + pa.frac) * BigInt(pb.int + pb.frac);
     var scale = pa.frac.length + pb.frac.length;
     if (scale > limit) {
       var divisor = pow10Big(scale - limit);
       var quotient = product / divisor;
       var remainder = product % divisor;
-      if (remainder * 2n >= divisor) quotient += 1n; // 非负四舍五入
+      if (remainder * 2n >= divisor) quotient += 1n; // 绝对值 half-away-from-zero
       product = quotient;
       scale = limit;
     }
+    var neg = pa.neg !== pb.neg && product !== 0n;
     var digits = product.toString().padStart(scale + 1, '0');
     var whole = digits.slice(0, digits.length - scale);
     var frac = digits.slice(digits.length - scale).replace(/0+$/, '');
-    return whole + (frac ? '.' + frac : '');
+    return (neg ? '-' : '') + whole + (frac ? '.' + frac : '');
   }
 
+  var RATE_MAX_EXPONENT = 18; // rate 必须落在 1e-18..1e18，超界视为非法
+
+  // 科学计数法安全展开为普通十进制；非法/超界返回 ''。
+  function expandExponent(text) {
+    var raw = String(text == null ? '' : text).trim();
+    var match = /^([+-]?)(\d*)(?:\.(\d*))?[eE]([+-]?\d+)$/.exec(raw);
+    if (!match) return decimalParts(raw) ? raw : '';
+    var sign = match[1] === '-' ? '-' : '';
+    var int = match[2] || '0';
+    var frac = match[3] || '';
+    var exponent = parseInt(match[4], 10);
+    if (!isFinite(exponent) || Math.abs(exponent) > RATE_MAX_EXPONENT) return '';
+    var digits = (int + frac).replace(/^0+(?=\d)/, '');
+    var point = int.length + exponent; // 小数点相对 digits 的位置
+    if (point <= 0) return sign + '0.' + new Array(1 - point).join('0') + digits;
+    if (point >= digits.length) return sign + digits + new Array(point - digits.length + 1).join('0');
+    return sign + digits.slice(0, point) + '.' + digits.slice(point);
+  }
+
+  // rate 归一化为「正的普通十进制文本」；非法、非正、超界一律回退为 '1'（有界，绝不产出 '—'）。
   function rateTextOf(rate) {
-    if (typeof rate === 'number') return isFinite(rate) && rate > 0 ? String(rate) : '1';
-    if (typeof rate === 'string' && rate.trim() !== '') return rate.trim();
-    return '1';
+    var text;
+    if (typeof rate === 'number') text = isFinite(rate) ? String(rate) : '';
+    else text = String(rate == null ? '' : rate).trim();
+    if (text === '') return '1';
+    var expanded = expandExponent(text);
+    if (expanded === '') return '1';
+    var parts = decimalParts(expanded);
+    if (!parts || parts.neg) return '1';
+    if ((parts.int + parts.frac).replace(/^0+/, '') === '') return '1';
+    var trimmed = trimZeros(parts);
+    return trimmed.int + (trimmed.frac ? '.' + trimmed.frac : '');
   }
 
   function normalizeCurrency(value) {
@@ -256,6 +294,18 @@
     return 1n;
   }
 
+  function tokenUnitDivisor(unit) {
+    return Number(tokenUnitDivisorBig(normalizeTokenUnit(unit)));
+  }
+
+  // 几何坐标必须与坐标轴 formatter 使用同一单位：按 tokenUnit 缩放（如 k -> /1000），
+  // 否则 12500 会被标成 “12500K”。精确 tooltip 仍使用未缩放的整数文本。
+  function tokenDataNumber(value, unit) {
+    var num = toNumber(value);
+    var divisor = tokenUnitDivisor(unit);
+    return divisor === 1 ? num : num / divisor;
+  }
+
   function tokenUnitSuffix(unit) {
     if (unit === 'k') return 'K';
     if (unit === 'wan') return '万';
@@ -286,10 +336,10 @@
     return (neg ? '-' : '') + groupDigits(whole.toString()) + (frac ? '.' + frac : '');
   }
 
+  // 与 app.js 的 formatTokens 一致：单位后缀紧贴数字（如 12.5K），坐标轴与 tooltip 同一写法。
   function tokenText(value, unit) {
     var normalized = normalizeTokenUnit(unit);
-    var suffix = tokenUnitSuffix(normalized);
-    return formatTokenCount(value, normalized) + (suffix ? ' ' + suffix : '');
+    return formatTokenCount(value, normalized) + tokenUnitSuffix(normalized);
   }
 
   // 契约字段（计数/token/微美元）缺省即 0；非整数输入保守回退为 0，避免 NaN 进入图形。
@@ -349,13 +399,15 @@
     return String(value).padStart(2, '0');
   }
 
+  // 服务端 bucket 与 time 都是 UTC（基于 epoch 的 started_at）；这里一律用 UTC getter，
+  // 否则 UTC 2026-03-01 在西部时区会被标成 02-28。
   function formatDateTime(value) {
     if (!value) return '';
     var date = new Date(value);
     if (isNaN(date.getTime())) return String(value);
     return (
-      date.getFullYear() + '-' + pad2(date.getMonth() + 1) + '-' + pad2(date.getDate()) +
-      ' ' + pad2(date.getHours()) + ':' + pad2(date.getMinutes()) + ':' + pad2(date.getSeconds())
+      date.getUTCFullYear() + '-' + pad2(date.getUTCMonth() + 1) + '-' + pad2(date.getUTCDate()) +
+      ' ' + pad2(date.getUTCHours()) + ':' + pad2(date.getUTCMinutes()) + ':' + pad2(date.getUTCSeconds())
     );
   }
 
@@ -363,9 +415,11 @@
     if (!value) return '';
     var date = new Date(value);
     if (isNaN(date.getTime())) return String(value);
-    if (bucket === 'month') return date.getFullYear() + '-' + pad2(date.getMonth() + 1);
-    if (bucket === 'hour') return pad2(date.getMonth() + 1) + '-' + pad2(date.getDate()) + ' ' + pad2(date.getHours()) + ':00';
-    return pad2(date.getMonth() + 1) + '-' + pad2(date.getDate());
+    if (bucket === 'month') return date.getUTCFullYear() + '-' + pad2(date.getUTCMonth() + 1);
+    if (bucket === 'hour') {
+      return pad2(date.getUTCMonth() + 1) + '-' + pad2(date.getUTCDate()) + ' ' + pad2(date.getUTCHours()) + ':00';
+    }
+    return pad2(date.getUTCMonth() + 1) + '-' + pad2(date.getUTCDate());
   }
 
   /* ------------------------------------------------------------------ *
@@ -430,10 +484,12 @@
       var reasoning = intOrDefault(tokens.reasoning);
       // 合计只取互不重叠的五个桶之和，避免把 reasoning 既当独立桶又计入 output 的重复计数。
       var sum = sumIntTexts([input, output, cacheRead, cacheWrite, reasoning]);
+      var stamp = formatDateTime(source.time);
       return {
         time: source.time,
         label: bucketLabel(source.time, bucket),
-        timeText: formatDateTime(source.time),
+        // tooltip 明确标注 UTC，避免读者把 UTC 聚合桶误当本地时间。
+        timeText: stamp ? stamp + ' UTC' : '',
         requests: intOrDefault(source.requests),
         executions: intOrDefault(source.executions),
         failed: intOrDefault(source.failed),
@@ -665,7 +721,7 @@
         itemStyle: { color: theme.colors[item.key], borderWidth: 1, borderColor: theme.panel },
         areaStyle: { color: withAlpha(theme.colors[item.key], theme.areaAlpha) },
         emphasis: { focus: 'series' },
-        data: points.map(function (p) { return toNumber(p.tokens[item.key]); }),
+        data: points.map(function (p) { return tokenDataNumber(p.tokens[item.key], model.tokenUnit); }),
       };
     });
     option.dataZoom = dataZoomFor(points.length, theme);
@@ -914,36 +970,19 @@
     return records.size;
   }
 
+  // 公共 API：生命周期（app.js 只用 render/refreshTheme，其余供集成方按需调用）
+  // 与精确数值工具（金额/token 文本，供测试与复用）。内部实现不在此暴露。
   return {
     version: VERSION,
-    SLOTS: SLOTS,
     PALETTES: PALETTES,
-    TOKEN_SERIES: TOKEN_SERIES,
-    // 精确数值工具（可单独复用/测试）
     intText: intText,
-    isIntText: isIntText,
-    groupDigits: groupDigits,
     formatInt: formatInt,
-    microToUSDText: microToUSDText,
     multiplyDecimal: multiplyDecimal,
-    rateTextOf: rateTextOf,
     formatMoneyMicro: formatMoneyMicro,
-    formatMoneyDisplay: formatMoneyDisplay,
-    moneyDisplayNumber: moneyDisplayNumber,
-    normalizeTokenUnit: normalizeTokenUnit,
-    normalizeCurrency: normalizeCurrency,
     normalizeBucket: normalizeBucket,
     formatTokenCount: formatTokenCount,
     tokenText: tokenText,
-    tokenUnitSuffix: tokenUnitSuffix,
-    // 主题与数据
-    resolvePalette: resolvePalette,
-    normalizePoints: normalizePoints,
     bucketLabel: bucketLabel,
-    formatDateTime: formatDateTime,
-    axisIntText: axisIntText,
-    axisTokenText: axisTokenText,
-    // 图表
     buildChartOptions: buildChartOptions,
     render: render,
     resize: resize,
