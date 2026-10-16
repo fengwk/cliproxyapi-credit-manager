@@ -1221,12 +1221,19 @@ async function main() {
     const consoleErrors = cdp.events.filter((name) => name === 'Runtime.exceptionThrown').length;
     check('运行期间没有未捕获异常', consoleErrors === 0, 'count=' + consoleErrors);
   } finally {
+    const chromeExited = new Promise((resolve) => {
+      if (chrome.child.exitCode !== null || chrome.child.signalCode !== null) resolve();
+      else chrome.child.once('close', resolve);
+    });
     try {
       await cdp.send('Browser.close');
     } catch (err) {
       /* 忽略关闭失败 */
     }
+    // 先等待正常退出完成，避免 SIGKILL 打断子进程清理并在删除后重建 profile。
+    await Promise.race([chromeExited, sleep(5000)]);
     chrome.child.kill('SIGKILL');
+    await chromeExited;
     mock.child.kill('SIGKILL');
     // Chrome 的子进程可能仍在写 profile 目录，删除需要重试，否则清理竞态会掩盖已经完成的检查结果。
     fs.rmSync(profileDir, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });

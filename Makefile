@@ -56,6 +56,7 @@ static:
 	bash scripts/test-package-plugin.sh
 	PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-verify-release-assets.py
 	PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-release-pipeline.py
+	PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests/integration -p 'test_*.py'
 
 race:
 	go test -race ./...

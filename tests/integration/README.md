@@ -23,6 +23,8 @@ mock.
 - Python 3.11+ (standard library only).
 - Optional: a locally cached Playwright Chromium (`python3 -m playwright install
   chromium` or an existing `~/.cache/ms-playwright`) for the `browser` module.
+  Set `CHROME_BIN=/absolute/path/to/chrome` to explicitly use an installed Chrome
+  instead. No automatic fallback occurs; an invalid executable fails the cases.
   The harness never installs anything into the repo.
 
 ## Build

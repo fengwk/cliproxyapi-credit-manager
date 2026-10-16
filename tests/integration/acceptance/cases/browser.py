@@ -1,6 +1,6 @@
 """Real-browser checks against the native resource shell.
 
-Uses a locally cached Playwright Chromium in an isolated browser context (no
+Uses Playwright Chromium (or explicit CHROME_BIN) in an isolated browser context (no
 shared profile, no stored state). The page is loaded from the real host's public
 resource route and driven through the in-memory management login. The management
 key must never be persisted to localStorage, sessionStorage, cookies or the URL.
@@ -8,7 +8,9 @@ key must never be persisted to localStorage, sessionStorage, cookies or the URL.
 
 from __future__ import annotations
 
+import os
 import re
+from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -73,6 +75,23 @@ def _launch():
     return sync_playwright().start()
 
 
+@contextmanager
+def _browser():
+    playwright = _launch()
+    try:
+        options = {"headless": True}
+        if executable := os.environ.get("CHROME_BIN"):
+            options["executable_path"] = executable
+        browser = playwright.chromium.launch(**options)
+        try:
+            yield browser
+        finally:
+            browser.close()
+    finally:
+        # Launch and browser.close can fail too; always stop the sync runtime.
+        playwright.stop()
+
+
 def _seed(ctx, label, body=None):
     ctx.set_price("synthetic-chat")
     item, key = ctx.new_key(label=label)
@@ -89,10 +108,8 @@ def _seed(ctx, label, body=None):
       "a real browser logs in with the in-memory key, renders usage and persists no credentials")
 def login_and_usage(ctx):
     item, key, request = _seed(ctx, "browser-alpha")
-    playwright = _launch()
-    browser = playwright.chromium.launch(headless=True)
     console_errors = []
-    try:
+    with _browser() as browser:
         context = browser.new_context()
         page = context.new_page()
         page.on("pageerror", lambda error: console_errors.append(str(error)))
@@ -113,9 +130,6 @@ def login_and_usage(ctx):
         check_eq(console_errors, [], "no uncaught page errors")
         context.close()
         return {"storage": storage, "rows_rendered": True}
-    finally:
-        browser.close()
-        playwright.stop()
 
 
 @case("browser.lazy_capture_body",
@@ -132,9 +146,7 @@ def lazy_capture(ctx):
             "api_key": secret, "big": 9007199254740993}
     item, key, request = _seed(ctx, "browser-body", body=body)
 
-    playwright = _launch()
-    browser = playwright.chromium.launch(headless=True)
-    try:
+    with _browser() as browser:
         context = browser.new_context()
         page = context.new_page()
         _login(page, ctx, request["started_at"])
@@ -154,6 +166,3 @@ def lazy_capture(ctx):
         check(ctx.management_secret not in modal, "management key not rendered into the modal")
         context.close()
         return {"modal_chars": len(modal)}
-    finally:
-        browser.close()
-        playwright.stop()
