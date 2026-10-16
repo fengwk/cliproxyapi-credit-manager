@@ -14,21 +14,9 @@ import (
 // only the current page hydrates nested executions.
 func (s *Store) Report(ctx context.Context, f Filter) (Report, error) {
 	now := s.nowUTC()
-	from := f.From
-	if from.IsZero() {
-		from = s.retentionFrom(now)
-	}
-	to := f.To
-	if to.IsZero() {
-		to = now.Add(time.Nanosecond)
-	}
-	from, to = from.UTC(), to.UTC()
-	// UnixNano silently wraps instants outside SQLite's int64 timestamp range.
-	if !time.Unix(0, from.UnixNano()).Equal(from) || !time.Unix(0, to.UnixNano()).Equal(to) {
-		return Report{}, fmt.Errorf("%w: report range is not representable at nanosecond precision", ErrInvalid)
-	}
-	if !to.After(from) {
-		return Report{}, fmt.Errorf("%w: report range is empty", ErrInvalid)
+	from, to, err := s.reportRange(f, now)
+	if err != nil {
+		return Report{}, err
 	}
 	where, args, execWhere, execArgs := buildPredicates(f, from, to)
 	page, size := normalizePaging(f)
@@ -76,6 +64,30 @@ func (s *Store) Report(ctx context.Context, f Filter) (Report, error) {
 		return Report{}, err
 	}
 	return out, nil
+}
+
+// reportRange resolves and validates the half-open UTC window a selection
+// reads. Report and Analytics share it so their defaults (retention floor and
+// an exclusive "now") and their overflow / empty-range errors can never
+// diverge into two overlapping definitions of the same filter.
+func (s *Store) reportRange(f Filter, now time.Time) (time.Time, time.Time, error) {
+	from := f.From
+	if from.IsZero() {
+		from = s.retentionFrom(now)
+	}
+	to := f.To
+	if to.IsZero() {
+		to = now.Add(time.Nanosecond)
+	}
+	from, to = from.UTC(), to.UTC()
+	// UnixNano silently wraps instants outside SQLite's int64 timestamp range.
+	if !time.Unix(0, from.UnixNano()).Equal(from) || !time.Unix(0, to.UnixNano()).Equal(to) {
+		return time.Time{}, time.Time{}, fmt.Errorf("%w: report range is not representable at nanosecond precision", ErrInvalid)
+	}
+	if !to.After(from) {
+		return time.Time{}, time.Time{}, fmt.Errorf("%w: report range is empty", ErrInvalid)
+	}
+	return from, to, nil
 }
 
 func normalizePaging(f Filter) (int, int) {
