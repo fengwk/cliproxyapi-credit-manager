@@ -737,6 +737,11 @@
       max_concurrent: intVal(input.maxConcurrent),
       allowed_models: (input.allowedModels || []).slice(),
     };
+    // 自定义密钥材料只在显式提供非空值时下发，且原样（不裁剪）：留空表示由服务端生成，
+    // 首尾空白由服务端校验拒绝，避免界面悄悄把调用方的密钥改写成另一个值。
+    if (input.key !== undefined && input.key !== null && input.key !== '') {
+      spec.key = String(input.key);
+    }
     // 显式 null 表示清空：界面清空 token 限额或过期时间时必须下发 null，
     // 否则合并既有 spec 时会保留旧值，用户无法取消限制。
     spec.model_token_limits = input.modelTokenLimits === null || input.modelTokenLimits === undefined
@@ -820,6 +825,9 @@
 
   var state = {
     key: '',
+    // 会话纪元：登录尝试、登出与会话失效时递增。请求在发起时捕获纪元，
+    // 纪元变化后到达的任何响应（含失败）都被判定为过期，不得写回状态、渲染或触发登出。
+    sessionEpoch: 0,
     tab: 'usage',
     usage: {
       filters: defaultUsageFilters(),
@@ -827,11 +835,13 @@
       loading: false,
       error: '',
       requestedQuery: '',
+      loadedAt: null,
+      loadSeq: 0,
     },
-    keys: { items: null, loading: false, error: '' },
-    prices: { items: null, loading: false, error: '' },
-    credentials: { items: null, loading: false, error: '', quota: {} },
-    health: { data: null, loading: false, error: '' },
+    keys: { items: null, loading: false, error: '', loadSeq: 0 },
+    prices: { items: null, loading: false, error: '', loadSeq: 0 },
+    credentials: { items: null, loading: false, error: '', quota: {}, loadSeq: 0 },
+    health: { data: null, loading: false, error: '', loadSeq: 0 },
   };
 
   function authHeaders() {
@@ -844,9 +854,22 @@
     return raw.length > max ? raw.slice(0, max) + '…' : raw;
   }
 
+  // 过期请求的专用错误：调用方通过 failRequest 静默丢弃，绝不提示、绝不登出。
+  function staleError() {
+    var error = new Error('会话已变更，忽略过期响应');
+    error.kind = 'stale';
+    return error;
+  }
+
   // 统一请求入口：始终携带管理密钥；401/403 视为密钥失效，由调用方回到登录界面。
+  // 会话纪元在开始解析响应之前校验：登出或重新登录之后到达的旧响应一律作废，
+  // 否则旧会话的迟到成功会回填缓存甚至弹出明文密钥，迟到的 401 会把新会话踢下线。
   function request(path, options) {
     var opts = options || {};
+    var epoch = state.sessionEpoch;
+    var stale = function () {
+      return epoch !== state.sessionEpoch;
+    };
     var init = {
       method: opts.method || 'GET',
       headers: authHeaders(),
@@ -857,31 +880,44 @@
       init.headers['Content-Type'] = 'application/json';
       init.body = typeof opts.body === 'string' ? opts.body : exactStringify(opts.body);
     }
-    return fetch(path, init).then(function (response) {
-      return response.text().then(function (text) {
-        var data = null;
-        if (text.trim() !== '') {
-          try {
-            data = parseJSON(text);
-          } catch (err) {
-            data = null;
+    return fetch(path, init).then(
+      function (response) {
+        return response.text().then(
+          function (text) {
+            if (stale()) throw staleError();
+            var data = null;
+            if (text.trim() !== '') {
+              try {
+                data = parseJSON(text);
+              } catch (err) {
+                data = null;
+              }
+            }
+            if (!response.ok) {
+              var message = data && typeof data.error === 'string' && data.error ? data.error : truncateText(text);
+              var error = new Error(message || ('HTTP ' + response.status));
+              error.status = response.status;
+              error.kind = response.status === 401 || response.status === 403 ? 'auth' : 'http';
+              error.detail = text;
+              throw error;
+            }
+            return data;
+          },
+          function (cause) {
+            // 读取响应体失败同样是一种请求结果：会话变更后到达的失败必须作废，
+            // 否则旧会话的普通错误会被当成新会话的错误写进界面状态。
+            if (stale()) throw staleError();
+            throw cause;
           }
-        }
-        if (!response.ok) {
-          var message = data && typeof data.error === 'string' && data.error ? data.error : truncateText(text);
-          var error = new Error(message || ('HTTP ' + response.status));
-          error.status = response.status;
-          error.kind = response.status === 401 || response.status === 403 ? 'auth' : 'http';
-          error.detail = text;
-          throw error;
-        }
-        return data;
-      });
-    }, function (cause) {
-      var error = new Error('无法连接管理 API：' + (cause && cause.message ? cause.message : '网络错误'));
-      error.kind = 'network';
-      throw error;
-    });
+        );
+      },
+      function (cause) {
+        if (stale()) throw staleError();
+        var error = new Error('无法连接管理 API：' + (cause && cause.message ? cause.message : '网络错误'));
+        error.kind = 'network';
+        throw error;
+      }
+    );
   }
 
   function managerPath(path) {
@@ -992,6 +1028,8 @@
     pricePayload: pricePayload,
     keySpecPayload: keySpecPayload,
     mergeKeySpec: mergeKeySpec,
+    moneyInputMicro: moneyInputMicro,
+    captureStatusText: captureStatusText,
     parseModelTokenLimits: parseModelTokenLimits,
     modelTokenLimitsToText: modelTokenLimitsToText,
     splitAllowedModels: splitAllowedModels,
@@ -1381,8 +1419,24 @@
     return { node: row, microInput: microInput, usdInput: usdInput, hint: hint };
   }
 
-  function readMoneyInput(pair, label, errors) {
-    var text = pair.microInput.value.trim();
+  // 纯逻辑：金额输入对的取值。美元字段非空时必须以美元字段为准重新校验——
+  // 否则非法的美元输入会让「上一次换算留下的微美元值」被当作有效金额提交，
+  // 用户以为填了无效金额而界面却按旧值扣费/建 Key/写价格。
+  function moneyInputMicro(input, label, errors) {
+    var raw = input || {};
+    var usdText = String(raw.usd == null ? '' : raw.usd).trim();
+    if (usdText !== '') {
+      var converted = usdToMicroUSD(usdText);
+      if (!converted.ok) {
+        errors.push(label + '：美元输入无效（' + converted.error + '），请改成合法金额或清空后再提交');
+        return '0';
+      }
+      return microAmountValue(converted.micro, label, errors);
+    }
+    return microAmountValue(String(raw.micro == null ? '' : raw.micro).trim(), label, errors);
+  }
+
+  function microAmountValue(text, label, errors) {
     if (text === '') return '0';
     if (!isIntegerText(text)) {
       errors.push(label + ' 必须是整数微美元（1 USD = 1,000,000 微美元）');
@@ -1393,6 +1447,15 @@
       return '0';
     }
     return text;
+  }
+
+  function readMoneyInput(pair, label, errors) {
+    return moneyInputMicro({ micro: pair.microInput.value, usd: pair.usdInput.value }, label, errors);
+  }
+
+  // 金额输入对是否完全留空：留空表示 0（可选金额字段还表示「不下发该字段」）。
+  function moneyPairEmpty(pair) {
+    return pair.microInput.value.trim() === '' && pair.usdInput.value.trim() === '';
   }
 
   /* ---------------- 登录与会话 ---------------- */
@@ -1425,8 +1488,65 @@
     if (logout) logout.hidden = false;
   }
 
+  // 清空会话私有状态：登出或会话失效后，内存里不得再保留上一个会话的缓存与查询串。
+  // 每个资源的读取序号一并重置，配合会话纪元保证在途响应不会被当成有效结果。
+  function clearSessionState() {
+    state.usage.report = null;
+    state.usage.loading = false;
+    state.usage.error = '';
+    state.usage.requestedQuery = '';
+    state.usage.loadedAt = null;
+    state.usage.loadSeq = 0;
+    state.keys = { items: null, loading: false, error: '', loadSeq: 0 };
+    state.prices = { items: null, loading: false, error: '', loadSeq: 0 };
+    state.credentials = { items: null, loading: false, error: '', quota: {}, loadSeq: 0 };
+    state.health = { data: null, loading: false, error: '', loadSeq: 0 };
+  }
+
+  // 已渲染的私有内容：登出/会话失效时必须从 DOM 中抹掉，不能只隐藏容器。
+  var PRIVATE_RENDER_TARGETS = [
+    'usage-status',
+    'usage-summary',
+    'usage-quality-note',
+    'usage-chart',
+    'usage-legend',
+    'usage-total',
+    'usage-retention',
+    'usage-items',
+    'usage-pagination',
+    'keys-status',
+    'keys-list',
+    'prices-status',
+    'prices-list',
+    'credentials-status',
+    'credentials-list',
+    'health-status',
+    'health-cards',
+    'health-extra',
+  ];
+
+  var PRIVATE_ERROR_TARGETS = ['usage-error', 'keys-error', 'prices-error', 'credentials-error', 'health-error'];
+
+  function clearRenderedPrivateContent() {
+    for (var i = 0; i < PRIVATE_RENDER_TARGETS.length; i++) {
+      var node = $(PRIVATE_RENDER_TARGETS[i]);
+      if (node) node.textContent = '';
+    }
+    for (var e = 0; e < PRIVATE_ERROR_TARGETS.length; e++) {
+      renderErrorBox($(PRIVATE_ERROR_TARGETS[e]), '');
+    }
+    var keySelect = $('usage-key');
+    if (keySelect) {
+      replace(keySelect, [el('option', { value: '', text: '全部' })]);
+      keySelect.value = '';
+    }
+  }
+
   function handleSessionExpired(message) {
+    state.sessionEpoch++;
     state.key = '';
+    clearSessionState();
+    clearRenderedPrivateContent();
     closeDialog();
     showLoginView();
     var errorNode = $('login-error');
@@ -1436,8 +1556,10 @@
     }
   }
 
-  // 统一处理请求失败：鉴权失败回到登录界面，其余错误交给调用方展示。
+  // 统一处理请求失败：会话纪元变化后的过期请求静默丢弃（既不提示也不登出），
+  // 鉴权失败回到登录界面，其余错误交给调用方展示。
   function failRequest(error) {
+    if (error && error.kind === 'stale') return true;
     if (error && error.kind === 'auth') {
       handleSessionExpired(describeError(error));
       return true;
@@ -1459,6 +1581,8 @@
       return;
     }
     state.key = key;
+    // 每次登录尝试都开启新的会话纪元：旧会话（含同一密钥的旧会话）的在途请求立即作废。
+    var epoch = ++state.sessionEpoch;
     if (errorNode) {
       errorNode.hidden = true;
       errorNode.textContent = '';
@@ -1466,6 +1590,7 @@
     if (button) button.disabled = true;
     api.health().then(
       function () {
+        if (epoch !== state.sessionEpoch) return;
         if (button) button.disabled = false;
         if (input) input.value = '';
         showMainView();
@@ -1476,6 +1601,7 @@
         loadKeys(true);
       },
       function (error) {
+        if (epoch !== state.sessionEpoch) return;
         if (button) button.disabled = false;
         state.key = '';
         showLoginView();
@@ -1493,12 +1619,11 @@
   }
 
   function logout() {
+    // 先递增会话纪元：所有在途请求立即失效，其响应不得再写回状态或弹窗。
+    state.sessionEpoch++;
     state.key = '';
-    state.keys = { items: null, loading: false, error: '' };
-    state.prices = { items: null, loading: false, error: '' };
-    state.credentials = { items: null, loading: false, error: '', quota: {} };
-    state.health = { data: null, loading: false, error: '' };
-    state.usage.report = null;
+    clearSessionState();
+    clearRenderedPrivateContent();
     closeDialog();
     showLoginView();
     var keyInput = $('management-key');
@@ -1625,13 +1750,24 @@
     if (!state.key) return;
     var filters = state.usage.filters;
     var query = buildUsageQuery(filters);
-    if (!force && state.usage.requestedQuery === query && state.usage.report) return;
+    // 读取序号：只有最后一次发出的查询可以写回结果，先发的响应迟到一律丢弃。
+    // 序号必须先自增（含命中缓存的分支）：即使本次命中缓存、不再发起请求，
+    // 也必须作废在途的旧查询，否则更早发出的查询迟到时会覆盖当前筛选条件下的缓存结果。
+    var seq = ++state.usage.loadSeq;
+    if (!force && state.usage.requestedQuery === query && state.usage.report) {
+      // 命中缓存：清掉在途查询留下的加载/错误状态，并用缓存结果重新渲染，保持界面自洽。
+      state.usage.loading = false;
+      state.usage.error = '';
+      renderUsage();
+      return;
+    }
     state.usage.loading = true;
     state.usage.error = '';
     renderUsageStatus();
     renderUsageError();
     api.usage(query).then(
       function (data) {
+        if (seq !== state.usage.loadSeq) return;
         state.usage.loading = false;
         state.usage.report = data || {};
         state.usage.requestedQuery = query;
@@ -1639,6 +1775,8 @@
         renderUsage();
       },
       function (error) {
+        if (seq !== state.usage.loadSeq) return;
+        if (failRequest(error)) return;
         state.usage.loading = false;
         state.usage.error = describeError(error);
         renderUsageStatus();
@@ -2292,11 +2430,20 @@
 
   /* ---------------- 请求体快照 ---------------- */
 
+  // 快照状态取值来自 internal/capture（captured/disabled/oversize/dropped/expired/unavailable）。
+  // 未收录的状态原样显示，既不猜测含义也不隐藏。
+  var CAPTURE_STATUS_LABELS = {
+    captured: { label: '快照可用', tone: 'ok' },
+    disabled: { label: '捕获功能未启用', tone: 'warn' },
+    oversize: { label: '快照超出体积上限', tone: 'warn' },
+    dropped: { label: '快照已丢弃', tone: 'warn' },
+    expired: { label: '快照已过期', tone: 'warn' },
+    unavailable: { label: '快照不可用', tone: 'warn' },
+  };
+
   function captureStatusText(status) {
     var text = String(status == null ? '' : status);
-    if (text === 'ok') return { label: '快照可用', tone: 'ok' };
-    if (text === 'disabled') return { label: '捕获功能未启用', tone: 'warn' };
-    if (text === 'unavailable') return { label: '快照不可用', tone: 'warn' };
+    if (Object.prototype.hasOwnProperty.call(CAPTURE_STATUS_LABELS, text)) return CAPTURE_STATUS_LABELS[text];
     return { label: text || '未知状态', tone: '' };
   }
 
@@ -2526,20 +2673,23 @@
   function loadKeys(force) {
     if (!state.key) return Promise.resolve();
     if (!force && state.keys.items) return Promise.resolve();
+    var seq = ++state.keys.loadSeq;
     state.keys.loading = true;
     state.keys.error = '';
     renderKeys();
     return api.listKeys().then(
       function (data) {
+        if (seq !== state.keys.loadSeq) return;
         state.keys.loading = false;
         state.keys.items = (data && data.items) || [];
         renderKeys();
         renderUsageKeyOptions();
       },
       function (error) {
+        if (seq !== state.keys.loadSeq) return;
+        if (failRequest(error)) return;
         state.keys.loading = false;
         state.keys.error = describeError(error);
-        if (failRequest(error)) return;
         renderKeys();
       }
     );
@@ -2729,6 +2879,16 @@
       if (!isNaN(expiresDate.getTime())) expiresInput.value = localDatetimeValue(expiresDate);
     }
     var errorNode = el('p', { class: 'inline-error', hidden: true, role: 'alert' });
+    // 自定义密钥材料只在新建时提供；编辑永远不下发该字段（服务端会拒绝回传材料）。
+    var customKeyInput = creating
+      ? el('input', {
+          type: 'text',
+          id: 'key-material',
+          placeholder: '留空则由服务端生成',
+          spellcheck: 'false',
+          autocomplete: 'off',
+        })
+      : null;
 
     var handle = openDialog({
       title: creating ? '新建客户端 Key' : '编辑客户端 Key · ' + (spec.label || shortId(existing.id)),
@@ -2762,6 +2922,16 @@
           dailyField.node,
           weeklyField.node,
           monthlyField.node,
+          creating
+            ? el('div', { class: 'field span-all' }, [
+                el('label', { for: 'key-material', text: '自定义密钥（可选，留空由服务端生成）' }),
+                el('p', {
+                  class: 'note',
+                  text: '原样提交、不做裁剪：首尾空白会由服务端校验拒绝，绝不会被悄悄改写。明文密钥只在创建响应中出现一次。',
+                }),
+                customKeyInput,
+              ])
+            : null,
           el('div', { class: 'field span-all' }, [
             el('label', { for: 'key-allowed', text: '允许模型（每行一个精确 ID；留空 = 全部）' }),
             allowedInput,
@@ -2783,6 +2953,8 @@
           type: 'button',
           text: creating ? '创建' : '保存',
           onclick: function () {
+            // 提交进行中忽略重复点击：避免快速双击创建出两个 Key，或把已失效的新密钥当成有效结果展示。
+            if (this.disabled) return;
             var errors = [];
             var fields = {
               label: labelInput.value,
@@ -2794,6 +2966,7 @@
               maxConcurrent: '0',
               allowedModels: splitAllowedModels(allowedInput.value),
             };
+            if (creating) fields.key = customKeyInput.value;
             var concurrent = concurrentInput.value.trim();
             if (concurrent === '') concurrent = '0';
             if (!isIntegerText(concurrent) || concurrent.charAt(0) === '-') {
@@ -2821,7 +2994,13 @@
               return;
             }
             errorNode.hidden = true;
-            saveKey(handle, existing, fields);
+            this.disabled = true;
+            saveKey(handle, existing, fields, function () {
+              // 只有失败时才需要恢复按钮；成功路径会关闭弹窗。
+              handle.root.querySelectorAll('.modal-foot button').forEach(function (node) {
+                node.disabled = false;
+              });
+            });
           },
         }),
       ],
@@ -2829,7 +3008,7 @@
     return handle;
   }
 
-  function saveKey(handle, existing, fields) {
+  function saveKey(handle, existing, fields, onFailure) {
     var editedSpec = keySpecPayload(fields);
     var request;
     if (existing) {
@@ -2850,6 +3029,7 @@
         }
       },
       function (error) {
+        if (onFailure) onFailure();
         if (failRequest(error)) return;
         handle.setError(describeError(error));
       }
@@ -2923,12 +3103,18 @@
           type: 'button',
           text: '确认轮换',
           onclick: function () {
+            // 提交进行中忽略重复点击：轮换不是幂等操作，重复提交会连续换掉两次密钥。
+            if (this.disabled) return;
             if (!confirmInput.checked) {
               handle.setError('请先勾选确认项');
               return;
             }
             handle.setError('');
-            api.rotateKey(key.id, customInput.value.trim()).then(
+            this.disabled = true;
+            var submitButton = this;
+            // 自定义密钥原样提交（不裁剪）：留空才由服务端生成，
+            // 首尾空白交给服务端校验拒绝，避免界面悄悄换成一个用户没输入的密钥。
+            api.rotateKey(key.id, customInput.value).then(
               function (data) {
                 closeDialog();
                 loadKeys(true);
@@ -2939,6 +3125,7 @@
                 }
               },
               function (error) {
+                submitButton.disabled = false;
                 if (failRequest(error)) return;
                 handle.setError(describeError(error));
               }
@@ -2956,19 +3143,22 @@
   function loadPrices(force) {
     if (!state.key) return Promise.resolve();
     if (!force && state.prices.items) return Promise.resolve();
+    var seq = ++state.prices.loadSeq;
     state.prices.loading = true;
     state.prices.error = '';
     renderPrices();
     return api.listPrices().then(
       function (data) {
+        if (seq !== state.prices.loadSeq) return;
         state.prices.loading = false;
         state.prices.items = (data && data.items) || [];
         renderPrices();
       },
       function (error) {
+        if (seq !== state.prices.loadSeq) return;
+        if (failRequest(error)) return;
         state.prices.loading = false;
         state.prices.error = describeError(error);
-        if (failRequest(error)) return;
         renderPrices();
       }
     );
@@ -3094,7 +3284,9 @@
               model: model,
               input: readMoneyInput(inputField, '输入价格', errors),
               output: readMoneyInput(outputField, '输出价格', errors),
-              reasoning: reasoningField.microInput.value.trim() === '' ? '' : readMoneyInput(reasoningField, '思考价格', errors),
+              // 思考价格是可选的：只有两个输入框都留空才表示「按输出计费」。
+              // 只要美元框里有内容就必须校验，否则非法输入会被静默忽略并按输出计费。
+              reasoning: moneyPairEmpty(reasoningField) ? '' : readMoneyInput(reasoningField, '思考价格', errors),
               cacheRead: readMoneyInput(cacheReadField, '缓存读价格', errors),
               cacheWrite: readMoneyInput(cacheWriteField, '缓存写价格', errors),
               version: existing ? existing.version : '0',
@@ -3130,19 +3322,22 @@
   function loadCredentials(force) {
     if (!state.key) return Promise.resolve();
     if (!force && state.credentials.items) return Promise.resolve();
+    var seq = ++state.credentials.loadSeq;
     state.credentials.loading = true;
     state.credentials.error = '';
     renderCredentials();
     return api.credentials().then(
       function (data) {
+        if (seq !== state.credentials.loadSeq) return;
         state.credentials.loading = false;
         state.credentials.items = (data && (data.files || data.items)) || [];
         renderCredentials();
       },
       function (error) {
+        if (seq !== state.credentials.loadSeq) return;
+        if (failRequest(error)) return;
         state.credentials.loading = false;
         state.credentials.error = describeError(error);
-        if (failRequest(error)) return;
         renderCredentials();
       }
     );
@@ -3428,19 +3623,22 @@
   function loadHealth(force) {
     if (!state.key) return Promise.resolve();
     if (!force && state.health.data) return Promise.resolve();
+    var seq = ++state.health.loadSeq;
     state.health.loading = true;
     state.health.error = '';
     renderHealth();
     return api.health().then(
       function (data) {
+        if (seq !== state.health.loadSeq) return;
         state.health.loading = false;
         state.health.data = data || {};
         renderHealth();
       },
       function (error) {
+        if (seq !== state.health.loadSeq) return;
+        if (failRequest(error)) return;
         state.health.loading = false;
         state.health.error = describeError(error);
-        if (failRequest(error)) return;
         renderHealth();
       }
     );
