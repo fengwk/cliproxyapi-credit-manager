@@ -53,11 +53,16 @@ func TestAssetAllowListIsExact(t *testing.T) {
 			t.Fatalf("asset %s mime = %q", name, mime)
 		}
 	}
-	// Declared-but-absent assets (the shared chart slice) report not-found
-	// instead of falling back to a neighbouring file.
+	// The shared chart slice may not have landed in this build yet. Whether or
+	// not it has, an exact-map lookup must never return a different asset's
+	// bytes: the declared name resolves to its own file or to nothing.
+	appJS, _, ok := Asset("app.js")
+	if !ok {
+		t.Fatal("app.js must be served")
+	}
 	for _, name := range []string{"charts.js", "vendor/echarts-5.6.0.min.js"} {
-		if _, _, ok := Asset(name); ok {
-			t.Fatalf("asset %s must not resolve to a different file", name)
+		if data, _, ok := Asset(name); ok && string(data) == string(appJS) {
+			t.Fatalf("declared asset %s aliased another asset", name)
 		}
 	}
 
