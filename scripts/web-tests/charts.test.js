@@ -80,9 +80,11 @@ function deepFreeze(value) {
   return value;
 }
 
+// 时间戳一律带 Z：服务端 bucket 是 UTC，断言也必须是 UTC，才能在任意 TZ 下成立
+// （测试在 TZ=America/Los_Angeles 下运行以验证这一点）。
 const POINTS = [
   {
-    time: '2026-01-02T03:04:05',
+    time: '2026-01-02T03:04:05Z',
     requests: 2,
     executions: 3,
     failed: 1,
@@ -92,7 +94,7 @@ const POINTS = [
     tokens: { input: 1000, output: 2000, cache_read: 300, cache_write: 40, reasoning: 50, total: 3390 },
   },
   {
-    time: '2026-01-02T04:04:05',
+    time: '2026-01-02T04:04:05Z',
     requests: 0,
     executions: 1,
     failed: 0,
@@ -153,22 +155,53 @@ test('金额：USD 微美元精确文本、CNY 按 rate 精确换算', () => {
   assert.equal(CMCharts.formatMoneyMicro('1000000', 'CNY', NaN), '1 CNY');
 });
 
+test('带符号十进制乘法保留负数符号（half away from zero）', () => {
+  assert.equal(CMCharts.multiplyDecimal('-1.25', '7.1', 6), '-8.875');
+  assert.equal(CMCharts.multiplyDecimal('1.25', '-7.1', 6), '-8.875');
+  assert.equal(CMCharts.multiplyDecimal('-1.25', '-7.1', 6), '8.875');
+  assert.equal(CMCharts.multiplyDecimal('-0.000001', '7.1', 6), '-0.000007');
+  assert.equal(CMCharts.multiplyDecimal('-1.25', '7.1', 2), '-8.88'); // 负值进位方向正确
+  assert.equal(CMCharts.multiplyDecimal('0', '-7.1', 6), '0'); // 零不带负号
+  // 负微美元金额：CNY 换算不得丢号。
+  assert.equal(CMCharts.formatMoneyMicro('-1250000', 'CNY', 7.1), '-8.875 CNY');
+  assert.equal(CMCharts.formatMoneyMicro('-1250000', 'USD'), '-1.25 USD');
+});
+
+test('rate 支持科学计数法展开，非法/超界/负数一律有界回退', () => {
+  // '1e-7' 展开为 0.0000001，不再静默返回 '—'。
+  assert.equal(CMCharts.formatMoneyMicro('1250000', 'CNY', '1e-7'), '0 CNY'); // 1.25e-7 四舍五入到 6 位 = 0
+  assert.equal(CMCharts.formatMoneyMicro('1250000', 'CNY', 1e3), '1250 CNY'); // 1.25 * 1000（金额文本不带千分位）
+  assert.equal(CMCharts.formatMoneyMicro('1250000', 'CNY', '1.5E+2'), '187.5 CNY');
+  // 非法/超界/负数/零：回退为 1，输出始终是合法的 CNY 文本（绝不 '—'、绝不 NaN）。
+  for (const bad of [-7, '0', '1e400', '1e-400', 'abc', '', null, undefined, NaN, Infinity]) {
+    const text = CMCharts.formatMoneyMicro('1250000', 'CNY', bad);
+    assert.equal(text, '1.25 CNY', 'rate=' + String(bad));
+  }
+});
+
 test('Token 单位换算精确，raw 千分位，k/wan/m 保留 2 位小数', () => {
   assert.equal(CMCharts.formatTokenCount('12345678', 'raw'), '12,345,678');
   assert.equal(CMCharts.formatTokenCount('12345678', 'k'), '12,345.68');
   assert.equal(CMCharts.formatTokenCount('12345678', 'wan'), '1,234.57');
   assert.equal(CMCharts.formatTokenCount('12345678', 'm'), '12.35');
   assert.equal(CMCharts.formatTokenCount('0', 'k'), '0');
-  assert.equal(CMCharts.tokenText('1500', 'k'), '1.5 K');
+  assert.equal(CMCharts.tokenText('1500', 'k'), '1.5K');
   assert.equal(CMCharts.tokenText('1500', 'raw'), '1,500');
   // 非整数透传，不臆造数值。
   assert.equal(CMCharts.formatTokenCount('', 'k'), '');
 });
 
-test('bucket 标签按 hour/day/month 生成', () => {
-  assert.equal(CMCharts.bucketLabel('2026-01-02T03:04:05', 'hour'), '01-02 03:00');
-  assert.equal(CMCharts.bucketLabel('2026-01-02T03:04:05', 'day'), '01-02');
-  assert.equal(CMCharts.bucketLabel('2026-01-02T03:04:05', 'month'), '2026-01');
+test('bucket 标签按 UTC 生成 hour/day/month（跨月边界不受本地时区影响）', () => {
+  assert.equal(CMCharts.bucketLabel('2026-01-02T03:04:05Z', 'hour'), '01-02 03:00');
+  assert.equal(CMCharts.bucketLabel('2026-01-02T03:04:05Z', 'day'), '01-02');
+  assert.equal(CMCharts.bucketLabel('2026-01-02T03:04:05Z', 'month'), '2026-01');
+  // UTC 月初：在西部时区（TZ=America/Los_Angeles）本地时间仍是 02-28，
+  // 必须按 UTC 标成 03-01 / 2026-03，否则月份分桶会错位。
+  assert.equal(CMCharts.bucketLabel('2026-03-01T00:00:00Z', 'month'), '2026-03');
+  assert.equal(CMCharts.bucketLabel('2026-03-01T00:00:00Z', 'day'), '03-01');
+  assert.equal(CMCharts.bucketLabel('2026-03-01T00:30:00Z', 'hour'), '03-01 00:00');
+  // 同一时刻不同写法：UTC 12:00 的本地日在西部时区会退到前一天，标签必须仍用 UTC 日。
+  assert.equal(CMCharts.bucketLabel('2026-01-02T12:00:00Z', 'day'), '01-02');
   assert.equal(CMCharts.normalizeBucket('week'), 'day');
   assert.equal(CMCharts.normalizeBucket('month'), 'month');
 });
@@ -179,7 +212,7 @@ test('token 合计是互不重叠桶之和，与上报 total 无关，reasoning 
   const model = CMCharts.buildChartOptions(
     [
       {
-        time: '2026-01-02T03:04:05',
+        time: '2026-01-02T03:04:05Z',
         tokens: { input: 1000, output: 2000, cache_read: 300, cache_write: 40, reasoning: 50, total: 99999 },
       },
     ],
@@ -201,7 +234,7 @@ test('Token 五桶互斥：规范化 output 已剔除 reasoning，堆叠不会�
   // 即服务端下发的 tokens.output 不含 reasoning，tokens_output 与 tokens_reasoning
   // 是两条独立列；因此五桶可安全堆叠，reasoning 只计一次。
   const model = CMCharts.buildChartOptions(
-    [{ time: '2026-01-02T03:04:05', tokens: { input: 10, output: 20, cache_read: 30, cache_write: 40, reasoning: 50, total: 150 } }],
+    [{ time: '2026-01-02T03:04:05Z', tokens: { input: 10, output: 20, cache_read: 30, cache_write: 40, reasoning: 50, total: 150 } }],
     { tokenUnit: 'raw' }
   );
   const tokens = model.points[0].tokens;
@@ -237,7 +270,8 @@ test('buildChartOptions 产出请求/Token/成本三张图', () => {
     ['输入', '输出', '缓存读', '缓存写', '思考']
   );
   assert.ok(model.tokens.series.every((s) => s.stack === 'tokens'));
-  assert.deepEqual(model.tokens.series.map((s) => s.data[0]), [1000, 2000, 300, 40, 50]);
+  // tokenUnit='k' 时几何坐标按 /1000 缩放（与坐标轴单位一致）。
+  assert.deepEqual(model.tokens.series.map((s) => s.data[0]), [1, 2, 0.3, 0.04, 0.05]);
 
   // 成本：执行成本与人工补记两条独立序列，没有合并序列。
   assert.deepEqual(
@@ -261,7 +295,7 @@ test('buildChartOptions 空数据返回空模型且不构造 option', () => {
 });
 
 test('零值不产生 NaN，坐标轴仍固定 min:0', () => {
-  const zero = [{ time: '2026-01-02T03:04:05', requests: 0, executions: 0, cost_micro_usd: 0, adjustment_micro_usd: 0, tokens: {} }];
+  const zero = [{ time: '2026-01-02T03:04:05Z', requests: 0, executions: 0, cost_micro_usd: 0, adjustment_micro_usd: 0, tokens: {} }];
   const model = CMCharts.buildChartOptions(zero, { tokenUnit: 'k' });
   assert.equal(model.empty, false);
   for (const option of [model.requests, model.tokens, model.cost]) {
@@ -276,10 +310,37 @@ test('零值不产生 NaN，坐标轴仍固定 min:0', () => {
 test('超过 10 个点启用 dataZoom，少量点关闭', () => {
   const many = [];
   for (let i = 0; i < 11; i++) {
-    many.push({ time: '2026-01-02T0' + (i % 10) + ':04:05', tokens: {} });
+    many.push({ time: '2026-01-02T0' + (i % 10) + ':04:05Z', tokens: {} });
   }
   assert.equal(CMCharts.buildChartOptions(many, {}).tokens.dataZoom.length, 2);
   assert.equal(CMCharts.buildChartOptions(POINTS, {}).tokens.dataZoom.length, 0);
+});
+
+test('tokenUnit 缩放几何坐标，与坐标轴 formatter 单位一致（不是 12500K）', () => {
+  const point = { time: '2026-01-02T00:00:00Z', tokens: { input: 12500, output: 0, cache_read: 0, cache_write: 0, reasoning: 0, total: 12500 } };
+
+  const scaled = CMCharts.buildChartOptions([point], { tokenUnit: 'k' });
+  const inputSeries = scaled.tokens.series[0];
+  const fmt = scaled.tokens.yAxis[0].axisLabel.formatter;
+  assert.equal(inputSeries.data[0], 12.5); // 12500 个 token -> 12.5（以 k 为单位）
+  assert.equal(fmt(12.5), '12.5K'); // 轴与几何同单位
+  assert.equal(fmt(12500), '12,500K'); // 若几何未缩放，就正好会得到这个错误标注
+  // 精确 tooltip 仍是同一单位（12.5K == 12500 tokens）。
+  assert.match(scaled.tokens.tooltip.formatter([{ dataIndex: 0 }]), /输入：12.5K/);
+
+  // raw 单位：几何即为原始整数。
+  const raw = CMCharts.buildChartOptions([point], { tokenUnit: 'raw' });
+  assert.equal(raw.tokens.series[0].data[0], 12500);
+  assert.equal(raw.tokens.yAxis[0].axisLabel.formatter(12500), '12,500');
+  assert.match(raw.tokens.tooltip.formatter([{ dataIndex: 0 }]), /输入：12,500/);
+
+  // wan / m 同样按 1e4 / 1e6 缩放，轴与数据一致。
+  const wan = CMCharts.buildChartOptions([point], { tokenUnit: 'wan' });
+  assert.equal(wan.tokens.series[0].data[0], 1.25);
+  assert.equal(wan.tokens.yAxis[0].axisLabel.formatter(1.25), '1.25万');
+  const million = CMCharts.buildChartOptions([point], { tokenUnit: 'm' });
+  assert.equal(million.tokens.series[0].data[0], 0.0125);
+  assert.equal(million.tokens.yAxis[0].axisLabel.formatter(0.0125), '0.01M');
 });
 
 // --- tooltip：纯文本、精确、无注入 ------------------------------------------
@@ -291,17 +352,18 @@ test('tooltip 使用 richText 且输出纯文本，无 HTML 注入面', () => {
     assert.equal(typeof option.tooltip.formatter, 'function');
   }
   // 逐条精确比对：纯文本、`\n` 换行、精确整数/金额，且不含任何 HTML 元字符。
+  // tooltip 首行必须显式标注 UTC，说明聚合口径。
   assert.equal(
     model.requests.tooltip.formatter([{ dataIndex: 0 }]),
-    '2026-01-02 03:04:05\n请求次数：2\n执行次数：3\n失败请求：1\n未结算请求：0'
+    '2026-01-02 03:04:05 UTC\n请求次数：2\n执行次数：3\n失败请求：1\n未结算请求：0'
   );
   assert.equal(
     model.tokens.tooltip.formatter([{ dataIndex: 0 }]),
-    '2026-01-02 03:04:05\n输入：1,000\n输出：2,000\n缓存读：300\n缓存写：40\n思考：50\n合计：3,390'
+    '2026-01-02 03:04:05 UTC\n输入：1,000\n输出：2,000\n缓存读：300\n缓存写：40\n思考：50\n合计：3,390'
   );
   assert.equal(
     model.cost.tooltip.formatter([{ dataIndex: 0 }]),
-    '2026-01-02 03:04:05\n执行成本：1.25 USD\n人工补记：0.5 USD（独立记账，不计入执行成本）'
+    '2026-01-02 03:04:05 UTC\n执行成本：1.25 USD\n人工补记：0.5 USD（独立记账，不计入执行成本）'
   );
   const text = [
     model.requests.tooltip.formatter([{ dataIndex: 0 }]),
@@ -323,7 +385,7 @@ test('tooltip 精确展示大整数与金额，人工补记独立不合并', () 
   const cost = model.cost.tooltip.formatter([{ dataIndex: 1 }]);
   assert.equal(
     cost,
-    '2026-01-02 04:04:05\n执行成本：9007199254.740993 USD\n人工补记：0 USD（独立记账，不计入执行成本）'
+    '2026-01-02 04:04:05 UTC\n执行成本：9007199254.740993 USD\n人工补记：0 USD（独立记账，不计入执行成本）'
   );
   // 请求 tooltip 使用精确整数（失败/未结算按 0 兜底）。
   const requests = model.requests.tooltip.formatter([{ dataIndex: 0 }]);

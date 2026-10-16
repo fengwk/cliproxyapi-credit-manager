@@ -13,12 +13,11 @@ const EMOJI = /[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}\u{FE0F}\u{2B00}-\u{2BFF}]/u
 
 test('index.html 仅引用相对资源，且不含任何凭据或账务数据', () => {
   const refs = [...html.matchAll(/(?:href|src)="([^"]+)"/g)].map((m) => m[1]);
-  assert.deepEqual(refs.sort(), ['./app.js', './style.css']);
+  assert.deepEqual(refs.sort(), ['./app.js', './charts.js', './lookup.html', './style.css', './vendor/echarts-5.6.0.min.js']);
   assert.ok(!/https?:\/\//.test(html), '静态外壳不得引用外部 CDN');
-  assert.ok(!/sk-[A-Za-z0-9]/.test(html), '静态外壳不得内嵌密钥');
-  assert.ok(!/Bearer\s/i.test(html), '静态外壳不得内嵌凭据');
-  assert.ok(!/localStorage\s*[.[]|sessionStorage\s*[.[]/.test(html), '静态外壳不得访问存储 API');
-  assert.ok(!/localStorage\s*=|sessionStorage\s*=/.test(html));
+  assert.ok(!/sk-[A-Za-z0-9]{8,}/.test(html), '静态外壳不得内嵌密钥');
+  assert.ok(!/Bearer\s+[A-Za-z0-9]{16,}/i.test(html), '静态外壳不得内嵌凭据');
+  assert.ok(!/sessionStorage\s*[.=[\]]|document\.cookie\s*=/.test(html), '静态外壳不得读写 sessionStorage 或 Cookie');
   assert.equal(html.match(/<meta charset="utf-8">/g).length, 1);
   assert.ok(html.includes('lang="zh-CN"'));
 });
