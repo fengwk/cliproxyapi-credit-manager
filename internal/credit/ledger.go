@@ -428,3 +428,81 @@ func checkedAdd(a, b int64) (int64, error) {
 	}
 	return a + b, nil
 }
+
+// baselineMoney reads the reset baseline of one money window/period. An absent
+// baseline means no reset ever happened for that window, so the durable counter
+// is the effective usage.
+func baselineMoney(ctx context.Context, q querier, keyID, win, period string) (int64, error) {
+	return counterValue(ctx, q, `SELECT micro_usd FROM key_money_baselines WHERE key_id=? AND win=? AND period=?`,
+		keyID, win, period)
+}
+
+// baselineToken reads the reset baseline of one model token window/period.
+func baselineToken(ctx context.Context, q querier, keyID, model, win, period string) (int64, error) {
+	return counterValue(ctx, q, `SELECT tokens FROM key_token_baselines WHERE key_id=? AND model=? AND win=? AND period=?`,
+		keyID, model, win, period)
+}
+
+// effectiveUsage is the quota view of a durable counter: the part accrued after
+// the last reset. A reset never zeroes the durable counter, so this is always
+// the durable value minus its baseline, floored at zero so a stale or repeated
+// baseline can never produce a negative usage or a refund.
+func effectiveUsage(durable, baseline int64) int64 {
+	if durable <= baseline {
+		return 0
+	}
+	return durable - baseline
+}
+
+// effectiveMoney resolves the effective money usage of one window/period from
+// the durable counter and its reset baseline.
+func effectiveMoney(ctx context.Context, q querier, keyID, win, period string, durable int64) (int64, error) {
+	base, err := baselineMoney(ctx, q, keyID, win, period)
+	if err != nil {
+		return 0, err
+	}
+	return effectiveUsage(durable, base), nil
+}
+
+// effectiveToken resolves the effective token usage of one model window/period.
+func effectiveToken(ctx context.Context, q querier, keyID, model, win, period string, durable int64) (int64, error) {
+	base, err := baselineToken(ctx, q, keyID, model, win, period)
+	if err != nil {
+		return 0, err
+	}
+	return effectiveUsage(durable, base), nil
+}
+
+// hydrateEffectiveUsage fills the effective (post reset) usage view of a key
+// row: the lifetime total from the durable spent column plus the current day,
+// week and month money counters. It is used by the management read paths only;
+// admission reads the same values with the store clock at reservation time.
+func (s *Store) hydrateEffectiveUsage(ctx context.Context, q querier, k *keyRow) error {
+	now := s.nowUTC()
+	base, err := baselineMoney(ctx, q, k.id, windowTotal, periodOf(windowTotal, now))
+	if err != nil {
+		return err
+	}
+	k.quotaUsed = effectiveUsage(k.spent, base)
+	windows := []struct {
+		win string
+		dst *int64
+	}{
+		{windowDay, &k.dayUsed},
+		{windowWeek, &k.weekUsed},
+		{windowMonth, &k.monthUsed},
+	}
+	for _, w := range windows {
+		period := periodOf(w.win, now)
+		durable, err := moneyCounter(ctx, q, k.id, w.win, period)
+		if err != nil {
+			return err
+		}
+		effective, err := effectiveMoney(ctx, q, k.id, w.win, period, durable)
+		if err != nil {
+			return err
+		}
+		*w.dst = effective
+	}
+	return nil
+}

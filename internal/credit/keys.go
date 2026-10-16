@@ -22,6 +22,16 @@ type keyRow struct {
 	createdAt   time.Time
 	spent       int64
 	held        int64
+	// materialEnc is the AES-256-GCM sealed key material. It never leaves the
+	// store except through RevealKey, which decrypts and re-verifies it.
+	materialEnc []byte
+	callerID    string
+	deletedAt   *time.Time
+	// Effective (post reset) usage view, filled by hydrateEffectiveUsage.
+	quotaUsed int64
+	dayUsed   int64
+	weekUsed  int64
+	monthUsed int64
 }
 
 func (k *keyRow) toKey() Key {
@@ -29,14 +39,20 @@ func (k *keyRow) toKey() Key {
 	spec.Material = "" // material must never leave the store
 	spec.ModelTokenLimits = slices.Clone(k.spec.ModelTokenLimits)
 	return Key{
-		ID:            k.id,
-		Principal:     k.principal,
-		Scope:         k.scope,
-		Fingerprint:   k.fingerprint,
-		Spec:          spec,
-		SpentMicroUSD: k.spent,
-		HeldMicroUSD:  k.held,
-		CreatedAt:     k.createdAt,
+		ID:                  k.id,
+		Principal:           k.principal,
+		Scope:               k.scope,
+		Fingerprint:         k.fingerprint,
+		Spec:                spec,
+		SpentMicroUSD:       k.spent,
+		HeldMicroUSD:        k.held,
+		QuotaUsedMicroUSD:   k.quotaUsed,
+		DailyUsedMicroUSD:   k.dayUsed,
+		WeeklyUsedMicroUSD:  k.weekUsed,
+		MonthlyUsedMicroUSD: k.monthUsed,
+		CallerID:            k.callerID,
+		DeletedAt:           k.deletedAt,
+		CreatedAt:           k.createdAt,
 	}
 }
 
@@ -47,7 +63,7 @@ type keyColumnQuerier interface {
 
 const keyColumns = `id, principal, scope, fingerprint, hmac, label, enabled, quota_micro_usd,
 	daily_micro_usd, weekly_micro_usd, monthly_micro_usd, max_concurrent, allowed_models,
-	expires_at, created_at, spent_micro_usd, held_micro_usd`
+	expires_at, created_at, spent_micro_usd, held_micro_usd, key_material_enc, caller_id, deleted_at`
 
 func scanKeyRow(scan func(...any) error) (*keyRow, error) {
 	var (
@@ -57,18 +73,24 @@ func scanKeyRow(scan func(...any) error) (*keyRow, error) {
 		allowedRaw string
 		expires    sql.NullInt64
 		created    int64
+		material   []byte
+		deleted    sql.NullInt64
 	)
 	if err := scan(&k.id, &k.principal, &k.scope, &k.fingerprint, &k.hmac, &label, &enabled,
 		&k.spec.QuotaMicroUSD, &k.spec.DailyMicroUSD, &k.spec.WeeklyMicroUSD, &k.spec.MonthlyMicroUSD,
-		&k.spec.MaxConcurrent, &allowedRaw, &expires, &created, &k.spent, &k.held); err != nil {
+		&k.spec.MaxConcurrent, &allowedRaw, &expires, &created, &k.spent, &k.held,
+		&material, &k.callerID, &deleted); err != nil {
 		return nil, err
 	}
+	k.materialEnc = material
+	k.deletedAt = scanNano(deleted)
 	k.spec.Label = label
 	k.spec.Enabled = enabled != 0
 	k.spec.ExpiresAt = scanNano(expires)
 	if err := json.Unmarshal([]byte(allowedRaw), &k.spec.AllowedModels); err != nil {
 		return nil, fmt.Errorf("%w: corrupt allowed_models for key %s", ErrInvalid, k.id)
 	}
+	k.spec.CallerID = k.callerID
 	k.createdAt = fromUnixNano(created)
 	return &k, nil
 }
@@ -123,6 +145,7 @@ func hydrateLimits(ctx context.Context, q limitsQuerier, k *keyRow) error {
 func normalizeSpec(spec KeySpec) (KeySpec, error) {
 	out := spec
 	out.Material = ""
+	out.CallerID = strings.TrimSpace(spec.CallerID)
 	if spec.QuotaMicroUSD < 0 || spec.DailyMicroUSD < 0 || spec.WeeklyMicroUSD < 0 || spec.MonthlyMicroUSD < 0 {
 		return out, fmt.Errorf("%w: monetary limits must not be negative", ErrInvalid)
 	}
@@ -259,23 +282,38 @@ func (s *Store) CreateKey(ctx context.Context, spec KeySpec) (Key, string, error
 	// otherwise the native layer can never resolve a request back to this key.
 	scope := callerScope(principalValue)
 	hmac := materialHMAC(s.pepper, material)
+	// Sealing the material before the transaction keeps the transaction short
+	// while guaranteeing the ciphertext is written atomically with the key.
+	sealed, err := encryptMaterial(s.pepper, material)
+	if err != nil {
+		return Key{}, "", err
+	}
 	now := s.nowUTC()
 	var out Key
 	err = s.inTx(ctx, func(tx *sql.Tx) error {
 		if err := checkMaterialFree(ctx, tx, hmac, ""); err != nil {
 			return err
 		}
+		if err := requireCaller(ctx, tx, norm.CallerID); err != nil {
+			return err
+		}
 		if _, err := tx.ExecContext(ctx, `INSERT INTO keys
 			(id, principal, scope, fingerprint, hmac, label, enabled, quota_micro_usd,
 			 daily_micro_usd, weekly_micro_usd, monthly_micro_usd, max_concurrent,
-			 allowed_models, expires_at, created_at, spent_micro_usd, held_micro_usd)
-			VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,0)`,
+			 allowed_models, expires_at, created_at, spent_micro_usd, held_micro_usd,
+			 key_material_enc, caller_id, deleted_at)
+			VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,0,?,?,NULL)`,
 			id, principalValue, scope, fingerprintOf(hmac), hmac,
 			norm.Label, boolInt(norm.Enabled), norm.QuotaMicroUSD, norm.DailyMicroUSD, norm.WeeklyMicroUSD,
-			norm.MonthlyMicroUSD, norm.MaxConcurrent, allowed, nullableNano(norm.ExpiresAt), unixNano(now)); err != nil {
+			norm.MonthlyMicroUSD, norm.MaxConcurrent, allowed, nullableNano(norm.ExpiresAt), unixNano(now),
+			sealed, norm.CallerID); err != nil {
 			return fmt.Errorf("insert key: %w", err)
 		}
 		if err := s.insertLimits(ctx, tx, id, norm.ModelTokenLimits); err != nil {
+			return err
+		}
+		if err := insertAudit(ctx, tx, now, ActionCreate, id, norm.CallerID, "",
+			"fingerprint="+fingerprintOf(hmac)); err != nil {
 			return err
 		}
 		out = Key{
@@ -284,6 +322,7 @@ func (s *Store) CreateKey(ctx context.Context, spec KeySpec) (Key, string, error
 			Scope:       scope,
 			Fingerprint: fingerprintOf(hmac),
 			Spec:        norm,
+			CallerID:    norm.CallerID,
 			CreatedAt:   now,
 		}
 		return nil
@@ -319,14 +358,21 @@ func (s *Store) UpdateKey(ctx context.Context, id string, spec KeySpec) (Key, er
 		if err != nil {
 			return err
 		}
+		if key.deletedAt != nil {
+			return fmt.Errorf("%w: key is deleted", ErrConflict)
+		}
 		if err := hydrateLimits(ctx, tx, key); err != nil {
+			return err
+		}
+		if err := requireCaller(ctx, tx, norm.CallerID); err != nil {
 			return err
 		}
 		if _, err := tx.ExecContext(ctx, `UPDATE keys SET label=?, enabled=?, quota_micro_usd=?,
 			daily_micro_usd=?, weekly_micro_usd=?, monthly_micro_usd=?, max_concurrent=?,
-			allowed_models=?, expires_at=? WHERE id=?`,
+			allowed_models=?, expires_at=?, caller_id=? WHERE id=?`,
 			norm.Label, boolInt(norm.Enabled), norm.QuotaMicroUSD, norm.DailyMicroUSD, norm.WeeklyMicroUSD,
-			norm.MonthlyMicroUSD, norm.MaxConcurrent, allowed, nullableNano(norm.ExpiresAt), key.id); err != nil {
+			norm.MonthlyMicroUSD, norm.MaxConcurrent, allowed, nullableNano(norm.ExpiresAt),
+			norm.CallerID, key.id); err != nil {
 			return fmt.Errorf("update key: %w", err)
 		}
 		if _, err := tx.ExecContext(ctx, `DELETE FROM model_token_limits WHERE key_id = ?`, key.id); err != nil {
@@ -336,6 +382,13 @@ func (s *Store) UpdateKey(ctx context.Context, id string, spec KeySpec) (Key, er
 			return err
 		}
 		key.spec = norm
+		key.callerID = norm.CallerID
+		if err := s.hydrateEffectiveUsage(ctx, tx, key); err != nil {
+			return err
+		}
+		if err := insertAudit(ctx, tx, s.nowUTC(), ActionUpdate, key.id, norm.CallerID, "", ""); err != nil {
+			return err
+		}
 		out = key.toKey()
 		return nil
 	})
@@ -361,11 +414,18 @@ func (s *Store) RotateKey(ctx context.Context, id string, custom string) (Key, s
 		return Key{}, "", err
 	}
 	hmac := materialHMAC(s.pepper, material)
+	sealed, err := encryptMaterial(s.pepper, material)
+	if err != nil {
+		return Key{}, "", err
+	}
 	var out Key
 	err = s.inTx(ctx, func(tx *sql.Tx) error {
 		key, err := loadKey(ctx, tx, "id = ?", id)
 		if err != nil {
 			return err
+		}
+		if key.deletedAt != nil {
+			return fmt.Errorf("%w: key is deleted", ErrConflict)
 		}
 		if err := hydrateLimits(ctx, tx, key); err != nil {
 			return err
@@ -376,12 +436,20 @@ func (s *Store) RotateKey(ctx context.Context, id string, custom string) (Key, s
 		if err := checkMaterialFree(ctx, tx, hmac, key.id); err != nil {
 			return err
 		}
-		if _, err := tx.ExecContext(ctx, `UPDATE keys SET hmac=?, fingerprint=? WHERE id=?`,
-			hmac, fingerprintOf(hmac), key.id); err != nil {
+		if _, err := tx.ExecContext(ctx, `UPDATE keys SET hmac=?, fingerprint=?, key_material_enc=? WHERE id=?`,
+			hmac, fingerprintOf(hmac), sealed, key.id); err != nil {
 			return fmt.Errorf("rotate key: %w", err)
 		}
 		key.hmac = hmac
 		key.fingerprint = fingerprintOf(hmac)
+		key.materialEnc = sealed
+		if err := s.hydrateEffectiveUsage(ctx, tx, key); err != nil {
+			return err
+		}
+		if err := insertAudit(ctx, tx, s.nowUTC(), ActionRotate, key.id, key.callerID, "",
+			"fingerprint="+fingerprintOf(hmac)); err != nil {
+			return err
+		}
 		out = key.toKey()
 		return nil
 	})
@@ -404,6 +472,9 @@ func (s *Store) ListKeys(ctx context.Context) ([]Key, error) {
 	out := make([]Key, 0, len(all))
 	for _, k := range all {
 		if err := hydrateLimits(ctx, s.db, k); err != nil {
+			return nil, err
+		}
+		if err := s.hydrateEffectiveUsage(ctx, s.db, k); err != nil {
 			return nil, err
 		}
 		out = append(out, k.toKey())
@@ -437,6 +508,9 @@ func (s *Store) GetKey(ctx context.Context, id string) (Key, error) {
 	if err := hydrateLimits(ctx, s.db, key); err != nil {
 		return Key{}, err
 	}
+	if err := s.hydrateEffectiveUsage(ctx, s.db, key); err != nil {
+		return Key{}, err
+	}
 	return key.toKey(), nil
 }
 
@@ -458,6 +532,11 @@ func (s *Store) Authenticate(ctx context.Context, material string) (Key, error) 
 	}
 	if err := hydrateLimits(ctx, s.db, key); err != nil {
 		return Key{}, err
+	}
+	if key.deletedAt != nil {
+		// A soft deleted key is permanently unusable for authentication even if
+		// a later write were to set enabled again.
+		return Key{}, ErrUnauthorized
 	}
 	if !key.spec.Enabled {
 		return Key{}, ErrUnauthorized
