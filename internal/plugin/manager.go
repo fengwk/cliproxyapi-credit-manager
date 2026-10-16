@@ -432,7 +432,7 @@ func (m *Manager) resumeAttached(reg registration) ([]byte, error) {
 // newLiveState builds the serving snapshot and connects runtime diagnostics.
 func (m *Manager) newLiveState(store credit.Backend, captures *capture.Store, cfg config.Config) *liveState {
 	handler := web.New(store, captures, cfg)
-	handler.SetStatus(metadataVersion(), m.LastError)
+	handler.SetStatus(diagnosticVersion(), m.LastError)
 	return &liveState{store: store, captures: captures, handler: handler, cfg: cfg}
 }
 

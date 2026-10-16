@@ -17,7 +17,7 @@ def case(name, expects):
 
 
 @case("native.registration",
-      "host loads the plugin: enabled, metadata present with the expected build version, management menu published")
+      "host loads the plugin: enabled, metadata present with the expected bare release version, management menu published")
 def registration(ctx):
     raw = ctx.host.plugin_registration()
     entries = {entry["id"]: entry for entry in raw.get("plugins", [])}
@@ -49,11 +49,12 @@ def health(ctx):
     registered = ctx.host.plugin_registration()
     entry = next((e for e in registered.get("plugins", []) if e.get("id") == ctx.plugin_id), {})
     registered_version = (entry.get("metadata") or {}).get("version")
-    # The health version must be exactly the version the host registered, and
-    # both must identify the expected build.
-    ctx.assert_plugin_version(data.get("version"), "health version")
-    check_eq(data.get("version"), registered_version,
-             "health version must equal the registered plugin version")
+    # The registration metadata is the bare release; the health diagnostic
+    # version reports the same release and may carry the build commit.
+    ctx.assert_plugin_version(registered_version, "registered metadata version")
+    ctx.assert_diagnostics_version(data.get("version"), "health version")
+    check_eq((data.get("version") or "").partition("+")[0], (registered_version or "").partition("+")[0],
+             "health version must report the same release as the registered metadata")
     check("capture" in data and "retention_months" in data and "capture_enabled" in data,
           f"health fields missing: {sorted(data)}")
     check_eq(data.get("last_error"), "", "health last_error")

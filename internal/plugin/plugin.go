@@ -54,13 +54,28 @@ func Metadata() pluginapi.Metadata {
 	}
 }
 
-// metadataVersion composes the release version with the full build commit so
-// the reported version identifies the exact source revision.
+// metadataVersion is the release version reported to the host as registration
+// metadata. It is deliberately a bare dotted release number: the CPA plugin
+// store compares an installed metadata version with the registry release
+// segment by segment (pluginstore.UpdateAvailable), and a build suffix such as
+// "+<commit>" makes that comparison non-numeric, so the host would always offer
+// a spurious update even for the exact released build. Build provenance is
+// exposed through runtime diagnostics instead. See diagnosticVersion.
 func metadataVersion() string {
 	version := strings.TrimSpace(PluginVersion)
 	if version == "" {
-		version = "0.0.0"
+		return "0.0.0"
 	}
+	return version
+}
+
+// diagnosticVersion is the human-facing build identity used by runtime
+// diagnostics (the management health endpoint). It keeps the full build commit
+// so an operator can identify the exact source revision, which the numeric-only
+// metadata version deliberately omits so the host's plugin store can compare
+// versions.
+func diagnosticVersion() string {
+	version := metadataVersion()
 	commit := strings.TrimSpace(GitCommit)
 	if commit == "" {
 		return version

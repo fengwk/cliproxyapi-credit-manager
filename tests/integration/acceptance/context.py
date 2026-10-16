@@ -11,8 +11,9 @@ from .host import Host, HostConfig
 from .mock import UpstreamMock, free_port
 from .report import CaseFailure
 
-#: A build commit is always injected by this project's Makefile, so a plugin
-#: version that carries no 40-hex commit is a misbuild, not a valid release.
+#: A build commit is a 40-hex hash. The registration metadata version is a bare
+#: release number; the health diagnostic version may carry this commit as a
+#: "+<commit>" suffix so the exact build stays identifiable.
 COMMIT_RE = re.compile(r"[0-9a-f]{40}")
 
 
@@ -25,11 +26,16 @@ class Context:
         self.plugin_id = plugin_id
         self.expected_version = expected_version
         self.expected_commit = (expected_commit or "").strip().lower()
-        # With an explicit commit the whole "<version>+<commit>" identity is
-        # asserted exactly; without one the base version must match exactly and
-        # the commit part must still be a real 40-hex build commit.
-        self.expected_metadata = (f"{self.expected_version}+{self.expected_commit}"
-                                  if self.expected_commit else None)
+        # The registration metadata version is a bare release number: the host's
+        # plugin store compares it numerically, so a build suffix would make the
+        # comparison non-numeric and always offer a spurious update. The build
+        # provenance is reported separately by the health diagnostic version.
+        self.expected_metadata = self.expected_version
+        # With an explicit commit the health diagnostic version must equal
+        # "<version>+<commit>" exactly; without one the release part must match
+        # and, when a commit part is present, it must be a 40-hex commit.
+        self.expected_diagnostics = (f"{self.expected_version}+{self.expected_commit}"
+                                     if self.expected_commit else None)
         self.management_secret = "synthetic-management-guard"
         self.original_client_key = "synthetic-original-cpa-client"
         self.openai_upstream_keys = ["synthetic-openai-upstream-a", "synthetic-openai-upstream-b"]
@@ -43,25 +49,39 @@ class Context:
 
     # -- expected build identity -------------------------------------------
     def plugin_version_error(self, actual) -> str | None:
-        """Return why a plugin-reported version is not the expected build, or None."""
+        """Return why a plugin-reported metadata version is not the expected release, or None."""
         if not isinstance(actual, str) or not actual:
             return f"missing plugin version: {actual!r}"
-        if self.expected_metadata is not None:
-            if actual != self.expected_metadata:
-                return f"version {actual!r} != expected {self.expected_metadata!r}"
-            return None
+        if actual != self.expected_metadata:
+            return f"metadata version {actual!r} != expected release {self.expected_metadata!r}"
+        if "+" in actual:
+            return f"metadata version {actual!r} must be a bare release number without a build suffix"
+        return None
+
+    def diagnostics_version_error(self, actual) -> str | None:
+        """Return why a health diagnostic version is not the expected build, or None."""
+        if not isinstance(actual, str) or not actual:
+            return f"missing diagnostic version: {actual!r}"
         version, sep, commit = actual.partition("+")
         if version != self.expected_version:
-            return (f"version {actual!r} base {version!r} != expected "
+            return (f"diagnostic version {actual!r} release {version!r} != expected "
                     f"{self.expected_version!r}")
-        if not sep:
-            return f"version {actual!r} carries no build commit"
-        if COMMIT_RE.fullmatch(commit) is None:
-            return f"version {actual!r} commit {commit!r} is not a 40-hex commit"
+        if self.expected_diagnostics is not None:
+            if actual != self.expected_diagnostics:
+                return f"diagnostic version {actual!r} != expected {self.expected_diagnostics!r}"
+            return None
+        if sep and COMMIT_RE.fullmatch(commit) is None:
+            return f"diagnostic version {actual!r} commit {commit!r} is not a 40-hex commit"
         return None
 
     def assert_plugin_version(self, actual, label="plugin version") -> str:
         error = self.plugin_version_error(actual)
+        if error:
+            raise CaseFailure(f"{label}: {error}")
+        return actual
+
+    def assert_diagnostics_version(self, actual, label="diagnostic version") -> str:
+        error = self.diagnostics_version_error(actual)
         if error:
             raise CaseFailure(f"{label}: {error}")
         return actual
@@ -71,6 +91,7 @@ class Context:
             "expected_version": self.expected_version,
             "expected_commit": self.expected_commit,
             "expected_metadata": self.expected_metadata,
+            "expected_diagnostics": self.expected_diagnostics,
         }
 
     # -- lifecycle ---------------------------------------------------------

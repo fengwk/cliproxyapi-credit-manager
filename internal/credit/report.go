@@ -39,7 +39,7 @@ func (s *Store) Report(ctx context.Context, f Filter) (Report, error) {
 	if err != nil {
 		return Report{}, err
 	}
-	bucket := bucketSize(f.Bucket)
+	bucketExpr, bucketArgs := trendBucket(f.Bucket)
 
 	// All derived numbers come from one read transaction so a concurrent writer
 	// cannot make the page, the total and the trend disagree.
@@ -53,7 +53,7 @@ func (s *Store) Report(ctx context.Context, f Filter) (Report, error) {
 		if err != nil {
 			return err
 		}
-		trend, err := s.reportTrend(ctx, q, where, args, execWhere, execArgs, bucket)
+		trend, err := s.reportTrend(ctx, q, where, args, execWhere, execArgs, bucketExpr, bucketArgs)
 		if err != nil {
 			return err
 		}
@@ -107,12 +107,30 @@ func pageOffset(page, size int) (int64, error) {
 	return (p - 1) * s, nil
 }
 
-// bucketSize maps the requested bucket to nanoseconds; unknown values mean day.
-func bucketSize(bucket string) int64 {
-	if strings.EqualFold(strings.TrimSpace(bucket), "hour") {
-		return int64(time.Hour)
+// monthBucketExpr groups rows by their true UTC calendar month. SQLite stores
+// started_at as nanoseconds since the epoch, so dividing by 1e9 yields whole UTC
+// seconds and strftime(..., 'start of month') returns that month's UTC first
+// second; scaling back to nanoseconds matches the hour and day bucket encoding,
+// which is what Point.Time decodes. A constant width cannot express a calendar
+// month, so this is derived from the date rather than from an integer division.
+const monthBucketExpr = `CAST(strftime('%s', r.started_at/1000000000, 'unixepoch', 'start of month') AS INTEGER) * 1000000000`
+
+// trendBucket maps the requested bucket to its SQL grouping expression and
+// arguments. Hour and day are fixed offsets from the Unix epoch, which is a UTC
+// midnight, so integer division already lands on true UTC hour and day starts.
+// A calendar month is unequal length and uses the date function above. Any other
+// value keeps the day fallback.
+func trendBucket(requested string) (string, []any) {
+	switch strings.ToLower(strings.TrimSpace(requested)) {
+	case "hour":
+		const hour = int64(time.Hour)
+		return "(r.started_at / ?) * ?", []any{hour, hour}
+	case "month":
+		return monthBucketExpr, nil
+	default:
+		const day = int64(24 * time.Hour)
+		return "(r.started_at / ?) * ?", []any{day, day}
 	}
-	return int64(24 * time.Hour)
 }
 
 // failedOutcomeList is the shared definition of a non-successful outcome.
@@ -273,14 +291,14 @@ func adjustmentTotals(ctx context.Context, q querier, where string, args []any) 
 	return total, nil
 }
 
-func (s *Store) reportTrend(ctx context.Context, q querier, where string, args []any, execWhere string, execArgs []any, bucket int64) ([]Point, error) {
+func (s *Store) reportTrend(ctx context.Context, q querier, where string, args []any, execWhere string, execArgs []any, bucketExpr string, bucketArgs []any) ([]Point, error) {
 	points := map[int64]*Summary{}
 	order := []int64{}
-	requestRows, err := q.QueryContext(ctx, `SELECT (r.started_at / ?) * ? AS bucket, COUNT(*),
+	requestRows, err := q.QueryContext(ctx, `SELECT `+bucketExpr+` AS bucket, COUNT(*),
 		COALESCE(SUM(CASE WHEN r.outcome IN `+failedOutcomeList+` THEN 1 ELSE 0 END),0),
 		COALESCE(SUM(CASE WHEN r.state IN ('`+stateActive+`','`+statePending+`') THEN 1 ELSE 0 END),0)
 		FROM requests r WHERE `+where+` GROUP BY bucket ORDER BY bucket`,
-		append([]any{bucket, bucket}, args...)...)
+		append(append([]any{}, bucketArgs...), args...)...)
 	if err != nil {
 		return nil, fmt.Errorf("trend requests: %w", err)
 	}
@@ -302,10 +320,10 @@ func (s *Store) reportTrend(ctx context.Context, q querier, where string, args [
 	}
 	requestRows.Close()
 
-	execRows, err := q.QueryContext(ctx, `SELECT (r.started_at / ?) * ? AS bucket, `+execAggregate+`
+	execRows, err := q.QueryContext(ctx, `SELECT `+bucketExpr+` AS bucket, `+execAggregate+`
 		FROM usages u JOIN requests r ON r.id = u.request_id
 		WHERE `+where+` AND `+execWhere+` GROUP BY bucket ORDER BY bucket`,
-		append([]any{bucket, bucket}, append(append([]any{}, args...), execArgs...)...)...)
+		append(append([]any{}, bucketArgs...), append(append([]any{}, args...), execArgs...)...)...)
 	if err != nil {
 		return nil, fmt.Errorf("trend executions: %w", err)
 	}
@@ -336,11 +354,11 @@ func (s *Store) reportTrend(ctx context.Context, q querier, where string, args [
 
 	// Adjustments follow the bucket of the request they belong to, so the
 	// trend always sums to the summary total.
-	adjustRows, err := q.QueryContext(ctx, `SELECT (r.started_at / ?) * ? AS bucket,
+	adjustRows, err := q.QueryContext(ctx, `SELECT `+bucketExpr+` AS bucket,
 		COALESCE(SUM(a.amount_micro_usd),0)
 		FROM adjustments a JOIN requests r ON r.id = a.request_id
 		WHERE `+where+` GROUP BY bucket ORDER BY bucket`,
-		append([]any{bucket, bucket}, args...)...)
+		append(append([]any{}, bucketArgs...), args...)...)
 	if err != nil {
 		return nil, fmt.Errorf("trend adjustments: %w", err)
 	}

@@ -30,8 +30,10 @@ mock.
 ## Build
 
 ```sh
-# 1. Build the plugin library (from this worktree root). VERSION is the release
-#    version the harness asserts, so keep it in sync with --expected-version.
+# 1. Build the plugin library (from this worktree root). VERSION is the bare
+#    release version the harness asserts in the registration metadata; the build
+#    commit (GIT_COMMIT, auto-derived) is asserted in the health diagnostic
+#    version. Keep VERSION in sync with --expected-version.
 env CGO_ENABLED=1 make build VERSION=0.1.0
 # -> dist/linux/amd64/cliproxyapi-credit-manager.so
 
@@ -66,13 +68,15 @@ Options:
 - `--only <substr>` run only cases whose name contains the substring.
 - `--modules core,retry` restrict to specific case modules (default: all).
 - `--plugin-id credit-manager` override the plugin library/instance id.
-- `--expected-version <v>` the exact plugin base version the build must report
-  (default `0.1.0`); must be non-empty.
-- `--expected-commit <40hex>` an explicit build commit to assert exactly. When
-  given, the plugin version must equal `<version>+<commit>` exactly. When
-  omitted, the version before `+` must equal `--expected-version` and the part
-  after `+` must still be a 40-hex commit (this project always injects the build
-  commit, so a version without one is a misbuild). Must be 40 hex characters.
+- `--expected-version <v>` the exact bare release version the registration
+  metadata must report (default `0.1.0`); must be non-empty.
+- `--expected-commit <40hex>` an explicit build commit the health diagnostic
+  version must carry. When given, the health version must equal
+  `<version>+<commit>` exactly. When omitted, the health version's release part
+  must equal `--expected-version` and any commit part must still be a 40-hex
+  commit (this project always injects the build commit, so an unexpected suffix
+  is a misbuild). The registration metadata version never carries the commit.
+  Must be 40 hex characters.
 
 Exit code: `0` all cases pass, `1` at least one case failed, `2` fail-closed: the
 host failed to boot, a requested module does not exist, the filter matched no
@@ -104,7 +108,7 @@ Each case's host lives at `<artifacts>/host-<n>-<case>/` with `config.yaml`,
 | Module | Coverage |
 | --- | --- |
 | `abi` | Direct `.so` probe via ctypes: ABI 1 / RPC schema 6 negotiation, passive-only capabilities (no executor/router/scheduler), older-schema host rejected. |
-| `core` | Host lists the plugin (enabled, metadata, published menu); health; management auth gate (401 without/with wrong key). |
+| `core` | Host lists the plugin (enabled, bare numeric metadata version, published menu); health (build-identity diagnostic version carrying the commit); management auth gate (401 without/with wrong key). |
 | `accounting` | Exact cost (input 10 / output 4 / total 14 = 14 microUSD), canonical buckets, complete quality, distinct execution id, same-key ledger, all-zero price is free, unpriced model denied with no upstream call and no poisoning of other keys. |
 | `auth` | Five credential locations, invalid/absent denial with no upstream call, invalid Bearer + valid Google fallback, first-candidate-wins on conflict, original CPA key rejected while exclusive, custom (non `sk-`) prefix key. Deployment fail-closed: a plugin-managed key is accepted at all five locations while the plugin is loaded, and with `plugins.enabled: false` (library not loaded) all five are denied with no upstream call while the plugin instance stays unregistered. |
 | `capture` | Disabled vs unavailable vs captured states, lazy fetch, header + JSON redaction, 64-bit integer fidelity, adjustable body limit (oversize skipped). |

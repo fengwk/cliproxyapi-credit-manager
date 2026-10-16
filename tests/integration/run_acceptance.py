@@ -42,10 +42,10 @@ def parse_args(argv):
     parser.add_argument("--only", default="", help="run only cases whose name contains this substring")
     parser.add_argument("--modules", default="", help="comma separated case module names (default: all present)")
     parser.add_argument("--expected-version", default="0.1.0",
-                        help="exact plugin base version the build must report (default: 0.1.0)")
+                        help="exact bare plugin release version the metadata must report (default: 0.1.0)")
     parser.add_argument("--expected-commit", default="",
-                        help="explicit 40-hex build commit to assert exactly; when omitted the commit part "
-                             "must simply be a 40-hex hash")
+                        help="explicit 40-hex build commit the health diagnostic version must carry; when "
+                             "omitted the release part must match and any commit part must be a 40-hex hash")
     return parser.parse_args(argv)
 
 
