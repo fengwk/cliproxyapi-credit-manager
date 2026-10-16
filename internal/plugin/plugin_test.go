@@ -679,8 +679,10 @@ func TestManagementRoutesAndResourceWhitelist(t *testing.T) {
 			t.Fatalf("management route %s is not registered", want)
 		}
 	}
-	if len(registration.Resources) != len(resourceAssets) {
-		t.Fatalf("resources = %d, want %d", len(registration.Resources), len(resourceAssets))
+	// The registered resources are the static asset allow list plus the public
+	// customer self-service endpoints, and nothing else.
+	if want := len(resourceAssets) + len(lookupRoutes); len(registration.Resources) != want {
+		t.Fatalf("resources = %d, want %d", len(registration.Resources), want)
 	}
 	for _, resource := range registration.Resources {
 		if !strings.HasPrefix(resource.Path, "/v0/resource/plugins/credit-manager/") {

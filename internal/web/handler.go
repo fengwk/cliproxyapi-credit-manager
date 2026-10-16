@@ -10,7 +10,6 @@ import (
 	"io"
 	"mime"
 	"net/http"
-	"path"
 	"strconv"
 	"strings"
 	"time"
@@ -43,21 +42,39 @@ func (h *Handler) SetStatus(version string, health func() string) {
 	h.version, h.health = version, health
 }
 
+// assetMIMEs is the complete, exact allow list of publicly served embedded
+// assets. Each entry maps one exact relative path to its content type: the
+// served set is fixed here, no caller supplied name is ever derived into a
+// path, and no extension lookup can widen the set to an arbitrary embedded
+// file. Nested paths (the vendored chart build) are permitted only as this
+// exact entry.
+var assetMIMEs = map[string]string{
+	"index.html":                  "text/html; charset=utf-8",
+	"app.js":                      "text/javascript; charset=utf-8",
+	"style.css":                   "text/css; charset=utf-8",
+	"charts.js":                   "text/javascript; charset=utf-8",
+	"vendor/echarts-5.6.0.min.js": "text/javascript; charset=utf-8",
+	"lookup.html":                 "text/html; charset=utf-8",
+	"lookup.css":                  "text/css; charset=utf-8",
+	"lookup.js":                   "text/javascript; charset=utf-8",
+}
+
+// Asset returns one embedded public asset by its exact allow-listed name.
+//
+// An unknown, aliased or traversal spelling is never normalized into an allowed
+// name: only the exact paths above can be served. A declared asset whose file
+// is not present in this build reports not-found rather than falling back to
+// any other file.
 func Asset(name string) ([]byte, string, bool) {
-	name = path.Base(name)
-	var mime string
-	switch name {
-	case "index.html":
-		mime = "text/html; charset=utf-8"
-	case "app.js":
-		mime = "text/javascript; charset=utf-8"
-	case "style.css":
-		mime = "text/css; charset=utf-8"
-	default:
+	mime, ok := assetMIMEs[name]
+	if !ok {
 		return nil, "", false
 	}
 	data, err := assets.ReadFile("assets/" + name)
-	return data, mime, err == nil
+	if err != nil {
+		return nil, "", false
+	}
+	return data, mime, true
 }
 
 func response(code int, body any) pluginapi.ManagementResponse {
