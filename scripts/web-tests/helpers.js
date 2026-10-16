@@ -15,10 +15,11 @@ function readAsset(name) {
 // 以无 DOM 的宿主 realm 执行 app.js：document 为 undefined，因此不会触发 boot，
 // 同时保证断言可以严格比较（同 realm 原型一致）。
 function loadCM() {
+  const charts = require(path.join(ASSETS_DIR, 'charts.js'));
   const source = readAsset('app.js');
-  const factory = new Function('window', 'document', source + '\n//# sourceURL=app.js');
-  const win = {};
-  factory(win, undefined);
+  const factory = new Function('window', 'document', 'require', source + '\n//# sourceURL=app.js');
+  const win = { CMCharts: charts };
+  factory(win, undefined, require);
   if (!win.CM) throw new Error('app.js 未导出 window.CM');
   return win.CM;
 }

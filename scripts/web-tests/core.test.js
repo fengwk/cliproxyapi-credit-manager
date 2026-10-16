@@ -472,14 +472,32 @@ test('formatTokens 支持不同单位换算', () => {
   assert.equal(CM.formatTokens(1234567), '1,234,567');
 
   CM.state.tokenUnit = 'k';
-  assert.equal(CM.formatTokens(1234567), '1,234.6k');
+  assert.equal(CM.formatTokens(1234567), '1,234.57K');
 
   CM.state.tokenUnit = 'wan';
-  assert.equal(CM.formatTokens(1234567), '123.5万');
+  assert.equal(CM.formatTokens(1234567), '123.46万');
 
   CM.state.tokenUnit = 'm';
-  assert.equal(CM.formatTokens(1234567), '1.23m');
+  assert.equal(CM.formatTokens(1234567), '1.23M');
 
   // 恢复 raw
   CM.state.tokenUnit = 'raw';
+});
+
+test('formatMicroUSD 与 formatMicroUSDPair 支持精确法币换算且保持超大整数精度', () => {
+  CM.state.currency = 'USD';
+  assert.equal(CM.formatMicroUSD('1000000'), '1 USD');
+  assert.equal(CM.formatMicroUSDPair('1000000'), '1 USD（1,000,000 µUSD）');
+  assert.equal(CM.formatMicroUSD('123456789012345678'), '123456789012.345678 USD');
+
+  CM.state.currency = 'CNY';
+  CM.state.currencyRate = 7.2;
+  assert.equal(CM.formatMicroUSD('1000000'), '7.2 CNY');
+  assert.equal(CM.formatMicroUSDPair('1000000'), '7.2 CNY（1,000,000 µUSD）');
+  assert.equal(CM.formatMicroUSD('123456789012345678'), '888888880888.888882 CNY');
+  assert.equal(CM.formatMicroUSDPair('123456789012345678'), '888888880888.888882 CNY（123,456,789,012,345,678 µUSD）');
+
+  // 恢复 USD
+  CM.state.currency = 'USD';
+  CM.state.currencyRate = 7.2;
 });

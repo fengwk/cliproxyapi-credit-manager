@@ -155,49 +155,42 @@
     return { ok: true, micro: (negative && digits !== '0' ? '-' : '') + digits };
   }
 
+  function getChartsApi() {
+    if (typeof window !== 'undefined' && window && window.CMCharts) return window.CMCharts;
+    if (typeof globalThis !== 'undefined' && globalThis && globalThis.CMCharts) return globalThis.CMCharts;
+    if (typeof global !== 'undefined' && global && global.CMCharts) return global.CMCharts;
+    if (typeof require === 'function') {
+      try {
+        return require('./charts.js');
+      } catch (_) {}
+    }
+    return null;
+  }
+
   function formatMicroUSD(micro) {
+    var charts = getChartsApi();
+    if (charts && typeof charts.formatMoneyMicro === 'function') {
+      return charts.formatMoneyMicro(micro, state.currency, state.currencyRate);
+    }
     var usdText = microToUSDText(micro);
     if (usdText === null) return '—';
-    if (state.currency === 'CNY') {
-      var usdNum = Number(usdText);
-      var cny = usdNum * (state.currencyRate || DEFAULT_USD_CNY_RATE);
-      var abs = Math.abs(cny);
-      var maxFrac = abs >= 100 ? 2 : (abs >= 1 ? 3 : 4);
-      return '¥' + cny.toLocaleString(undefined, { maximumFractionDigits: maxFrac });
-    }
     return usdText + ' USD';
   }
 
   function formatMicroUSDPair(micro) {
-    var usdText = microToUSDText(micro);
-    if (usdText === null) return '—';
-    if (state.currency === 'CNY') {
-      var usdNum = Number(usdText);
-      var cny = usdNum * (state.currencyRate || DEFAULT_USD_CNY_RATE);
-      var abs = Math.abs(cny);
-      var maxFrac = abs >= 100 ? 2 : (abs >= 1 ? 3 : 4);
-      return '¥' + cny.toLocaleString(undefined, { maximumFractionDigits: maxFrac }) + '（' + formatInt(micro) + ' µUSD）';
-    }
-    return usdText + ' USD（' + formatInt(micro) + ' µUSD）';
+    var moneyText = formatMicroUSD(micro);
+    if (moneyText === '—') return '—';
+    return moneyText + '（' + formatInt(micro) + ' µUSD）';
   }
 
   function formatTokens(value) {
+    var charts = getChartsApi();
+    if (charts && typeof charts.tokenText === 'function') {
+      return charts.tokenText(value, state.tokenUnit) || '—';
+    }
     var text = intString(value);
     if (!isIntegerText(text)) return '—';
-    var unit = state.tokenUnit || 'raw';
-    if (unit === 'raw') return formatInt(text);
-    var n = Number(text);
-    if (!isFinite(n)) return formatInt(text);
-    var cfg = {
-      k: { div: 1e3, suffix: 'k', maxFrac: 2 },
-      wan: { div: 1e4, suffix: '万', maxFrac: 2 },
-      m: { div: 1e6, suffix: 'm', maxFrac: 2 },
-    }[unit];
-    if (!cfg) return formatInt(text);
-    var scaled = n / cfg.div;
-    var abs = Math.abs(scaled);
-    var maxFrac = abs > 0 && abs < 0.01 ? 6 : (abs >= 100 ? 1 : cfg.maxFrac);
-    return scaled.toLocaleString(undefined, { maximumFractionDigits: maxFrac }) + cfg.suffix;
+    return formatInt(text);
   }
 
   function formatBytes(value) {
@@ -965,21 +958,44 @@
   }
 
   function readStoredCredential() {
-    var currentOrigin = typeof location !== 'undefined' ? location.origin : '';
+    var currentOrigin = typeof location !== 'undefined' && location ? location.origin : '';
+    var sessToken = '';
+    var sessOriginOk = false;
     try {
       var sessOrigin = sessionStorage.getItem(TOKEN_ORIGIN_KEY);
-      if (!sessOrigin || sessOrigin === currentOrigin) {
-        var sessToken = (sessionStorage.getItem(TOKEN_KEY) || '').trim();
-        if (sessToken) return { token: sessToken, remembered: false };
+      if (!sessOrigin || !currentOrigin || sessOrigin === currentOrigin) {
+        sessToken = (sessionStorage.getItem(TOKEN_KEY) || '').trim();
+        sessOriginOk = true;
+      } else {
+        try {
+          sessionStorage.removeItem(TOKEN_KEY);
+          sessionStorage.removeItem(TOKEN_ORIGIN_KEY);
+        } catch (_) {}
       }
     } catch (_) {}
+
+    var locToken = '';
+    var locOriginOk = false;
     try {
       var locOrigin = localStorage.getItem(TOKEN_ORIGIN_KEY);
-      if (!locOrigin || locOrigin === currentOrigin) {
-        var locToken = (localStorage.getItem(TOKEN_KEY) || '').trim();
-        if (locToken) return { token: locToken, remembered: true };
+      if (!locOrigin || !currentOrigin || locOrigin === currentOrigin) {
+        locToken = (localStorage.getItem(TOKEN_KEY) || '').trim();
+        locOriginOk = true;
+      } else {
+        try {
+          localStorage.removeItem(TOKEN_KEY);
+          localStorage.removeItem(TOKEN_ORIGIN_KEY);
+        } catch (_) {}
       }
     } catch (_) {}
+
+    if (sessToken && sessOriginOk) {
+      var isRemembered = Boolean(locToken && locOriginOk && locToken === sessToken);
+      return { token: sessToken, remembered: isRemembered };
+    }
+    if (locToken && locOriginOk) {
+      return { token: locToken, remembered: true };
+    }
     return { token: '', remembered: false };
   }
 
@@ -1768,6 +1784,8 @@
     'usage-token-chart',
     'usage-cost-chart',
     'usage-legend',
+    'usage-token-legend',
+    'usage-cost-legend',
     'usage-total',
     'usage-retention',
     'usage-items',
@@ -1786,6 +1804,10 @@
   var PRIVATE_ERROR_TARGETS = ['usage-error', 'keys-error', 'prices-error', 'credentials-error', 'health-error'];
 
   function clearRenderedPrivateContent() {
+    var charts = getChartsApi();
+    if (charts && typeof charts.disposeAll === 'function') {
+      try { charts.disposeAll(); } catch (_) {}
+    }
     for (var i = 0; i < PRIVATE_RENDER_TARGETS.length; i++) {
       var node = $(PRIVATE_RENDER_TARGETS[i]);
       if (node) node.textContent = '';
@@ -1826,7 +1848,7 @@
     return false;
   }
 
-  function autoConnectSavedCredential(savedToken) {
+  function autoConnectSavedCredential(savedToken, wasRemembered) {
     state.key = savedToken;
     var epoch = ++state.sessionEpoch;
     var button = $('login-button');
@@ -1842,6 +1864,9 @@
         if (button) button.disabled = false;
         var input = $('management-key');
         if (input) input.value = '';
+        var box = $('remember-management-key');
+        if (box) box.checked = Boolean(wasRemembered);
+        persistCredential(savedToken, Boolean(wasRemembered));
         showMainView();
         activateTab('usage', false);
         state.usage.filters = defaultUsageFilters();
@@ -1853,7 +1878,7 @@
         if (epoch !== state.sessionEpoch) return;
         if (button) button.disabled = false;
         state.key = '';
-        if (error && (error.kind === 'auth' || error.status === 401)) {
+        if (error && (error.kind === 'auth' || error.status === 401 || error.status === 403)) {
           clearStoredCredential();
         }
         showLoginView();
@@ -2256,29 +2281,32 @@
     var legend = $('usage-legend');
     if (!reqContainer && !tokenContainer && !costContainer) return;
 
+    var charts = getChartsApi();
+    if (charts && typeof charts.render === 'function') {
+      charts.render(
+        {
+          requests: reqContainer,
+          tokens: tokenContainer,
+          cost: costContainer,
+        },
+        trend || [],
+        {
+          bucket: (state.usage.filters && state.usage.filters.bucket) || 'day',
+          tokenUnit: state.tokenUnit || 'raw',
+          currency: state.currency || 'USD',
+          rate: Number(state.currencyRate) || DEFAULT_USD_CNY_RATE,
+          emptyText: '当前筛选范围内没有可绘制的趋势数据。',
+        }
+      );
+      return;
+    }
+
     if (!trend || !trend.length) {
       if (reqContainer) renderEmpty(reqContainer, '当前筛选范围内没有可绘制的趋势数据。');
       if (tokenContainer) renderEmpty(tokenContainer, '当前筛选范围内没有可绘制的趋势数据。');
       if (costContainer) renderEmpty(costContainer, '当前筛选范围内没有可绘制的趋势数据。');
       if (legend) replace(legend, []);
       return;
-    }
-
-    if (global.CMCharts && typeof global.CMCharts.render === 'function') {
-      global.CMCharts.render(
-        {
-          requests: reqContainer,
-          tokens: tokenContainer,
-          cost: costContainer,
-        },
-        trend,
-        {
-          bucket: (state.usage.filters && state.usage.filters.bucket) || 'day',
-          tokenUnit: state.tokenUnit || 'raw',
-          currency: state.currency || 'USD',
-          rate: Number(state.currencyRate) || DEFAULT_USD_CNY_RATE,
-        }
-      );
     }
   }
 
@@ -3978,7 +4006,7 @@
       rememberBox.checked = true;
     }
     if (saved.token) {
-      autoConnectSavedCredential(saved.token);
+      autoConnectSavedCredential(saved.token, saved.remembered);
     } else {
       showLoginView();
       var keyInput = $('management-key');

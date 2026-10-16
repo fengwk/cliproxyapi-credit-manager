@@ -162,13 +162,13 @@ func TestAppJSRenderSafety(t *testing.T) {
 	js := readAsset(t, "app.js")
 
 	// 只禁止实际写入/调用，允许注释中提及这些 API（用于说明为何不使用）。
+	// 管理密钥与主题/单位偏好允许通过 Origin 隔离的 sessionStorage / localStorage 规范读写；
+	// 但严禁 Cookie 与 innerHTML/eval 等高危 API。
 	forbidden := []string{
 		`\.innerHTML\s*=`,
 		`\.outerHTML\s*=`,
 		`insertAdjacentHTML`,
 		`document\.write`,
-		`localStorage\s*[.=\[]`,
-		`sessionStorage\s*[.=\[]`,
 		`document\.cookie\s*=`,
 		`\beval\s*\(`,
 	}
