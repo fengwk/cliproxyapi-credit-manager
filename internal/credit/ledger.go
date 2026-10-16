@@ -3,11 +3,47 @@ package credit
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
+	"strings"
 	"time"
 )
+
+// priceSnapshot is the frozen pricing decision of one request. It captures the
+// complete effective price (including its tiers and billing mode) together with
+// the resolution facts needed to settle late usage without ever re-reading a
+// rule that may have been edited or deleted after admission.
+type priceSnapshot struct {
+	Price       Price       `json:"price"`
+	Tiers       []PriceTier `json:"tiers,omitempty"`
+	RuleID      string      `json:"rule_id,omitempty"`
+	ServiceTier string      `json:"service_tier,omitempty"`
+	ImageCount  int64       `json:"image_count,omitempty"`
+}
+
+func encodePriceSnapshot(s priceSnapshot) (string, error) {
+	raw, err := json.Marshal(s)
+	if err != nil {
+		return "", fmt.Errorf("%w: encode price snapshot", ErrInvalid)
+	}
+	return string(raw), nil
+}
+
+// decodePriceSnapshot returns nil for an empty column, which is how requests
+// that predate the snapshot column are recognized.
+func decodePriceSnapshot(raw string) (*priceSnapshot, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, nil
+	}
+	var s priceSnapshot
+	if err := json.Unmarshal([]byte(raw), &s); err != nil {
+		return nil, fmt.Errorf("%w: decode price snapshot", ErrInvalid)
+	}
+	return &s, nil
+}
 
 type reqRow struct {
 	id            string
@@ -27,6 +63,34 @@ type reqRow struct {
 	// initialHold is the pre-authorization hold taken at admission. It is kept
 	// after settlement so a late unaccounted execution can restore it.
 	initialHold int64
+	// snapshot is the frozen pricing decision, nil for a legacy request whose
+	// price is rebuilt from the stored rate columns.
+	snapshot *priceSnapshot
+}
+
+// imageCount is the frozen requested image count of a per-image request.
+func (r *reqRow) imageCount() int64 {
+	if r.snapshot == nil {
+		return 1
+	}
+	return clampImageCount(r.snapshot.ImageCount)
+}
+
+// frozenServiceTier is the normalized service tier frozen at admission, used
+// when a usage record reports none of its own.
+func (r *reqRow) frozenServiceTier() string {
+	if r.snapshot == nil {
+		return ""
+	}
+	return normalizeServiceTier(r.snapshot.ServiceTier)
+}
+
+// tiers is the frozen tier list of the request price.
+func (r *reqRow) tiers() []PriceTier {
+	if r.snapshot == nil {
+		return nil
+	}
+	return r.snapshot.Tiers
 }
 
 func (r *reqRow) toRequest(executions []Usage, adjustment int64) Request {
@@ -52,26 +116,38 @@ func (r *reqRow) toRequest(executions []Usage, adjustment int64) Request {
 const requestColumns = `id, trace_id, key_id, model, state, outcome, status_code, started_at,
 	completed_at, held_micro_usd, price_input, price_output, price_reasoning, price_cache_read,
 	price_cache_write, price_version, token_estimate, charge_micro_usd, resolved,
-	initial_hold_micro_usd`
+	initial_hold_micro_usd, price_snapshot`
 
 func scanRequest(scan func(...any) error) (*reqRow, error) {
 	var (
-		r         reqRow
-		completed sql.NullInt64
-		reasoning sql.NullInt64
-		started   int64
-		in, out   int64
-		cr, cw    int64
-		version   int64
+		r            reqRow
+		completed    sql.NullInt64
+		reasoning    sql.NullInt64
+		started      int64
+		in, out      int64
+		cr, cw       int64
+		version      int64
+		snapshotJSON sql.NullString
 	)
 	if err := scan(&r.id, &r.traceID, &r.keyID, &r.model, &r.state, &r.outcome, &r.statusCode,
 		&started, &completed, &r.held, &in, &out, &reasoning, &cr, &cw, &version,
-		&r.tokenEstimate, &r.charge, &r.resolved, &r.initialHold); err != nil {
+		&r.tokenEstimate, &r.charge, &r.resolved, &r.initialHold, &snapshotJSON); err != nil {
 		return nil, err
 	}
 	r.startedAt = fromUnixNano(started)
 	r.completedAt = scanNano(completed)
-	r.price = priceFromRequestRow(in, out, cr, cw, version, reasoning, r.model)
+	snapshot, err := decodePriceSnapshot(snapshotJSON.String)
+	if err != nil {
+		return nil, err
+	}
+	r.snapshot = snapshot
+	if snapshot != nil {
+		// The frozen snapshot is authoritative; the legacy rate columns are
+		// only a downgrade-compatible mirror of the same price.
+		r.price = snapshot.Price
+	} else {
+		r.price = priceFromRequestRow(in, out, cr, cw, version, reasoning, r.model)
+	}
 	return &r, nil
 }
 
@@ -296,9 +372,13 @@ type usageAgg struct {
 
 func usageStats(ctx context.Context, q querier, requestID string) (usageAgg, error) {
 	var a usageAgg
+	// "unknown" is accounting that is not trustworthy, which is exactly what the
+	// reliable flag encodes. It is deliberately not "cost IS NULL": a per-image
+	// price books a single charge per request, so its reliable usage rows carry
+	// no per-execution cost and must not be mistaken for unknown accounting.
 	err := q.QueryRowContext(ctx, `SELECT COUNT(*),
 		COALESCE(SUM(reliable),0),
-		COALESCE(SUM(CASE WHEN cost_micro_usd IS NULL THEN 1 ELSE 0 END),0),
+		COALESCE(SUM(CASE WHEN reliable = 0 THEN 1 ELSE 0 END),0),
 		COALESCE(SUM(CASE WHEN reliable = 1 AND failed = 0 THEN 1 ELSE 0 END),0)
 		FROM usages WHERE request_id = ?`, requestID).Scan(&a.total, &a.reliable, &a.unknown, &a.success)
 	if err != nil {

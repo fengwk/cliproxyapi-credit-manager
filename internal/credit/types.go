@@ -69,10 +69,34 @@ type Rates struct {
 }
 
 // Price amounts are integer microUSD per million tokens, not USD floats.
+//
+// BillingMode selects how a request is billed: the empty string and "token"
+// bill the canonical token buckets through Rates; "per_image" bills
+// PerImageMicroUSD once per requested image. Optional rate tiers are carried by
+// the pricing rule that selects this price (see PricingRule.Tiers), so a price
+// value and its tiers can never be duplicated or disagree.
 type Price struct {
-	Model   string `json:"model"`
-	Rates   Rates  `json:"rates"`
-	Version int64  `json:"version"`
+	Model            string `json:"model"`
+	Rates            Rates  `json:"rates"`
+	BillingMode      string `json:"billing_mode,omitempty"`
+	PerImageMicroUSD int64  `json:"per_image_micro_usd,omitempty"`
+	Version          int64  `json:"version"`
+}
+
+// PriceTier is an optional rate overlay carried by a pricing rule.
+//
+// A context tier applies when the canonical prompt size (uncached input plus
+// cache read and cache write) reaches Threshold; the highest matching
+// threshold wins. A service tier applies when the request's normalized service
+// tier is named in the comma separated Service list. A matching service tier
+// takes precedence over every context tier. Each rate that is zero (or, for
+// reasoning, nil) inherits the base price.
+type PriceTier struct {
+	Kind      string `json:"kind"`
+	Threshold int64  `json:"threshold,omitempty"`
+	Service   string `json:"service,omitempty"`
+	Label     string `json:"label,omitempty"`
+	Rates     Rates  `json:"rates"`
 }
 
 type Tokens struct {
@@ -91,7 +115,14 @@ type ReserveInput struct {
 	RequestedModel string
 	InputEstimate  int64
 	OutputEstimate int64
-	At             time.Time
+	// ServiceTier is the pricing key read from the request body (for example
+	// "priority"). It is normalized before matching; empty means no service
+	// tier and selects context tiers only.
+	ServiceTier string
+	// ImageCount is the requested image count for per-image billing. Values
+	// below one mean one image, and values above the 32 image cap are clamped.
+	ImageCount int64
+	At         time.Time
 }
 
 type Usage struct {
@@ -108,12 +139,16 @@ type Usage struct {
 	Raw           pluginapi.UsageDetail `json:"raw"`
 	Tokens        Tokens                `json:"tokens"`
 	Quality       string                `json:"quality"`
-	CostMicroUSD  *int64                `json:"cost_micro_usd,omitempty"`
-	Failed        bool                  `json:"failed"`
-	StatusCode    int                   `json:"status_code,omitempty"`
-	At            time.Time             `json:"at"`
-	LatencyMS     int64                 `json:"latency_ms"`
-	TTFTMS        int64                 `json:"ttft_ms"`
+	// ServiceTier is the normalized pricing key actually used to bill this
+	// execution: the host response tier, else the reported requested tier,
+	// else the tier frozen on the request snapshot.
+	ServiceTier  string    `json:"service_tier,omitempty"`
+	CostMicroUSD *int64    `json:"cost_micro_usd,omitempty"`
+	Failed       bool      `json:"failed"`
+	StatusCode   int       `json:"status_code,omitempty"`
+	At           time.Time `json:"at"`
+	LatencyMS    int64     `json:"latency_ms"`
+	TTFTMS       int64     `json:"ttft_ms"`
 }
 
 type Request struct {

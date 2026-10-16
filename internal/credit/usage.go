@@ -23,6 +23,7 @@ type usageRow struct {
 	model         string
 	responseModel string
 	quality       string
+	serviceTier   string
 	failed        bool
 	statusCode    int
 	tokens        Tokens
@@ -50,6 +51,7 @@ func (u *usageRow) toUsage() Usage {
 		Raw:           u.raw,
 		Tokens:        u.tokens,
 		Quality:       u.quality,
+		ServiceTier:   u.serviceTier,
 		Failed:        u.failed,
 		StatusCode:    u.statusCode,
 		At:            u.at,
@@ -69,6 +71,7 @@ type usageMaterial struct {
 	requestID, traceID, keyID                 string
 	provider, authID, authIndex, executorName string
 	model, responseModel, quality             string
+	serviceTier                               string
 	failed                                    bool
 	statusCode                                int
 	tokens                                    Tokens
@@ -89,6 +92,7 @@ func (u Usage) material() usageMaterial {
 		model:         u.Model,
 		responseModel: u.ResponseModel,
 		quality:       u.Quality,
+		serviceTier:   normalizeServiceTier(u.ServiceTier),
 		failed:        u.Failed,
 		statusCode:    u.StatusCode,
 		tokens:        u.Tokens,
@@ -103,7 +107,7 @@ const usageColumns = `id, request_id, trace_id, key_id, provider, auth_id, auth_
 	model, response_model, quality, failed, status_code, tokens_input, tokens_cache_read,
 	tokens_cache_write, tokens_output, tokens_reasoning, tokens_total, raw_input, raw_output,
 	raw_reasoning, raw_cached, raw_cache_read, raw_cache_create, raw_total, cost_micro_usd,
-	charged, reliable, at, latency_ms, ttft_ms`
+	charged, reliable, at, latency_ms, ttft_ms, service_tier`
 
 func scanUsage(scan func(...any) error) (*usageRow, error) {
 	var (
@@ -119,7 +123,7 @@ func scanUsage(scan func(...any) error) (*usageRow, error) {
 		&u.tokens.Input, &u.tokens.CacheRead, &u.tokens.CacheWrite, &u.tokens.Output, &u.tokens.Reasoning,
 		&u.tokens.Total, &u.raw.InputTokens, &u.raw.OutputTokens, &u.raw.ReasoningTokens,
 		&u.raw.CachedTokens, &u.raw.CacheReadTokens, &u.raw.CacheCreationTokens, &u.raw.TotalTokens,
-		&cost, &charged, &reliable, &at, &u.latencyMS, &u.ttftMS); err != nil {
+		&cost, &charged, &reliable, &at, &u.latencyMS, &u.ttftMS, &u.serviceTier); err != nil {
 		return nil, err
 	}
 	u.failed = failed != 0
@@ -248,6 +252,15 @@ func (s *Store) RecordUsage(ctx context.Context, usage Usage) error {
 		// Canonicalize the request id before comparison: the native bridge only
 		// supplies a trace, so an empty id must still replay idempotently.
 		usage.RequestID = req.id
+		// The billed service tier is the reported one, else the tier frozen at
+		// admission. It is resolved before the replay comparison because it is
+		// part of the replay identity: a replay that changes the tier must
+		// conflict instead of silently repricing the execution.
+		if tier := normalizeServiceTier(usage.ServiceTier); tier != "" {
+			usage.ServiceTier = tier
+		} else {
+			usage.ServiceTier = req.frozenServiceTier()
+		}
 		existing, err := loadUsageByID(ctx, tx, usage.ID)
 		switch {
 		case err == nil:
@@ -267,22 +280,27 @@ func (s *Store) RecordUsage(ctx context.Context, usage Usage) error {
 			return err
 		}
 		var cost *int64
-		if reliable {
-			v, err := computeCost(req.price, tokens)
+		if reliable && !req.price.IsPerImage() {
+			// Token prices settle from actual usage: the frozen service tier
+			// applies first, and the highest context tier matching the actual
+			// canonical prompt size applies otherwise. A per-image price is
+			// booked once per successful lifecycle instead (see
+			// bookPerImageOnProvenSuccess).
+			v, err := requestCost(req.price, req.tiers(), tokens, usage.ServiceTier)
 			if err != nil {
 				return err
 			}
 			cost = &v
 		}
 		if _, err := tx.ExecContext(ctx, `INSERT INTO usages (`+usageColumns+`) VALUES
-			(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+			(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 			usage.ID, req.id, usage.TraceID, usage.KeyID, usage.Provider, usage.AuthID, usage.AuthIndex,
 			usage.Executor, usage.Model, usage.ResponseModel, usage.Quality, boolInt(usage.Failed),
 			usage.StatusCode, tokens.Input, tokens.CacheRead, tokens.CacheWrite, tokens.Output,
 			tokens.Reasoning, tokens.Total, usage.Raw.InputTokens, usage.Raw.OutputTokens,
 			usage.Raw.ReasoningTokens, usage.Raw.CachedTokens, usage.Raw.CacheReadTokens,
 			usage.Raw.CacheCreationTokens, usage.Raw.TotalTokens, cost, 0, boolInt(reliable),
-			unixNano(at), usage.LatencyMS, usage.TTFTMS); err != nil {
+			unixNano(at), usage.LatencyMS, usage.TTFTMS, usage.ServiceTier); err != nil {
 			return fmt.Errorf("insert usage: %w", err)
 		}
 		if reliable {
@@ -299,11 +317,20 @@ func (s *Store) RecordUsage(ctx context.Context, usage Usage) error {
 				return err
 			}
 		}
-		if cost == nil && req.state == stateSettled && req.resolved == resolvedAuto {
+		// A per-image price is booked once per proven successful lifecycle, not
+		// once per execution attempt.
+		if err := s.bookPerImageOnProvenSuccess(ctx, tx, req); err != nil {
+			return err
+		}
+		if !reliable && req.state == stateSettled && req.resolved == resolvedAuto {
 			// Untrustworthy accounting arrived after the request was closed
 			// automatically: reopen it so the work stays visible until an
 			// administrator decides. A manually resolved request is left
 			// closed because an administrator already ruled on it.
+			//
+			// The test is the reliable flag, not a missing per-execution cost:
+			// a per-image request bills once per lifecycle, so its reliable
+			// usage rows legitimately carry no cost.
 			if err := s.reopenRequest(ctx, tx, req); err != nil {
 				return err
 			}
@@ -327,6 +354,7 @@ func (u *usageRow) materialEqual(in Usage) bool {
 		model:         u.model,
 		responseModel: u.responseModel,
 		quality:       u.quality,
+		serviceTier:   u.serviceTier,
 		failed:        u.failed,
 		statusCode:    u.statusCode,
 		tokens:        u.tokens,
@@ -370,6 +398,9 @@ func (s *Store) Complete(ctx context.Context, c Completion) error {
 				return nil
 			}
 			// Still unresolved: a late usage may have made it closable.
+			if err := s.bookPerImageOnProvenSuccess(ctx, tx, req); err != nil {
+				return err
+			}
 			return s.evaluateSettle(ctx, tx, req, at)
 		}
 		if req.state == stateSettled {
@@ -396,6 +427,50 @@ func (s *Store) Complete(ctx context.Context, c Completion) error {
 		req.outcome = c.Outcome
 		req.statusCode = c.StatusCode
 		req.completedAt = &at
+		if err := s.bookPerImageOnProvenSuccess(ctx, tx, req); err != nil {
+			return err
+		}
 		return s.evaluateSettle(ctx, tx, req, at)
 	})
+}
+
+// bookPerImageOnProvenSuccess charges the frozen per-image price exactly once.
+//
+// A per-image request is billed for the requested image count only when its
+// lifecycle is proven successful: a failed, canceled or rejected lifecycle is
+// never charged, a retried or failed attempt is not charged per attempt, and an
+// unknown or still missing completion keeps the request pending. The first
+// charged usage row is the durable "already booked" marker, so a replay, a late
+// duplicate or a second successful execution can never double charge.
+func (s *Store) bookPerImageOnProvenSuccess(ctx context.Context, tx *sql.Tx, req *reqRow) error {
+	if !req.price.IsPerImage() || req.outcome != OutcomeSucceeded {
+		return nil
+	}
+	booked, err := counterValue(ctx, tx,
+		`SELECT COUNT(*) FROM usages WHERE request_id = ? AND charged = 1`, req.id)
+	if err != nil || booked > 0 {
+		return err
+	}
+	agg, err := usageStats(ctx, tx, req.id)
+	if err != nil {
+		return err
+	}
+	if agg.success == 0 || agg.reliable == 0 || agg.unknown > 0 {
+		return nil
+	}
+	var usageID string
+	err = tx.QueryRowContext(ctx,
+		`SELECT id FROM usages WHERE request_id = ? AND reliable = 1 AND failed = 0 ORDER BY at, id LIMIT 1`,
+		req.id).Scan(&usageID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("load per-image usage: %w", err)
+	}
+	amount, err := perImageCost(req.price, req.imageCount())
+	if err != nil {
+		return err
+	}
+	return s.applyCharge(ctx, tx, req, usageID, amount)
 }

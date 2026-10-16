@@ -407,6 +407,9 @@ func (s *Store) migrate(ctx context.Context) error {
 		if _, err := tx.ExecContext(ctx, schemaDDL); err != nil {
 			return fmt.Errorf("apply schema: %w", err)
 		}
+		if err := migratePricingFeatures(ctx, tx); err != nil {
+			return err
+		}
 		_, err := tx.ExecContext(ctx,
 			`INSERT INTO meta(k, v) VALUES('schema_version', ?) ON CONFLICT(k) DO NOTHING`,
 			fmt.Sprint(1))
