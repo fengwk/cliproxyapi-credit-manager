@@ -1,6 +1,8 @@
 package config
 
 import (
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -66,5 +68,32 @@ func TestWarmupConfiguration(t *testing.T) {
 		if _, err := Parse([]byte(raw)); err == nil {
 			t.Fatalf("accepted %q", raw)
 		}
+	}
+}
+
+// TestDataDirWhitespaceRejected keeps data_dir verbatim: trimming a padded path
+// would silently relocate the ledger away from the path the health and capture
+// settings resolve, so an empty/blank or padded value must fail closed.
+func TestDataDirWhitespaceRejected(t *testing.T) {
+	for _, raw := range []string{
+		"data_dir: ''",
+		"data_dir: ' '",
+		"data_dir: \"   \"",
+		"data_dir: \"\\t\"",
+		"data_dir: './ledger '",
+		"data_dir: ' ./ledger'",
+	} {
+		if _, err := Parse([]byte(raw)); err == nil {
+			t.Fatalf("accepted whitespace-padded data_dir %q", raw)
+		}
+	}
+	// A normal path stays valid, and embedded spaces inside a path segment are
+	// not leading or trailing whitespace.
+	c, err := Parse([]byte("data_dir: './ledger dir/data'"))
+	if err != nil {
+		t.Fatalf("embedded space rejected: %v", err)
+	}
+	if !filepath.IsAbs(c.DataDir) || !strings.HasSuffix(c.DataDir, filepath.Join("ledger dir", "data")) {
+		t.Fatalf("data dir = %q", c.DataDir)
 	}
 }

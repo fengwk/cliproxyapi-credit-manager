@@ -169,6 +169,14 @@ func normalizeSpec(spec KeySpec) (KeySpec, error) {
 	out.ModelTokenLimits = limits
 	if out.ExpiresAt != nil {
 		e := out.ExpiresAt.UTC()
+		// expires_at is persisted as int64 nanoseconds since the Unix epoch. An
+		// instant outside that window overflows into a wrong past time, and the
+		// year-1 zero Time is written as NULL by nullableNano ("never expires").
+		// Only a nil expiry means no expiry, so reject any explicit instant that
+		// would not survive the round trip exactly.
+		if !time.Unix(0, e.UnixNano()).UTC().Equal(e) {
+			return out, fmt.Errorf("%w: expires_at is not representable at nanosecond precision", ErrInvalid)
+		}
 		out.ExpiresAt = &e
 	}
 	return out, nil

@@ -82,9 +82,14 @@ func Parse(raw []byte) (Config, error) {
 			return Config{}, fmt.Errorf("plugin configuration must contain one YAML document")
 		}
 	}
-	if c.DataDir == "" || c.History.RetentionMonths < 1 || c.History.RetentionMonths > 1200 ||
+	// data_dir is resolved and used verbatim: a padded value would resolve to a
+	// different directory than the health and capture paths point at, so leading
+	// or trailing whitespace is refused rather than trimmed.
+	if c.DataDir == "" || strings.TrimSpace(c.DataDir) != c.DataDir ||
+		c.History.RetentionMonths < 1 || c.History.RetentionMonths > 1200 ||
 		c.MaxPendingRequests < 1 || c.MaxPendingRequests > 10000 {
-		return Config{}, fmt.Errorf("data_dir, retention_months (1..1200), and max_pending_requests (1..10000) are required")
+		return Config{}, fmt.Errorf("data_dir must be a non-empty path without leading or trailing whitespace, and " +
+			"retention_months (1..1200) and max_pending_requests (1..10000) are required")
 	}
 	var err error
 	c.DataDir, err = filepath.Abs(c.DataDir)
