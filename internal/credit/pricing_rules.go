@@ -142,6 +142,10 @@ func scanPricingRule(scan func(...any) error) (PricingRule, error) {
 		return PricingRule{}, err
 	}
 	r.Tiers = tiers
+	// The rule pattern is the canonical label of the priced model: the table
+	// does not duplicate a separate price.model column, so it is rebuilt here
+	// rather than read back empty and losing the label.
+	r.Price.Model = r.Pattern
 	return r, nil
 }
 

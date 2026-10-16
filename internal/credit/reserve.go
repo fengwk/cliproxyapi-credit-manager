@@ -19,9 +19,6 @@ func (s *Store) Reserve(ctx context.Context, in ReserveInput) (Request, error) {
 	if in.InputEstimate < 0 || in.OutputEstimate < 0 {
 		return Request{}, fmt.Errorf("%w: token estimates must not be negative", ErrInvalid)
 	}
-	if in.ImageCount < 0 {
-		return Request{}, fmt.Errorf("%w: image count must not be negative", ErrInvalid)
-	}
 	estimate, err := checkedAdd(in.InputEstimate, in.OutputEstimate)
 	if err != nil {
 		return Request{}, err
@@ -70,7 +67,16 @@ func (s *Store) Reserve(ctx context.Context, in ReserveInput) (Request, error) {
 		if err != nil {
 			return err
 		}
-		hold, err := holdFor(price, tiers, in, estimate)
+		// Only a per-image price cares about the requested image count, and only
+		// then is an unsupported explicit count refused: a token request may
+		// legitimately carry an image hint that is irrelevant to its billing.
+		images := int64(0)
+		if price.IsPerImage() {
+			if images, err = imageCountFor(in); err != nil {
+				return err
+			}
+		}
+		hold, err := holdFor(price, tiers, in, images, estimate)
 		if err != nil {
 			return err
 		}
@@ -85,10 +91,6 @@ func (s *Store) Reserve(ctx context.Context, in ReserveInput) (Request, error) {
 		}
 		if err := s.checkTokenLimits(ctx, tx, key, in.RequestedModel, estimate, at); err != nil {
 			return err
-		}
-		images := int64(0)
-		if price.IsPerImage() {
-			images = clampImageCount(in.ImageCount)
 		}
 		snapshot, err := encodePriceSnapshot(priceSnapshot{
 			Price:       price,
@@ -135,15 +137,16 @@ func (s *Store) Reserve(ctx context.Context, in ReserveInput) (Request, error) {
 	return out, nil
 }
 
-// holdFor prices the pre-authorization hold of one admission.
+// holdFor prices the pre-authorization hold of one admission. images is the
+// already-resolved image count of a per-image request.
 //
 // A per-image price holds the frozen requested image count. A token price holds
 // the canonical bucket estimates and applies only matching service tiers: the
 // admission estimate is far too coarse to select a context tier, so context
 // tiers are applied at settlement from actual usage instead.
-func holdFor(price Price, tiers []PriceTier, in ReserveInput, estimate int64) (int64, error) {
+func holdFor(price Price, tiers []PriceTier, in ReserveInput, images, estimate int64) (int64, error) {
 	if price.IsPerImage() {
-		return perImageCost(price, in.ImageCount)
+		return perImageCost(price, images)
 	}
 	return tokenCost(price, tiers, Tokens{
 		Input:  in.InputEstimate,

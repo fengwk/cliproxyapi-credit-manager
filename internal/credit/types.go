@@ -119,10 +119,14 @@ type ReserveInput struct {
 	// "priority"). It is normalized before matching; empty means no service
 	// tier and selects context tiers only.
 	ServiceTier string
-	// ImageCount is the requested image count for per-image billing. Values
-	// below one mean one image, and values above the 32 image cap are clamped.
-	ImageCount int64
-	At         time.Time
+	// ImageCount is the requested image count read from the request body and
+	// ImageCountDeclared reports whether the request declared one at all. An
+	// omitted count means one image; an explicit count outside the supported
+	// 1..32 range is refused for a per-image price rather than silently billed
+	// as a different number. Token prices ignore both fields.
+	ImageCount         int64
+	ImageCountDeclared bool
+	At                 time.Time
 }
 
 type Usage struct {
