@@ -397,6 +397,177 @@
     return seen ? total.toString() : '0';
   }
 
+  // 两个 BigInt / 整数文本相除，输出保留 decimals 位小数的精确字符串（四舍五入，绝不经过浮点截断）。
+  function formatDecimalRatio(numerator, denominator, decimals) {
+    var numText = intText(numerator);
+    var denText = intText(denominator);
+    if (!isIntText(numText) || !isIntText(denText)) return null;
+    var num = BigInt(numText);
+    var den = BigInt(denText);
+    if (den === 0n) return null;
+    var neg = (num < 0n) !== (den < 0n) && num !== 0n;
+    if (num < 0n) num = -num;
+    if (den < 0n) den = -den;
+    var limit = typeof decimals === 'number' && decimals >= 0 ? decimals : 2;
+    var scale = pow10Big(limit);
+    var scaled = num * scale;
+    var quotient = scaled / den;
+    var remainder = scaled % den;
+    if (remainder * 2n >= den) quotient += 1n; // half away from zero
+    var str = quotient.toString().padStart(limit + 1, '0');
+    var whole = str.slice(0, str.length - limit);
+    var frac = str.slice(str.length - limit).replace(/0+$/, '');
+    return (neg ? '-' : '') + groupDigits(whole) + (frac ? '.' + frac : '');
+  }
+
+  function formatRatioPercent(numerator, denominator, decimals) {
+    var numText = intText(numerator);
+    var denText = intText(denominator);
+    if (!isIntText(numText) || !isIntText(denText)) return null;
+    var num = BigInt(numText);
+    var den = BigInt(denText);
+    if (den === 0n) return null;
+    var limit = typeof decimals === 'number' && decimals >= 0 ? decimals : 1;
+    return formatDecimalRatio(num * 100n, den, limit);
+  }
+
+  function compareBigIntRational(numA, denA, numB, denB) {
+    var a = BigInt(intText(numA));
+    var b = BigInt(intText(denA));
+    var c = BigInt(intText(numB));
+    var d = BigInt(intText(denB));
+    var left = a * d;
+    var right = c * b;
+    if (left > right) return 1;
+    if (left < right) return -1;
+    return 0;
+  }
+
+  // 模型排名纯计算辅助函数（供 app.js 与 lookup.js 共享，避免 Number 精度损失与口径不一致）。
+  function computeModelRankings(models, metric, options) {
+    var opts = options || {};
+    var tokenUnit = normalizeTokenUnit(opts.tokenUnit);
+    var currency = normalizeCurrency(opts.currency);
+    var rate = opts.rate;
+    var selectedMetric = metric || 'value';
+
+    var list = (models || []).map(function (m) {
+      var modelName = m.model || 'unknown';
+      var reqText = intText(m.requests || 0);
+      var costMicroText = intText(m.cost_micro_usd || 0);
+      var tokText = intText(m.tokens && m.tokens.total !== undefined ? m.tokens.total : m.tokens || 0);
+      var completeExecText = intText(m.complete_executions || 0);
+      var execText = intText(m.executions || 0);
+      var pendingText = intText(m.pending || 0);
+
+      // TPS 优先使用真实测得输出 token 字段 measured_output_tokens，fallback 至 output_tokens
+      var measuredOutText = intText(m.measured_output_tokens !== undefined ? m.measured_output_tokens : (m.output_tokens || 0));
+      var latencyMsText = intText(m.latency_ms || 0);
+      var latencySamplesText = intText(m.latency_samples || 0);
+
+      var score = null;
+      var rational = null;
+      var display = '—';
+
+      if (selectedMetric === 'value') {
+        var costMicro = BigInt(isIntText(costMicroText) ? costMicroText : '0');
+        var tokens = BigInt(isIntText(tokText) ? tokText : '0');
+        if (costMicro > 0n) {
+          rational = { num: tokens * 1000000n, den: costMicro };
+          var tokensPerUSD = rational.num / costMicro;
+          display = tokenText(tokensPerUSD.toString(), tokenUnit) + ' / USD';
+        } else if (tokens > 0n) {
+          score = Infinity;
+          display = '∞ (免费)';
+        } else {
+          score = null;
+          display = '—';
+        }
+      } else if (selectedMetric === 'unit') {
+        var execCount = BigInt(isIntText(execText) ? execText : '0');
+        var completeCount = BigInt(isIntText(completeExecText) ? completeExecText : '0');
+        var pendingCount = BigInt(isIntText(pendingText) ? pendingText : '0');
+        var isKnown = execCount > 0n && completeCount === execCount && pendingCount === 0n;
+        if (isKnown) {
+          var costMicroVal = BigInt(isIntText(costMicroText) ? costMicroText : '0');
+          rational = { num: costMicroVal, den: execCount };
+          var unitMicro = costMicroVal / execCount;
+          display = formatMoneyMicro(unitMicro.toString(), currency, rate) + ' / 次';
+        } else {
+          score = null;
+          display = '—（计量未完整）';
+        }
+      } else if (selectedMetric === 'cache') {
+        if (m.cache_read_ratio !== undefined && m.cache_read_ratio !== null) {
+          var ratioNum = Number(m.cache_read_ratio);
+          if (isFinite(ratioNum)) {
+            score = ratioNum;
+            display = (ratioNum * 100).toFixed(1) + '%';
+          }
+        }
+      } else if (selectedMetric === 'tps') {
+        var latMs = Number(latencyMsText);
+        var mOut = Number(measuredOutText);
+        if (latMs > 0 && mOut > 0) {
+          var tpsRate = mOut / (latMs / 1000);
+          score = tpsRate;
+          display = tpsRate.toFixed(1) + ' tokens/s (累计吞吐)';
+        }
+      } else if (selectedMetric === 'latency') {
+        var samples = Number(latencySamplesText);
+        var totalMs = Number(latencyMsText);
+        if (samples > 0 && totalMs > 0) {
+          var avgMs = totalMs / samples;
+          score = avgMs;
+          display = avgMs >= 1000 ? (avgMs / 1000).toFixed(2) + ' s' : Math.round(avgMs) + ' ms';
+        }
+      }
+
+      return {
+        model: modelName,
+        score: score,
+        rational: rational,
+        display: display,
+        requestsText: reqText,
+        tokensText: tokText,
+        costMicroText: costMicroText,
+        completeExecutionsText: completeExecText,
+        executionsText: execText,
+        pendingText: pendingText,
+      };
+    });
+
+    list.sort(function (a, b) {
+      if (selectedMetric === 'value') {
+        if (a.score === Infinity && b.score === Infinity) return 0;
+        if (a.score === Infinity) return -1;
+        if (b.score === Infinity) return 1;
+        if (!a.rational && !b.rational) return 0;
+        if (!a.rational) return 1;
+        if (!b.rational) return -1;
+        return compareBigIntRational(b.rational.num, b.rational.den, a.rational.num, a.rational.den);
+      }
+      if (selectedMetric === 'unit') {
+        if (!a.rational && !b.rational) return 0;
+        if (!a.rational) return 1;
+        if (!b.rational) return -1;
+        return compareBigIntRational(a.rational.num, a.rational.den, b.rational.num, b.rational.den);
+      }
+      if (selectedMetric === 'latency') {
+        if (a.score === null && b.score === null) return 0;
+        if (a.score === null) return 1;
+        if (b.score === null) return -1;
+        return a.score - b.score;
+      }
+      if (a.score === null && b.score === null) return 0;
+      if (a.score === null) return 1;
+      if (b.score === null) return -1;
+      return b.score - a.score;
+    });
+
+    return list;
+  }
+
   /* ------------------------------------------------------------------ *
    * 时间标签
    * ------------------------------------------------------------------ */
@@ -1119,6 +1290,10 @@
     normalizeBucket: normalizeBucket,
     formatTokenCount: formatTokenCount,
     tokenText: tokenText,
+    formatDecimalRatio: formatDecimalRatio,
+    formatRatioPercent: formatRatioPercent,
+    compareBigIntRational: compareBigIntRational,
+    computeModelRankings: computeModelRankings,
     bucketLabel: bucketLabel,
     buildChartOptions: buildChartOptions,
     buildDonutOption: buildDonutOption,
