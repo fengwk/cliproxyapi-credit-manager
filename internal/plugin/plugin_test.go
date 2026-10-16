@@ -1334,3 +1334,33 @@ func TestConflictRejectionDoesNotBlockOtherKeys(t *testing.T) {
 		t.Fatalf("admissions must stay fail-closed after an unrecognized storage failure: %+v", response)
 	}
 }
+
+// TestRegisterAcceptsStoreManifest pins that CPA plugin store lifecycle requests
+// carrying the store manifest block register and reconfigure without rejection.
+func TestRegisterAcceptsStoreManifest(t *testing.T) {
+	m := NewManager()
+	dir := t.TempDir()
+	t.Cleanup(func() {
+		_, _ = m.HandleCall(pluginabi.MethodPluginShutdown, nil)
+	})
+
+	payload, err := json.Marshal(lifecycleRequest{
+		ConfigYAML:    []byte(fmt.Sprintf("enabled: true\npriority: 0\nstore:\n  id: cliproxyapi-credit-manager\n  name: Credit Manager\n  version: 0.1.2\ndata_dir: %q\n", dir)),
+		SchemaVersion: pluginabi.SchemaVersion,
+	})
+	if err != nil {
+		t.Fatalf("marshal lifecycle request: %v", err)
+	}
+
+	raw, err := m.HandleCall(pluginabi.MethodPluginRegister, payload)
+	if err != nil {
+		t.Fatalf("register returned error: %v", err)
+	}
+	var envelope pluginabi.Envelope
+	if err := json.Unmarshal(raw, &envelope); err != nil {
+		t.Fatalf("decode register envelope: %v", err)
+	}
+	if !envelope.OK {
+		t.Fatalf("register failed with store manifest: %s", raw)
+	}
+}

@@ -16,6 +16,7 @@ import (
 type Config struct {
 	Enabled            *bool          `yaml:"enabled" json:"-"`
 	Priority           int            `yaml:"priority" json:"-"`
+	Store              yaml.Node      `yaml:"store" json:"-"`
 	DataDir            string         `yaml:"data_dir" json:"data_dir"`
 	RetentionMonths    int            `yaml:"-" json:"retention_months"`
 	MaxPendingRequests int            `yaml:"max_pending_requests" json:"max_pending_requests"`

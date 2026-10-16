@@ -97,3 +97,31 @@ func TestDataDirWhitespaceRejected(t *testing.T) {
 		t.Fatalf("data dir = %q", c.DataDir)
 	}
 }
+
+// TestStoreManifestAccepted verifies that store-owned configuration metadata
+// injected by the CPA plugin store when installing a plugin is accepted without error.
+func TestStoreManifestAccepted(t *testing.T) {
+	raw := []byte(`
+enabled: true
+priority: 0
+store:
+  id: cliproxyapi-credit-manager
+  name: Credit Manager
+  source_id: custom-store
+  source_url: https://raw.githubusercontent.com/fengwk/cliproxyapi-credit-manager/main/registry.json
+  version: 0.1.2
+data_dir: ./data/cliproxyapi-credit-manager
+history:
+  retention_months: 3
+`)
+	cfg, err := Parse(raw)
+	if err != nil {
+		t.Fatalf("store manifest rejected: %v", err)
+	}
+	if cfg.Enabled == nil || !*cfg.Enabled {
+		t.Fatal("expected enabled to be true")
+	}
+	if cfg.Store.Kind == 0 {
+		t.Fatal("expected Store node to be parsed")
+	}
+}
