@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"math"
 	"slices"
 	"strings"
 	"time"
@@ -27,12 +28,19 @@ func (s *Store) Report(ctx context.Context, f Filter) (Report, error) {
 	}
 	where, args, execWhere, execArgs := buildPredicates(f, from, to)
 	page, size := normalizePaging(f)
+	// The offset is computed and range checked before any query: an unguarded
+	// (page-1)*size wraps negative, and SQLite reads a negative OFFSET as zero,
+	// quietly returning the first page under an extreme page number.
+	offset, err := pageOffset(page, size)
+	if err != nil {
+		return Report{}, err
+	}
 	bucket := bucketSize(f.Bucket)
 
 	// All derived numbers come from one read transaction so a concurrent writer
 	// cannot make the page, the total and the trend disagree.
 	var out Report
-	err := s.withSnapshot(ctx, func(q querier) error {
+	err = s.withSnapshot(ctx, func(q querier) error {
 		summary, err := s.reportSummary(ctx, q, where, args, execWhere, execArgs)
 		if err != nil {
 			return err
@@ -45,7 +53,7 @@ func (s *Store) Report(ctx context.Context, f Filter) (Report, error) {
 		if err != nil {
 			return err
 		}
-		items, err := s.reportItems(ctx, q, where, args, execWhere, execArgs, page, size)
+		items, err := s.reportItems(ctx, q, where, args, execWhere, execArgs, size, offset)
 		if err != nil {
 			return err
 		}
@@ -79,6 +87,20 @@ func normalizePaging(f Filter) (int, int) {
 		size = maxPageSize
 	}
 	return page, size
+}
+
+// pageOffset returns the row offset of a normalized page as int64. It rejects a
+// page whose offset does not fit an int64 instead of letting (page-1)*size wrap
+// to a negative value that SQLite would read as the first page.
+func pageOffset(page, size int) (int64, error) {
+	p, s := int64(page), int64(size)
+	if p < 1 || s < 1 {
+		return 0, fmt.Errorf("%w: page and page size must be positive", ErrInvalid)
+	}
+	if p-1 > math.MaxInt64/s {
+		return 0, fmt.Errorf("%w: page is out of range", ErrInvalid)
+	}
+	return (p - 1) * s, nil
 }
 
 // bucketSize maps the requested bucket to nanoseconds; unknown values mean day.
@@ -346,10 +368,10 @@ func (s *Store) reportTrend(ctx context.Context, q querier, where string, args [
 	return out, nil
 }
 
-func (s *Store) reportItems(ctx context.Context, q querier, where string, args []any, execWhere string, execArgs []any, page, size int) ([]Request, error) {
+func (s *Store) reportItems(ctx context.Context, q querier, where string, args []any, execWhere string, execArgs []any, size int, offset int64) ([]Request, error) {
 	rows, err := q.QueryContext(ctx, `SELECT `+requestColumns+` FROM requests r WHERE `+where+`
 		ORDER BY r.started_at DESC, r.id DESC LIMIT ? OFFSET ?`,
-		append(append([]any{}, args...), size, (page-1)*size)...)
+		append(append([]any{}, args...), size, offset)...)
 	if err != nil {
 		return nil, fmt.Errorf("list requests: %w", err)
 	}

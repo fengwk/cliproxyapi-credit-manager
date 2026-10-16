@@ -222,9 +222,16 @@ var _ Backend = (*Store)(nil)
 // existing directory reuses the pepper and marks crashed executions pending.
 // Only one process may own a directory at a time.
 func Open(opts Options) (*Store, error) {
-	dir := strings.TrimSpace(opts.DataDir)
+	dir := opts.DataDir
 	if dir == "" {
 		return nil, fmt.Errorf("%w: data dir is required", ErrInvalid)
+	}
+	// The configured directory is used verbatim: silently trimming it would
+	// relocate the ledger and pepper into a different directory than the path
+	// the operator, the health report and the capture settings point at. Only
+	// leading/trailing whitespace is refused; embedded spaces stay valid.
+	if strings.TrimSpace(dir) != dir {
+		return nil, fmt.Errorf("%w: data dir must not have leading or trailing whitespace", ErrInvalid)
 	}
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, fmt.Errorf("create data dir: %w", err)
