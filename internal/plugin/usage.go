@@ -14,9 +14,9 @@ import (
 )
 
 // errOrphanUsage marks a usage record that belongs to this plugin but can not
-// be attributed to a reserved request. It is surfaced through health instead of
+// be attributed to an admitted request. It is surfaced through health instead of
 // being guessed into an accounting row.
-var errOrphanUsage = errors.New("usage record cannot be attributed to a reserved request")
+var errOrphanUsage = errors.New("usage record cannot be attributed to an admitted request")
 
 // handleUsage records one completed execution. Usage delivery is best effort on
 // the host side, so a malformed payload is acknowledged and reported through
@@ -33,7 +33,7 @@ func (m *Manager) handleUsage(request []byte) ([]byte, error) {
 	return okEnvelope(struct{}{})
 }
 
-// recordUsage attributes one usage record to a reserved request and settles it
+// recordUsage attributes one usage record to an admitted request and settles it
 // idempotently. Only records produced by this plugin's own frontend auth are
 // considered customer usage; the origin of the record is proven by the exact
 // AccessProvider the host derived from the client authentication path.
@@ -47,7 +47,7 @@ func (m *Manager) recordUsage(record pluginapi.UsageRecord) {
 	}
 	principal := strings.TrimSpace(record.APIKey)
 	// record.RequestID identifies one model execution, not the lifecycle request
-	// that reserved money; the lifecycle request is found through the trace. The
+	// that was admitted; the lifecycle request is found through the trace. The
 	// two must never be conflated: the core rejects a usage whose request id does
 	// not belong to the resolved request.
 	executionID := strings.TrimSpace(record.RequestID)
@@ -59,8 +59,8 @@ func (m *Manager) recordUsage(record pluginapi.UsageRecord) {
 
 	deps, ok := m.begin(false)
 	if !ok {
-		// Quiesced or shut down: the pending request stays pending in durable
-		// storage instead of being settled against nothing.
+		// Quiesced or shut down: the admitted request stays unresolved in
+		// durable storage instead of being settled against nothing.
 		m.recordError(errOrphanUsage)
 		return
 	}
@@ -111,23 +111,12 @@ func (m *Manager) recordUsage(record pluginapi.UsageRecord) {
 	}
 }
 
-// reportUsageFailure decides how a usage attribution failure is surfaced.
+// reportUsageFailure surfaces a usage attribution failure through health.
 //
-// Only business level rejections are reported through health: they describe one
-// record (an orphan, a malformed payload, a duplicate that must be reviewed)
-// and must not stop other keys. A storage or transaction fault must fail closed
-// instead, because accounting can no longer be trusted for any key.
+// A usage notification never gates future admissions: a malformed, conflicting
+// or transiently failing notification describes one record, and the next
+// admission re-validates its own storage state. The message names the affected
+// key so an operator can review the record.
 func (m *Manager) reportUsageFailure(err error, detail string) {
-	switch {
-	case errors.Is(err, credit.ErrNotFound),
-		errors.Is(err, credit.ErrUnauthorized),
-		errors.Is(err, credit.ErrDenied),
-		errors.Is(err, credit.ErrInvalid),
-		errors.Is(err, credit.ErrConflict):
-		// Health only: the pending request stays pending for an administrator to
-		// review, and other keys keep working.
-		m.recordError(fmt.Errorf("%s: %w", detail, err))
-	default:
-		m.recordFinanceFault(err)
-	}
+	m.recordError(fmt.Errorf("%s: %w", detail, err))
 }

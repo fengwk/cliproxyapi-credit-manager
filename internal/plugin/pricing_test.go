@@ -52,7 +52,8 @@ func ownUsage(id, trace, principal string, detail pluginapi.UsageDetail) plugina
 // TestInterceptorReadsPricingMetadataWithoutMutating pins that the interceptor
 // reads the requested image count from a private body copy, leaves the forwarded
 // request byte-identical, and still answers with the unchanged zero-value
-// envelope. The frozen count is what the ledger bills.
+// envelope. Admission charges nothing: the frozen count is what the ledger bills
+// once the proven successful lifecycle reports usage.
 func TestInterceptorReadsPricingMetadataWithoutMutating(t *testing.T) {
 	h := newHarness(t)
 	store := h.store()
@@ -75,20 +76,21 @@ func TestInterceptorReadsPricingMetadataWithoutMutating(t *testing.T) {
 		t.Fatalf("interceptor mutated the forwarded body: %s", req.Body)
 	}
 	key, err := store.GetKey(ctx, h.key.ID)
-	if err != nil || key.HeldMicroUSD != 150_000 {
-		t.Fatalf("held=%d err=%v, want the frozen three-image hold 150000", key.HeldMicroUSD, err)
+	if err != nil || key.SpentMicroUSD != 0 {
+		t.Fatalf("spent=%d err=%v, want no charge before usage is reported", key.SpentMicroUSD, err)
 	}
 	// The proven successful lifecycle bills the frozen count exactly once.
 	h.usage(ownUsage("exec-img", "trace-img", h.key.Principal, pluginapi.UsageDetail{InputTokens: 1, OutputTokens: 1, TotalTokens: 2}))
 	h.complete("req-img", "trace-img", pluginapi.RequestCompletionSucceeded)
 	key, err = store.GetKey(ctx, h.key.ID)
-	if err != nil || key.SpentMicroUSD != 150_000 || key.HeldMicroUSD != 0 {
-		t.Fatalf("spent=%d held=%d err=%v, want 150000/0", key.SpentMicroUSD, key.HeldMicroUSD, err)
+	if err != nil || key.SpentMicroUSD != 150_000 {
+		t.Fatalf("spent=%d err=%v, want the three-image charge 150000", key.SpentMicroUSD, err)
 	}
 }
 
 // TestInterceptorAppliesRequestedServiceTier pins that a service_tier in the
-// body raises the reservation without any context-tier estimate guess.
+// body is frozen at admission and bills the tier rate, with no context-tier
+// estimate guess and no effect on admission itself.
 func TestInterceptorAppliesRequestedServiceTier(t *testing.T) {
 	h := newHarness(t)
 	store := h.store()
@@ -100,25 +102,29 @@ func TestInterceptorAppliesRequestedServiceTier(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("PutPricingRule: %v", err)
 	}
-	// "standard" and "priority" have the same length, so only the tier differs.
-	if resp := h.interceptBody("req-a", "trace-a", `{"model":"test-model","tier":"standard"}`); resp.Terminate {
-		t.Fatalf("base intercept: %+v", resp)
+	settle := func(id, tier string) {
+		t.Helper()
+		if resp := h.interceptBody(id, "trace-"+id, `{"model":"test-model","tier":"`+tier+`"}`); resp.Terminate {
+			t.Fatalf("%s intercept: %+v", tier, resp)
+		}
+		h.usage(ownUsage("exec-"+id, "trace-"+id, h.key.Principal, pluginapi.UsageDetail{InputTokens: 1, TotalTokens: 1}))
+		h.complete(id, "trace-"+id, pluginapi.RequestCompletionSucceeded)
 	}
+	// "standard" and "priority" have the same length, so only the tier differs.
+	settle("req-a", "standard")
 	afterBase, err := store.GetKey(ctx, h.key.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if resp := h.interceptBody("req-b", "trace-b", `{"model":"test-model","tier":"priority"}`); resp.Terminate {
-		t.Fatalf("priority intercept: %+v", resp)
-	}
+	settle("req-b", "priority")
 	afterPriority, err := store.GetKey(ctx, h.key.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	baseHold := afterBase.HeldMicroUSD
-	priorityHold := afterPriority.HeldMicroUSD - baseHold
-	if baseHold <= 0 || priorityHold <= baseHold {
-		t.Fatalf("priority hold = %d, base hold = %d; the service tier must raise the hold", priorityHold, baseHold)
+	baseCharge := afterBase.SpentMicroUSD
+	priorityCharge := afterPriority.SpentMicroUSD - baseCharge
+	if baseCharge <= 0 || priorityCharge <= baseCharge {
+		t.Fatalf("priority charge = %d, base charge = %d; the service tier must raise the billed rate", priorityCharge, baseCharge)
 	}
 }
 
@@ -213,7 +219,8 @@ func TestUsageReportedDefaultTierDoesNotInheritFrozen(t *testing.T) {
 // requested image count: an explicit unsupported value fails closed for a
 // per-image price instead of being silently billed for a clamped number, an
 // omitted value means one image, and the same hint on a token request is
-// irrelevant rather than a rejection. The forwarded body is never modified.
+// irrelevant rather than a rejection. The forwarded body is never modified and
+// admission alone never charges.
 func TestInterceptorRefusesUnsupportedImageCount(t *testing.T) {
 	h := newHarness(t)
 	store := h.store()
@@ -253,23 +260,27 @@ func TestInterceptorRefusesUnsupportedImageCount(t *testing.T) {
 		if string(raw) != original {
 			t.Fatalf("body %s mutated: %s", body, raw)
 		}
-		if key, err := store.GetKey(ctx, h.key.ID); err != nil || key.HeldMicroUSD != 0 {
-			t.Fatalf("body %s: held = %d err = %v, want no reservation", body, key.HeldMicroUSD, err)
+		if key, err := store.GetKey(ctx, h.key.ID); err != nil || key.SpentMicroUSD != 0 {
+			t.Fatalf("body %s: spent = %d err = %v, want no charge", body, key.SpentMicroUSD, err)
 		}
 	}
-	// An omitted count is one image.
+	// An omitted count is one image, billed once the lifecycle proves success.
 	if resp := imageIntercept("req-default", `{"model":"img-model"}`); resp.Terminate {
 		t.Fatalf("omitted count: %+v", resp)
 	}
-	if key, err := store.GetKey(ctx, h.key.ID); err != nil || key.HeldMicroUSD != 50_000 {
-		t.Fatalf("omitted count held = %d err = %v, want 50000 for one image", key.HeldMicroUSD, err)
+	h.usage(ownUsage("exec-default", "trace-req-default", h.key.Principal, pluginapi.UsageDetail{InputTokens: 1, TotalTokens: 1}))
+	h.complete("req-default", "trace-req-default", pluginapi.RequestCompletionSucceeded)
+	if key, err := store.GetKey(ctx, h.key.ID); err != nil || key.SpentMicroUSD != 50_000 {
+		t.Fatalf("omitted count spent = %d err = %v, want 50000 for one image", key.SpentMicroUSD, err)
 	}
 	// A supported count is billed exactly.
 	if resp := imageIntercept("req-two", `{"model":"img-model","n":2}`); resp.Terminate {
 		t.Fatalf("supported count: %+v", resp)
 	}
-	if key, err := store.GetKey(ctx, h.key.ID); err != nil || key.HeldMicroUSD != 150_000 {
-		t.Fatalf("two-image held = %d err = %v, want 150000", key.HeldMicroUSD, err)
+	h.usage(ownUsage("exec-two", "trace-req-two", h.key.Principal, pluginapi.UsageDetail{InputTokens: 1, TotalTokens: 1}))
+	h.complete("req-two", "trace-req-two", pluginapi.RequestCompletionSucceeded)
+	if key, err := store.GetKey(ctx, h.key.ID); err != nil || key.SpentMicroUSD != 150_000 {
+		t.Fatalf("two-image spent = %d err = %v, want 150000", key.SpentMicroUSD, err)
 	}
 	// A token price ignores the hint: an image hint is not a billing input there,
 	// so it must never turn into a rejection.

@@ -23,7 +23,7 @@ func (m *Manager) handleRequestComplete(request []byte) ([]byte, error) {
 	return okEnvelope(struct{}{})
 }
 
-// complete settles the terminal state of a reserved request. The native
+// complete settles the terminal state of an admitted request. The native
 // outcome is preserved verbatim: succeeded, failed, rejected and canceled are
 // four distinct states and are never collapsed into one another.
 func (m *Manager) complete(completion pluginapi.RequestCompletion) {
@@ -33,7 +33,7 @@ func (m *Manager) complete(completion pluginapi.RequestCompletion) {
 	}
 	deps, ok := m.begin(false)
 	if !ok {
-		// Quiesced or shut down: the request keeps its durable pending state
+		// Quiesced or shut down: the request keeps its durable unresolved state
 		// instead of being faked into a settlement.
 		return
 	}
@@ -55,12 +55,14 @@ func (m *Manager) complete(completion pluginapi.RequestCompletion) {
 		return
 	case errors.Is(err, credit.ErrNotFound):
 		// No associated request: the execution was a native token-count probe
-		// (never reserved), or its history was purged. An unknown old event may
+		// (never admitted), or its history was purged. An unknown old event may
 		// not resurrect a request and must not fail the plugin closed.
 		return
 	default:
-		// A finance failure blocks new admissions so the plugin fails closed.
-		m.recordFinanceFault(err)
+		// A completion storage failure is reported through health; it never
+		// latches a global admission gate, so the next admission validates its
+		// own storage state.
+		m.recordError(err)
 	}
 }
 

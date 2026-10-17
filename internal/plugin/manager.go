@@ -67,19 +67,12 @@ type Manager struct {
 
 	// mu guards the fields below. It is only ever held for short snapshots, so
 	// no external store call is ever made while holding it.
-	mu               sync.Mutex
-	state            lifecycleState
-	live             *liveState
-	raw              []byte
-	hasConfig        bool
-	lastError        string
-	admissionBlocked bool
-
-	// hostCall is the host callback bridge installed by the native ABI shim. It
-	// is nil when the plugin runs without a host and then issues no warmup.
-	hostCall func(method string, payload []byte) ([]byte, error)
-	// warmup is the single background warmup worker, nil when none is running.
-	warmup *warmupWorker
+	mu        sync.Mutex
+	state     lifecycleState
+	live      *liveState
+	raw       []byte
+	hasConfig bool
+	lastError string
 
 	maintenanceCancel context.CancelFunc
 	maintenanceDone   chan struct{}
@@ -142,7 +135,7 @@ func (m *Manager) HandleCall(method string, request []byte) (resp []byte, err er
 
 // begin snapshots the live dependencies and marks one in-flight call. The
 // caller must pair it with end. When admission is true the call creates new
-// accounting and is refused unless the plugin is live and financially healthy.
+// accounting and is refused unless the plugin is live.
 func (m *Manager) begin(admission bool) (*liveState, bool) {
 	m.gate.RLock()
 	m.mu.Lock()
@@ -151,7 +144,7 @@ func (m *Manager) begin(admission bool) (*liveState, bool) {
 		m.gate.RUnlock()
 		return nil, false
 	}
-	if admission && (m.state != stateLive || m.admissionBlocked) {
+	if admission && m.state != stateLive {
 		m.gate.RUnlock()
 		return nil, false
 	}
@@ -171,8 +164,8 @@ func (m *Manager) LastError() string {
 }
 
 // recordError sets the sticky health message without blocking admissions. It is
-// used for maintenance and usage problems that must be observable but must not
-// stop the proxy.
+// used for maintenance, usage and admission problems that must be observable
+// but must not stop the proxy.
 func (m *Manager) recordError(err error) {
 	if err == nil {
 		return
@@ -181,20 +174,6 @@ func (m *Manager) recordError(err error) {
 	if m.lastError == "" {
 		m.lastError = err.Error()
 	}
-	m.mu.Unlock()
-}
-
-// recordFinanceFault records a financial failure and blocks new admissions so
-// the plugin fails closed instead of admitting unmetered requests.
-func (m *Manager) recordFinanceFault(err error) {
-	if err == nil {
-		return
-	}
-	m.mu.Lock()
-	if m.lastError == "" {
-		m.lastError = err.Error()
-	}
-	m.admissionBlocked = true
 	m.mu.Unlock()
 }
 
@@ -252,8 +231,8 @@ func (m *Manager) apply(raw []byte, hostSchema uint32) ([]byte, error) {
 		return m.resumeAttached(reg)
 	}
 	if previous != nil && previous.cfg.DataDir != cfg.DataDir {
-		// Moving the accounting database at runtime would strand the holds and
-		// unresolved debts recorded in the old file. The host must stop and start
+		// Moving the accounting database at runtime would strand the requests
+		// and debts recorded in the old file. The host must stop and start
 		// the plugin to relocate it.
 		return errorEnvelope(&PluginError{
 			Code:       "data_dir_immutable",
@@ -262,26 +241,9 @@ func (m *Manager) apply(raw []byte, hostSchema uint32) ([]byte, error) {
 		})
 	}
 
-	// Pause the probe loop and retire it once its pass is idle, before the
-	// exclusive gate is taken.
-	//
-	// Two reasons: a customer request must not be refused (or the gate held)
-	// while waiting on a probe that can run for as long as the upstream takes;
-	// and a probe's own nested execution can still deliver usage/complete
-	// callbacks into this plugin, which must never be blocked behind a gate
-	// held by the transition that is waiting for that same probe.
-	//
-	// A probe that does not go idle inside the grace is never abandoned: the
-	// swap is refused, the paused worker is resumed and the previous
-	// configuration keeps probing. This is a recoverable operator conflict
-	// rather than a warmup fault, so it does not degrade health.
-	if !m.stopWarmupForSwap() {
-		return errorEnvelope(&PluginError{Code: "busy", Message: "a warmup probe is still in flight", HTTPStatus: http.StatusConflict})
-	}
-
 	// Refuse new accounting before the exclusive gate blocks the swap, then
 	// drain in-flight calls. Draining first is what makes the liveness check
-	// below sound: a reservation that started earlier must have committed
+	// below sound: an admission that started earlier must have committed
 	// before the old database is judged safe to release.
 	m.mu.Lock()
 	m.state = stateReconfiguring
@@ -300,14 +262,11 @@ func (m *Manager) apply(raw []byte, hostSchema uint32) ([]byte, error) {
 	}
 	if errActive != nil || active {
 		// The refused swap must undo its own state change: a quiesced plugin
-		// stays quiesced, and only a plugin that goes back to live restarts the
-		// previous periodic warmup with exactly one replacement worker.
+		// stays quiesced, and only a plugin that goes back to live keeps
+		// serving its previous configuration.
 		m.mu.Lock()
 		m.state = previousState
 		m.mu.Unlock()
-		if previousState == stateLive && previous != nil {
-			m.startWarmup(previous.cfg.Warmup)
-		}
 		return errorEnvelope(&PluginError{Code: "busy", Message: "unfinished requests are still being settled", HTTPStatus: http.StatusConflict})
 	}
 
@@ -317,9 +276,8 @@ func (m *Manager) apply(raw []byte, hostSchema uint32) ([]byte, error) {
 	m.closeLive(m.detach())
 
 	store, err := credit.Open(credit.Options{
-		DataDir:            cfg.DataDir,
-		RetentionMonths:    cfg.RetentionMonths,
-		MaxPendingRequests: cfg.MaxPendingRequests,
+		DataDir:         cfg.DataDir,
+		RetentionMonths: cfg.RetentionMonths,
 	})
 	if err != nil {
 		m.restore(previousRaw, previousHasConfig, previousState)
@@ -346,13 +304,11 @@ func (m *Manager) apply(raw []byte, hostSchema uint32) ([]byte, error) {
 	m.hasConfig = true
 	m.state = stateLive
 	m.lastError = ""
-	m.admissionBlocked = false
 	m.mu.Unlock()
 	if captureFault != nil {
 		m.recordError(captureFault)
 	}
 	m.startMaintenance(store, captures)
-	m.startWarmup(cfg.Warmup)
 	return okEnvelope(reg)
 }
 
@@ -362,8 +318,8 @@ func (m *Manager) apply(raw []byte, hostSchema uint32) ([]byte, error) {
 //
 // A successful reopen restores the state the plugin had before the swap, so a
 // refused reconfigure can never turn a quiesced plugin back into a live one.
-// Periodic maintenance and warmup restart only for a plugin that really serves
-// requests again.
+// Periodic maintenance restarts only for a plugin that really serves requests
+// again.
 func (m *Manager) restore(raw []byte, hasConfig bool, previousState lifecycleState) {
 	m.mu.Lock()
 	m.state = stateQuiesced
@@ -376,9 +332,8 @@ func (m *Manager) restore(raw []byte, hasConfig bool, previousState lifecycleSta
 		return
 	}
 	store, err := credit.Open(credit.Options{
-		DataDir:            cfg.DataDir,
-		RetentionMonths:    cfg.RetentionMonths,
-		MaxPendingRequests: cfg.MaxPendingRequests,
+		DataDir:         cfg.DataDir,
+		RetentionMonths: cfg.RetentionMonths,
 	})
 	if err != nil {
 		return
@@ -399,7 +354,6 @@ func (m *Manager) restore(raw []byte, hasConfig bool, previousState lifecycleSta
 		return
 	}
 	m.startMaintenance(store, captures)
-	m.startWarmup(cfg.Warmup)
 }
 
 // resumeAttached re-activates the configuration that is still attached after a
@@ -407,10 +361,10 @@ func (m *Manager) restore(raw []byte, hasConfig bool, previousState lifecycleSta
 //
 // The host brings a quiesced plugin back by re-sending the configuration it
 // already applied, so the attached store is reused instead of reopened:
-// requests that reserved money before the quiesce keep their association and
-// can still be settled, and periodic maintenance and warmup restart only
-// because the plugin is really serving again. It never reports success while
-// the plugin stays quiesced.
+// requests that were admitted before the quiesce keep their association and
+// can still be settled, and periodic maintenance restarts only because the
+// plugin is really serving again. It never reports success while the plugin
+// stays quiesced.
 func (m *Manager) resumeAttached(reg registration) ([]byte, error) {
 	m.mu.Lock()
 	if m.state != stateQuiesced || m.live == nil {
@@ -425,7 +379,6 @@ func (m *Manager) resumeAttached(reg registration) ([]byte, error) {
 	m.state = stateLive
 	m.mu.Unlock()
 	m.startMaintenance(current.store, current.captures)
-	m.startWarmup(current.cfg.Warmup)
 	return okEnvelope(reg)
 }
 
@@ -494,7 +447,7 @@ func (m *Manager) closeLive(state *liveState) {
 
 // quiesce refuses new admissions and prepares the plugin to be replaced.
 //
-// Settling a reserved request is never dropped: in-flight handler calls are
+// Settling an admitted request is never dropped: in-flight handler calls are
 // drained first, and the accounting database is released only when the backend
 // can prove it holds no unfinished request. Otherwise the stores stay open so
 // late usage and completion events still settle. Shutdown always releases them.
@@ -510,14 +463,6 @@ func (m *Manager) quiesce() {
 	current := m.live
 	m.mu.Unlock()
 
-	// Stop new probes, including the rest of a running pass, before waiting on
-	// anything. A probe already inside the host is not awaited here: quiesce
-	// must not block on a synchronous host call it can not cancel. The worker
-	// is paused, not retired, so a refused or resumed transition keeps exactly
-	// one probe loop and shutdown can still wait for it before this library is
-	// unloaded.
-	m.pauseWarmup()
-
 	m.enterExclusive()
 	defer m.exitExclusive()
 	m.stopMaintenance()
@@ -528,7 +473,7 @@ func (m *Manager) quiesce() {
 		return
 	}
 	if active {
-		// Cannot prove the database is settled: keep it open so reserved
+		// Cannot prove the database is settled: keep it open so admitted
 		// requests can still be completed instead of losing accounting.
 		return
 	}
@@ -548,16 +493,8 @@ func (m *Manager) shutdown() {
 	m.state = stateClosed
 	m.mu.Unlock()
 
-	// Wait for an in-flight warmup probe before returning, and before the
-	// exclusive gate is taken so a probe's own callbacks can still reach this
-	// plugin. The host frees its callback context and dlclose()s this library
-	// as soon as this returns, so this wait is intentionally unbounded: letting
-	// the library go while one of its goroutines can still return into host
-	// memory is a use-after-free, and a bounded wait would only hide it. There
-	// is no host-side cancellation for a model execution, so a stuck upstream
-	// request delays shutdown.
-	m.drainWarmupForShutdown()
-
+	// Handlers are bounded local store calls, so draining the exclusive gate
+	// terminates before the stores are closed and this library is unloaded.
 	m.enterExclusive()
 	defer m.exitExclusive()
 	m.stopMaintenance()
