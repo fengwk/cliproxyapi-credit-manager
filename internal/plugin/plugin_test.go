@@ -484,10 +484,10 @@ func TestOwnAccessProviderRequiresExactPluginID(t *testing.T) {
 }
 
 // TestInterceptRequiresRequestedModel verifies the current-CPA input contract:
-// the requested model is the only id this plugin prices and freezes, so a
-// request that omits it is refused -- even when the host resolved a concrete
-// upstream model -- without creating any accounting row and without guessing an
-// id from the resolved model.
+// the requested model is the id this plugin checks against permissions and
+// records as the request model, so a request that omits it is refused -- even
+// when the host resolved a concrete upstream model -- without creating any
+// accounting row and without guessing an id from the resolved model.
 func TestInterceptRequiresRequestedModel(t *testing.T) {
 	h := newHarness(t)
 	for _, tc := range []struct {
@@ -521,31 +521,30 @@ func TestInterceptRequiresRequestedModel(t *testing.T) {
 	}
 }
 
-// TestInterceptBillsAliasRequestByRequestedModel verifies that an alias request
-// is priced and frozen by the client-requested id only: the alias, not the
-// resolved upstream model the host reports alongside it.
-func TestInterceptBillsAliasRequestByRequestedModel(t *testing.T) {
+// TestExecutionCostUsesActualUsageModel verifies that the query-time cost uses
+// the exact actual usage model, never the request alias or the reported
+// response model.
+func TestExecutionCostUsesActualUsageModel(t *testing.T) {
 	h := newHarness(t)
 	store := h.store()
 	ctx := context.Background()
-	if err := store.PutPrice(ctx, credit.Price{Model: "alias-model", Rates: credit.Rates{Input: 1_000_000}}); err != nil {
+	// The request alias and response model carry a much higher price than the
+	// actual execution model, so a wrong lookup is visible.
+	if err := store.PutPrice(ctx, credit.Price{Model: "alias-model", Rates: credit.Rates{Input: 9_000_000}}); err != nil {
 		t.Fatalf("PutPrice: %v", err)
 	}
 	req := h.request("req-alias", "trace-alias")
-	// The host resolves the alias to a different upstream id; billing must stay
-	// on the requested alias.
 	req.RequestedModel, req.Model = "alias-model", "resolved-upstream-model"
 	if response := h.intercept(req); response.Terminate {
 		t.Fatalf("alias admission failed: %+v", response)
 	}
-	h.usage(ownUsage("exec-alias", "trace-alias", h.key.Principal, pluginapi.UsageDetail{InputTokens: 1, TotalTokens: 1}))
+	record := ownUsage("exec-alias", "trace-alias", h.key.Principal, pluginapi.UsageDetail{InputTokens: 1, TotalTokens: 1})
+	record.ResponseModel = "alias-model"
+	h.usage(record)
 	h.complete("req-alias", "trace-alias", pluginapi.RequestCompletionSucceeded)
-	key, err := store.GetKey(ctx, h.key.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if key.SpentMicroUSD != 1 {
-		t.Fatalf("alias spend = %d, want the alias price 1 (never the resolved id)", key.SpentMicroUSD)
+	summary := h.report(credit.Filter{KeyID: h.key.ID}).Summary
+	if summary.CostMicroUSD != 1 {
+		t.Fatalf("cost = %d, want the actual-model price 1 (never the alias or response model)", summary.CostMicroUSD)
 	}
 }
 
@@ -583,12 +582,9 @@ func TestInterceptAdmitThenSettle(t *testing.T) {
 	if len(response.Body) != 0 || len(response.Headers) != 0 || response.Path != "" || len(response.ClearHeaders) != 0 {
 		t.Fatalf("before-auth interception must not modify the request: %+v", response)
 	}
-	admitted, err := h.store().GetKey(context.Background(), h.key.ID)
-	if err != nil {
-		t.Fatalf("GetKey: %v", err)
-	}
-	if admitted.SpentMicroUSD != 0 {
-		t.Fatalf("spent = %d, want no charge before usage is reported", admitted.SpentMicroUSD)
+	admitted := h.report(credit.Filter{KeyID: h.key.ID}).Summary
+	if admitted.Executions != 0 || admitted.CostMicroUSD != 0 {
+		t.Fatalf("admission created a priced execution: %+v", admitted)
 	}
 
 	h.usage(pluginapi.UsageRecord{
@@ -599,12 +595,9 @@ func TestInterceptAdmitThenSettle(t *testing.T) {
 	})
 	h.complete("req-1", "trace-1", pluginapi.RequestCompletionSucceeded)
 
-	key, err := h.store().GetKey(context.Background(), h.key.ID)
-	if err != nil {
-		t.Fatalf("GetKey: %v", err)
-	}
-	if key.SpentMicroUSD != 2000 {
-		t.Fatalf("spent = %d, want the settled actual usage charge 2000", key.SpentMicroUSD)
+	settled := h.report(credit.Filter{KeyID: h.key.ID}).Summary
+	if settled.CostMicroUSD != 2000 || settled.UnpricedExecutions != 0 {
+		t.Fatalf("settled summary = %+v, want the actual usage cost 2000", settled)
 	}
 }
 
@@ -632,12 +625,9 @@ func TestInterceptCountTokensSkipsBillingButKeepsPermissions(t *testing.T) {
 	if response.Terminate {
 		t.Fatalf("allowed count_tokens probe was terminated: %+v", response)
 	}
-	stored, err := h.store().GetKey(ctx, key.ID)
-	if err != nil {
-		t.Fatalf("GetKey: %v", err)
-	}
-	if stored.SpentMicroUSD != 0 {
-		t.Fatalf("count_tokens must never be billed, spent = %d", stored.SpentMicroUSD)
+	stored := h.report(credit.Filter{KeyID: key.ID}).Summary
+	if stored.Executions != 0 || stored.CostMicroUSD != 0 {
+		t.Fatalf("count_tokens must never create usage, summary = %+v", stored)
 	}
 
 	req.RequestID = "count-2"
@@ -756,12 +746,9 @@ func TestUsageIgnoresForeignAndInternalRecords(t *testing.T) {
 		APIKey: h.key.Principal, Source: "warmup",
 		Detail: pluginapi.UsageDetail{InputTokens: 10, OutputTokens: 5, TotalTokens: 15},
 	})
-	key, err := h.store().GetKey(context.Background(), h.key.ID)
-	if err != nil {
-		t.Fatalf("GetKey: %v", err)
-	}
-	if key.SpentMicroUSD != 0 {
-		t.Fatalf("foreign and background records must not be billed, spent = %d", key.SpentMicroUSD)
+	summary := h.report(credit.Filter{KeyID: h.key.ID}).Summary
+	if summary.Executions != 0 || summary.CostMicroUSD != 0 {
+		t.Fatalf("foreign and background records must not be recorded, summary = %+v", summary)
 	}
 }
 
@@ -873,11 +860,20 @@ func TestManagementRoutesAndResourceWhitelist(t *testing.T) {
 		"PUT " + web.BasePath + "/api/prices",
 		"GET " + web.BasePath + "/api/usage",
 		"GET " + web.BasePath + "/api/capture",
-		"POST " + web.BasePath + "/api/resolve",
+		"POST " + web.BasePath + "/api/reset-tokens",
 		"GET " + web.BasePath + "/api/health",
 	} {
 		if !found[want] {
 			t.Fatalf("management route %s is not registered", want)
+		}
+	}
+	// Retired routes are no longer registered at all.
+	for _, retired := range []string{
+		"POST " + web.BasePath + "/api/resolve",
+		"POST " + web.BasePath + "/api/reset-spend",
+	} {
+		if found[retired] {
+			t.Fatalf("retired route %s is still registered", retired)
 		}
 	}
 	// The registered resources are the static asset allow list plus the public
@@ -911,6 +907,24 @@ func TestManagementRoutesAndResourceWhitelist(t *testing.T) {
 	apiResponse := decodeInto[pluginapi.ManagementResponse](t, api)
 	if apiResponse.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("unauthenticated management call must be 401, got %d", apiResponse.StatusCode)
+	}
+
+	// Retired management routes are not registered and answer 404 even to an
+	// authenticated management request.
+	for _, retired := range []string{"/api/resolve", "/api/reset-spend"} {
+		gone := h.call(pluginabi.MethodManagementHandle, pluginapi.ManagementRequest{
+			Method: "POST", Path: web.BasePath + retired,
+			Headers: http.Header{
+				"Authorization": {"Bearer synthetic-manager"},
+				"Content-Type":  {"application/json"},
+			},
+			Body: []byte(`{"id":"x","total":true,"reason":"x"}`),
+		})
+		goneResponse := decodeInto[pluginapi.ManagementResponse](t, gone)
+		if goneResponse.StatusCode != http.StatusNotFound {
+			t.Fatalf("retired route %s must be 404, got %d: %s",
+				retired, goneResponse.StatusCode, goneResponse.Body)
+		}
 	}
 
 	// Unknown resource paths never resolve.
@@ -977,12 +991,9 @@ func TestQuiesceKeepsSettlingAdmittedRequests(t *testing.T) {
 		Detail:         pluginapi.UsageDetail{InputTokens: 1000, OutputTokens: 500, TotalTokens: 1500},
 	})
 	h.complete("req-late", "trace-late", pluginapi.RequestCompletionSucceeded)
-	key, err := h.store().GetKey(context.Background(), h.key.ID)
-	if err != nil {
-		t.Fatalf("GetKey: %v", err)
-	}
-	if key.SpentMicroUSD != 2000 {
-		t.Fatalf("admitted request lost on quiesce: spent=%d want 2000", key.SpentMicroUSD)
+	summary := h.report(credit.Filter{KeyID: h.key.ID}).Summary
+	if summary.CostMicroUSD != 2000 {
+		t.Fatalf("admitted request lost on quiesce: cost=%d want 2000", summary.CostMicroUSD)
 	}
 }
 
@@ -1134,12 +1145,9 @@ func TestConcurrentUsageAndCompletionSettleExactlyOnce(t *testing.T) {
 		t.Fatalf("concurrent settlement error: %v", err)
 	}
 
-	key, err := h.store().GetKey(context.Background(), h.key.ID)
-	if err != nil {
-		t.Fatalf("GetKey: %v", err)
-	}
-	if key.SpentMicroUSD != 2000 {
-		t.Fatalf("spent = %d, want exactly one settlement of 2000 microUSD", key.SpentMicroUSD)
+	summary := h.report(credit.Filter{KeyID: h.key.ID}).Summary
+	if summary.CostMicroUSD != 2000 || summary.Executions != 1 {
+		t.Fatalf("summary = %+v, want exactly one settlement of 2000 microUSD", summary)
 	}
 }
 
@@ -1150,6 +1158,16 @@ func (h *harness) request(id, trace string) pluginapi.RequestInterceptRequest {
 		Body:     []byte(`{"model":"test-model","max_tokens":128}`),
 		Metadata: map[string]any{"caller_scope": h.key.Scope, "request_path": "/v1/messages"},
 	}
+}
+
+// report reads the current query-time report for one selection.
+func (h *harness) report(filter credit.Filter) credit.Report {
+	h.t.Helper()
+	report, err := h.store().Report(context.Background(), filter)
+	if err != nil {
+		h.t.Fatalf("Report: %v", err)
+	}
+	return report
 }
 
 func (h *harness) usage(record pluginapi.UsageRecord) {
@@ -1186,12 +1204,9 @@ func TestUsageSettlesAcrossDistinctLifecycleAndExecutionIDs(t *testing.T) {
 		t.Fatalf("an execution id distinct from the lifecycle id must attribute cleanly, health=%q", message)
 	}
 	h.complete("req-lifecycle", "trace-lifecycle", pluginapi.RequestCompletionSucceeded)
-	key, err := h.store().GetKey(context.Background(), h.key.ID)
-	if err != nil {
-		t.Fatalf("GetKey: %v", err)
-	}
-	if key.SpentMicroUSD != 2000 {
-		t.Fatalf("spent = %d, want the execution charge 2000", key.SpentMicroUSD)
+	summary := h.report(credit.Filter{KeyID: h.key.ID}).Summary
+	if summary.CostMicroUSD != 2000 {
+		t.Fatalf("cost = %d, want the execution charge 2000", summary.CostMicroUSD)
 	}
 }
 
@@ -1217,12 +1232,9 @@ func TestUsageConflictIsHealthOnlyAndKeepsServing(t *testing.T) {
 	if message == "" || !strings.Contains(message, h.key.ID) {
 		t.Fatalf("a conflicting usage record must be reported with the affected key, got %q", message)
 	}
-	key, err := h.store().GetKey(context.Background(), h.key.ID)
-	if err != nil {
-		t.Fatalf("GetKey: %v", err)
-	}
-	if key.SpentMicroUSD == 0 {
-		t.Fatal("a conflicting usage must not write off the already booked charge")
+	summary := h.report(credit.Filter{KeyID: h.key.ID}).Summary
+	if summary.CostMicroUSD == 0 {
+		t.Fatal("a conflicting usage must not write off the already recorded execution")
 	}
 	if response := h.intercept(h.request("req-after-conflict", "trace-after-conflict")); response.Terminate {
 		t.Fatalf("other requests must keep being admitted: %+v", response)
@@ -1258,16 +1270,49 @@ func TestUsageStorageFaultIsHealthOnly(t *testing.T) {
 	}
 }
 
-// TestQuotaRejectionDoesNotDisableOtherKeys pins soft post-usage quota
-// admission: a key with a positive remaining quota admits a request even with a
-// tiny configured limit (quota=1, spent=0), the reported actual usage is charged
-// in full beyond that limit, only then does the exhausted key reject the next
-// request, and no other key or the health state is affected.
-func TestQuotaRejectionDoesNotDisableOtherKeys(t *testing.T) {
+// TestBudgetsDoNotGateAdmission pins the display-only budget contract: the
+// four USD budget figures never refuse a request, while a real model token
+// limit still does. A request far beyond the recorded budget is admitted and
+// its actual usage is recorded, and only token exhaustion rejects the next
+// request as a normal business outcome.
+func TestBudgetsDoNotGateAdmission(t *testing.T) {
 	h := newHarness(t)
 	ctx := context.Background()
+	budgeted, _, err := h.store().CreateKey(ctx, credit.KeySpec{
+		Label: "budgeted", Enabled: true,
+		QuotaMicroUSD: 1, DailyMicroUSD: 1, WeeklyMicroUSD: 1, MonthlyMicroUSD: 1,
+	})
+	if err != nil {
+		t.Fatalf("CreateKey: %v", err)
+	}
+	budgetRequest := func(id, trace string) pluginapi.RequestInterceptRequest {
+		req := h.request(id, trace)
+		req.Metadata = map[string]any{"caller_scope": budgeted.Scope, "request_path": "/v1/messages"}
+		return req
+	}
+
+	if response := h.intercept(budgetRequest("req-budget-admit", "trace-budget-admit")); response.Terminate {
+		t.Fatalf("a tiny display budget must not refuse the request: %+v", response)
+	}
+	h.usage(pluginapi.UsageRecord{
+		RequestID: "exec-budget", TraceID: "trace-budget-admit", Provider: "openai", Model: testModel,
+		APIKey: budgeted.Principal, AccessProvider: "plugin:cliproxyapi-credit-manager:" + authProviderID,
+		Detail: pluginapi.UsageDetail{InputTokens: 1000, OutputTokens: 500, TotalTokens: 1500},
+	})
+	h.complete("req-budget-admit", "trace-budget-admit", pluginapi.RequestCompletionSucceeded)
+	summary := h.report(credit.Filter{KeyID: budgeted.ID}).Summary
+	if summary.CostMicroUSD != 2000 {
+		t.Fatalf("actual usage must be recorded beyond every budget: %+v", summary)
+	}
+	// The budget is only display data: the next request is still admitted.
+	if response := h.intercept(budgetRequest("req-budget-again", "trace-budget-again")); response.Terminate {
+		t.Fatalf("an exhausted display budget must not refuse the next request: %+v", response)
+	}
+
+	// A model token limit is an admission limit and still rejects normally.
 	limited, _, err := h.store().CreateKey(ctx, credit.KeySpec{
-		Label: "limited", Enabled: true, QuotaMicroUSD: 1,
+		Label: "token-limited", Enabled: true,
+		ModelTokenLimits: []credit.ModelTokenLimit{{Model: testModel, Total: 1}},
 	})
 	if err != nil {
 		t.Fatalf("CreateKey: %v", err)
@@ -1277,128 +1322,120 @@ func TestQuotaRejectionDoesNotDisableOtherKeys(t *testing.T) {
 		req.Metadata = map[string]any{"caller_scope": limited.Scope, "request_path": "/v1/messages"}
 		return req
 	}
-
-	// A positive remaining quota admits the request: admission compares no
-	// estimate against the limit, so a declared body far larger than the quota
-	// is still admitted.
-	if response := h.intercept(limitedRequest("req-quota-admit", "trace-quota-admit")); response.Terminate {
-		t.Fatalf("a positive remaining quota must admit the request: %+v", response)
+	if response := h.intercept(limitedRequest("req-token-admit", "trace-token-admit")); response.Terminate {
+		t.Fatalf("a positive remaining token limit must admit: %+v", response)
 	}
-	// The reported actual usage is charged in full, beyond the limit.
 	h.usage(pluginapi.UsageRecord{
-		RequestID: "exec-quota", TraceID: "trace-quota-admit", Provider: "openai", Model: testModel,
+		RequestID: "exec-token", TraceID: "trace-token-admit", Provider: "openai", Model: testModel,
 		APIKey: limited.Principal, AccessProvider: "plugin:cliproxyapi-credit-manager:" + authProviderID,
 		Detail: pluginapi.UsageDetail{InputTokens: 1000, OutputTokens: 500, TotalTokens: 1500},
 	})
-	h.complete("req-quota-admit", "trace-quota-admit", pluginapi.RequestCompletionSucceeded)
-	used, err := h.store().GetKey(ctx, limited.ID)
-	if err != nil {
-		t.Fatalf("GetKey: %v", err)
-	}
-	if used.SpentMicroUSD != 2000 || used.QuotaUsedMicroUSD <= 1 {
-		t.Fatalf("actual usage must be charged in full beyond the quota: spent=%d quota_used=%d",
-			used.SpentMicroUSD, used.QuotaUsedMicroUSD)
-	}
-
-	// The exhausted key rejects the next request as a normal business outcome.
-	response := h.intercept(limitedRequest("req-quota", "trace-quota"))
+	h.complete("req-token-admit", "trace-token-admit", pluginapi.RequestCompletionSucceeded)
+	response := h.intercept(limitedRequest("req-token", "trace-token"))
 	if !response.Terminate || response.StatusCode != http.StatusTooManyRequests {
-		t.Fatalf("quota rejection must terminate with 429, got %+v", response)
+		t.Fatalf("token exhaustion must terminate with 429, got %+v", response)
 	}
 	if message := h.m.LastError(); message != "" {
-		t.Fatalf("a quota rejection must not degrade health, got %q", message)
+		t.Fatalf("a token limit rejection must not degrade health, got %q", message)
 	}
-
 	if response := h.intercept(h.request("req-other-key", "trace-other-key")); response.Terminate {
-		t.Fatalf("another key must still be admitted after a quota rejection: %+v", response)
+		t.Fatalf("another key must still be admitted after a token rejection: %+v", response)
 	}
 }
 
-// TestUnpricedModelRejectedThenPricedSucceeds verifies that a missing price is a
-// per-request rejection that disappears once the model is priced.
-func TestUnpricedModelRejectedThenPricedSucceeds(t *testing.T) {
+// TestUnpricedModelIsAdmittedAndPricedOnDemand verifies that a missing price is
+// never an admission failure: the execution is recorded with a null cost, and
+// adding the model price later recomputes the same historical execution.
+func TestUnpricedModelIsAdmittedAndPricedOnDemand(t *testing.T) {
 	h := newHarness(t)
+	ctx := context.Background()
+	const model = "unpriced-model"
 	probe := h.request("req-unpriced", "trace-unpriced")
-	probe.Model, probe.RequestedModel = "unpriced-model", "unpriced-model"
-	response := h.intercept(probe)
-	if !response.Terminate || response.StatusCode != http.StatusForbidden {
-		t.Fatalf("unpriced model must terminate with 403, got %+v", response)
+	probe.Model, probe.RequestedModel = model, model
+	if response := h.intercept(probe); response.Terminate {
+		t.Fatalf("an unpriced model must still be admitted: %+v", response)
 	}
 	if message := h.m.LastError(); message != "" {
-		t.Fatalf("an unpriced model must not degrade health, got %q", message)
+		t.Fatalf("a missing price must not be a storage failure, got %q", message)
+	}
+	h.usage(pluginapi.UsageRecord{
+		RequestID: "exec-unpriced", TraceID: "trace-unpriced", Provider: "openai", Model: model,
+		APIKey: h.key.Principal, AccessProvider: "plugin:cliproxyapi-credit-manager:" + authProviderID,
+		Detail: pluginapi.UsageDetail{InputTokens: 1, TotalTokens: 1},
+	})
+	h.complete("req-unpriced", "trace-unpriced", pluginapi.RequestCompletionSucceeded)
+
+	report := h.report(credit.Filter{KeyID: h.key.ID})
+	if report.Summary.Executions != 1 || report.Summary.CostMicroUSD != 0 ||
+		report.Summary.UnpricedExecutions != 1 {
+		t.Fatalf("unpriced summary = %+v, want one null-cost execution", report.Summary)
+	}
+	if len(report.Items) != 1 || len(report.Items[0].Executions) != 1 ||
+		report.Items[0].Executions[0].CostMicroUSD != nil {
+		t.Fatalf("unpriced execution must expose an explicit null cost: %+v", report.Items)
 	}
 
-	if err := h.store().PutPrice(context.Background(), credit.Price{
-		Model: "unpriced-model", Rates: credit.Rates{Input: 1000000, Output: 1000000},
+	// The price is looked up at query time, so the same stored execution now
+	// has the actual-model cost.
+	if err := h.store().PutPrice(ctx, credit.Price{
+		Model: model, Rates: credit.Rates{Input: 1_000_000},
 	}); err != nil {
 		t.Fatalf("PutPrice: %v", err)
 	}
-	priced := h.request("req-priced", "trace-priced")
-	priced.Model, priced.RequestedModel = "unpriced-model", "unpriced-model"
-	if response := h.intercept(priced); response.Terminate {
-		t.Fatalf("a newly priced model must be admitted: %+v", response)
+	report = h.report(credit.Filter{KeyID: h.key.ID})
+	if report.Summary.CostMicroUSD != 1 || report.Summary.UnpricedExecutions != 0 {
+		t.Fatalf("priced summary = %+v, want the history repriced to 1", report.Summary)
+	}
+	if len(report.Items) != 1 || len(report.Items[0].Executions) != 1 ||
+		report.Items[0].Executions[0].CostMicroUSD == nil ||
+		*report.Items[0].Executions[0].CostMicroUSD != 1 {
+		t.Fatalf("execution cost = %+v, want 1", report.Items)
 	}
 }
 
-// Pricing failures must explain the operator action, never masquerade as an
-// upstream availability failure or fall through to a lower-priority price.
-func TestPricingRejectionExplainsMissingOrDisabledPrice(t *testing.T) {
+// A missing price or a disabled pricing rule never turns into a permission
+// denial. A disabled rule is simply skipped, so the next candidate (here the
+// exact base price) applies instead of blocking the request.
+func TestMissingOrDisabledPriceNeverBlocksAdmission(t *testing.T) {
 	for _, disabledRule := range []bool{false, true} {
 		name := "missing"
 		if disabledRule {
-			name = "disabled winning rule"
+			name = "disabled rule"
 		}
 		t.Run(name, func(t *testing.T) {
 			h := newHarness(t)
 			ctx := context.Background()
 			model := "unpriced-model"
-			rule := credit.PricingRule{
-				ID: "disabled", MatchKind: credit.MatchExact, Pattern: testModel, Priority: 5,
-				Price: credit.Price{Rates: credit.Rates{Input: 1_000_000}},
-			}
 			if disabledRule {
-				model = testModel // A lower-priority exact base price already exists.
-				if err := h.store().(pricingStore).PutPricingRule(ctx, rule); err != nil {
+				model = testModel
+				if err := h.store().(pricingStore).PutPricingRule(ctx, credit.PricingRule{
+					ID: "disabled", MatchKind: credit.MatchExact, Pattern: testModel, Priority: 5,
+					Price: credit.Price{Rates: credit.Rates{Input: 9_000_000}},
+				}); err != nil {
 					t.Fatal(err)
 				}
 			}
-			probe := h.request("denied", "trace-denied")
+			probe := h.request("admitted", "trace-admitted")
 			probe.Model, probe.RequestedModel = model, model
-			resp := h.intercept(probe)
-			var body struct {
-				Error struct {
-					Message string `json:"message"`
-					Type    string `json:"type"`
-				} `json:"error"`
-			}
-			if err := json.Unmarshal(resp.ResponseBody, &body); err != nil {
-				t.Fatal(err)
-			}
-			if !resp.Terminate || resp.StatusCode != http.StatusForbidden ||
-				body.Error.Type != "permission_error" ||
-				body.Error.Message != "model pricing is not configured or is disabled; contact the administrator" {
-				t.Fatalf("unclear pricing rejection: status=%d body=%s", resp.StatusCode, resp.ResponseBody)
-			}
-			report, err := h.store().Report(ctx, credit.Filter{})
-			if err != nil || report.Summary.Requests != 0 {
-				t.Fatalf("pricing denial created accounting: %+v, %v", report.Summary, err)
-			}
-			if disabledRule {
-				rule.Enabled = true
-				if err := h.store().(pricingStore).PutPricingRule(ctx, rule); err != nil {
-					t.Fatal(err)
-				}
-			} else if err := h.store().PutPrice(ctx, credit.Price{
-				Model: model, Rates: credit.Rates{Input: 1_000_000},
-			}); err != nil {
-				t.Fatal(err)
-			}
-			probe.RequestID, probe.TraceID = "priced", "trace-priced"
 			if resp := h.intercept(probe); resp.Terminate {
-				t.Fatalf("configured price did not restore admission: %+v", resp)
+				t.Fatalf("missing or disabled price refused admission: %+v", resp)
+			}
+			h.usage(pluginapi.UsageRecord{
+				RequestID: "exec-admitted", TraceID: "trace-admitted", Provider: "openai", Model: model,
+				APIKey: h.key.Principal, AccessProvider: "plugin:cliproxyapi-credit-manager:" + authProviderID,
+				Detail: pluginapi.UsageDetail{InputTokens: 1, TotalTokens: 1},
+			})
+			h.complete("admitted", "trace-admitted", pluginapi.RequestCompletionSucceeded)
+			summary := h.report(credit.Filter{KeyID: h.key.ID}).Summary
+			if disabledRule {
+				if summary.CostMicroUSD != 1 || summary.UnpricedExecutions != 0 {
+					t.Fatalf("disabled rule must fall through to the base price: %+v", summary)
+				}
+			} else if summary.CostMicroUSD != 0 || summary.UnpricedExecutions != 1 {
+				t.Fatalf("a missing price must stay unpriced, not become a denial: %+v", summary)
 			}
 			if h.m.LastError() != "" {
-				t.Fatalf("business rejection degraded health: %s", h.m.LastError())
+				t.Fatalf("pricing state degraded health: %s", h.m.LastError())
 			}
 		})
 	}

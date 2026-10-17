@@ -23,13 +23,10 @@ func TestCustomerUsageSourceCannotExemptBilling(t *testing.T) {
 				Detail:         pluginapi.UsageDetail{InputTokens: 10, OutputTokens: 5, TotalTokens: 15},
 			})
 			h.complete("request-source", "trace-source", pluginapi.RequestCompletionSucceeded)
-			key, err := h.store().GetKey(context.Background(), h.key.ID)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if key.SpentMicroUSD != 20 || h.m.LastError() != "" {
-				t.Fatalf("source %q: spent=%d health=%q", source,
-					key.SpentMicroUSD, h.m.LastError())
+			summary := h.report(credit.Filter{KeyID: h.key.ID}).Summary
+			if summary.CostMicroUSD != 20 || h.m.LastError() != "" {
+				t.Fatalf("source %q: summary=%+v health=%q", source,
+					summary, h.m.LastError())
 			}
 		})
 	}
@@ -54,10 +51,6 @@ func TestNativeUsageWithoutTimestampReplaysIdempotently(t *testing.T) {
 	h.usage(record)
 	if message := h.m.LastError(); message != "" {
 		t.Fatalf("identical replay degraded health: %s", message)
-	}
-	key, err := h.store().GetKey(context.Background(), h.key.ID)
-	if err != nil || key.SpentMicroUSD != 20 {
-		t.Fatalf("replayed key=%+v err=%v", key, err)
 	}
 	report, err := h.store().Report(context.Background(), credit.Filter{KeyID: h.key.ID})
 	if err != nil || report.Summary.Executions != 1 || report.Summary.CostMicroUSD != 20 || report.Summary.Tokens.Total != 15 {

@@ -20,7 +20,7 @@ var managementRouteSuffixes = map[string][]string{
 	"/api/rotate":            {http.MethodPost},
 	"/api/reveal":            {http.MethodPost},
 	"/api/delete-key":        {http.MethodPost},
-	"/api/reset-spend":       {http.MethodPost},
+	"/api/reset-tokens":      {http.MethodPost},
 	"/api/callers":           {http.MethodGet, http.MethodPost, http.MethodPut},
 	"/api/audit":             {http.MethodGet},
 	"/api/overview":          {http.MethodGet},
@@ -32,7 +32,6 @@ var managementRouteSuffixes = map[string][]string{
 	"/api/price-preview":     {http.MethodGet},
 	"/api/usage":             {http.MethodGet},
 	"/api/capture":           {http.MethodGet},
-	"/api/resolve":           {http.MethodPost},
 	"/api/health":            {http.MethodGet},
 }
 
@@ -141,8 +140,8 @@ func managementRouteDescription(method, suffix string) string {
 		return "Reveal one recoverable credit key and audit the disclosure."
 	case "/api/delete-key":
 		return "Soft delete a credit key, preserving its ledger."
-	case "/api/reset-spend":
-		return "Reset selected quota baselines without clearing history."
+	case "/api/reset-tokens":
+		return "Reset selected token usage baselines without clearing history."
 	case "/api/callers":
 		return "Manage caller attribution metadata."
 	case "/api/audit":
@@ -171,8 +170,6 @@ func managementRouteDescription(method, suffix string) string {
 		return "Usage and cost report."
 	case "/api/capture":
 		return "One captured request snapshot, fetched on demand."
-	case "/api/resolve":
-		return "Resolve an unresolved request: release or charge."
 	default:
 		return "Plugin health and capture statistics."
 	}

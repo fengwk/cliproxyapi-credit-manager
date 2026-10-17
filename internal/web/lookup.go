@@ -50,26 +50,22 @@ type customerReport interface {
 }
 
 // lookupKey is the sanitized self-service view of one key. It deliberately
-// carries quota and counters only: the principal, scope, fingerprint and any
-// key material never leave the store, and no other key is ever described.
+// carries display budgets and limits only: the principal, scope, fingerprint
+// and any key material never leave the store, and no other key is ever
+// described.
 type lookupKey struct {
-	ID                  string                   `json:"id"`
-	Label               string                   `json:"label"`
-	Enabled             bool                     `json:"enabled"`
-	QuotaMicroUSD       int64                    `json:"quota_micro_usd"`
-	DailyMicroUSD       int64                    `json:"daily_micro_usd"`
-	WeeklyMicroUSD      int64                    `json:"weekly_micro_usd"`
-	MonthlyMicroUSD     int64                    `json:"monthly_micro_usd"`
-	MaxConcurrent       int64                    `json:"max_concurrent"`
-	AllowedModels       []string                 `json:"allowed_models,omitempty"`
-	ModelTokenLimits    []credit.ModelTokenLimit `json:"model_token_limits,omitempty"`
-	ExpiresAt           *time.Time               `json:"expires_at,omitempty"`
-	SpentMicroUSD       int64                    `json:"spent_micro_usd"`
-	QuotaUsedMicroUSD   int64                    `json:"quota_used_micro_usd"`
-	DailyUsedMicroUSD   int64                    `json:"daily_used_micro_usd"`
-	WeeklyUsedMicroUSD  int64                    `json:"weekly_used_micro_usd"`
-	MonthlyUsedMicroUSD int64                    `json:"monthly_used_micro_usd"`
-	CreatedAt           time.Time                `json:"created_at"`
+	ID               string                   `json:"id"`
+	Label            string                   `json:"label"`
+	Enabled          bool                     `json:"enabled"`
+	QuotaMicroUSD    int64                    `json:"quota_micro_usd"`
+	DailyMicroUSD    int64                    `json:"daily_micro_usd"`
+	WeeklyMicroUSD   int64                    `json:"weekly_micro_usd"`
+	MonthlyMicroUSD  int64                    `json:"monthly_micro_usd"`
+	MaxConcurrent    int64                    `json:"max_concurrent"`
+	AllowedModels    []string                 `json:"allowed_models,omitempty"`
+	ModelTokenLimits []credit.ModelTokenLimit `json:"model_token_limits,omitempty"`
+	ExpiresAt        *time.Time               `json:"expires_at,omitempty"`
+	CreatedAt        time.Time                `json:"created_at"`
 }
 
 // lookupExecution is the sanitized execution view. The upstream credential
@@ -83,31 +79,31 @@ type lookupExecution struct {
 	Provider      string        `json:"provider,omitempty"`
 	Tokens        credit.Tokens `json:"tokens"`
 	Quality       string        `json:"quality"`
-	CostMicroUSD  *int64        `json:"cost_micro_usd,omitempty"`
-	Failed        bool          `json:"failed"`
-	StatusCode    int           `json:"status_code,omitempty"`
-	At            time.Time     `json:"at"`
-	LatencyMS     int64         `json:"latency_ms,omitempty"`
-	TTFTMS        int64         `json:"ttft_ms,omitempty"`
-	ServiceTier   string        `json:"service_tier,omitempty"`
+	// CostMicroUSD is derived from the current price book at read time. It is
+	// explicitly null when the execution is not priced, so "free" and "unknown"
+	// never collapse into the same zero.
+	CostMicroUSD *int64    `json:"cost_micro_usd"`
+	Failed       bool      `json:"failed"`
+	StatusCode   int       `json:"status_code,omitempty"`
+	At           time.Time `json:"at"`
+	LatencyMS    int64     `json:"latency_ms,omitempty"`
+	TTFTMS       int64     `json:"ttft_ms,omitempty"`
+	ServiceTier  string    `json:"service_tier,omitempty"`
 }
 
 // lookupRequest is the sanitized request view. It never groups requests of
-// other keys and drops the raw upstream usage payload.
+// other keys and drops the raw upstream usage payload. It carries no frozen
+// price, amount or image count: cost is read only from each execution.
 type lookupRequest struct {
-	ID                 string             `json:"id"`
-	TraceID            string             `json:"trace_id"`
-	Model              string             `json:"model"`
-	Outcome            string             `json:"outcome"`
-	State              string             `json:"state"`
-	StartedAt          time.Time          `json:"started_at"`
-	CompletedAt        *time.Time         `json:"completed_at,omitempty"`
-	AdjustmentMicroUSD int64              `json:"adjustment_micro_usd"`
-	Price              credit.Price       `json:"price"`
-	Executions         []lookupExecution  `json:"executions"`
-	PriceTiers         []credit.PriceTier `json:"price_tiers,omitempty"`
-	ServiceTier        string             `json:"service_tier,omitempty"`
-	ImageCount         int64              `json:"image_count,omitempty"`
+	ID          string            `json:"id"`
+	TraceID     string            `json:"trace_id"`
+	Model       string            `json:"model"`
+	Outcome     string            `json:"outcome"`
+	State       string            `json:"state"`
+	StartedAt   time.Time         `json:"started_at"`
+	CompletedAt *time.Time        `json:"completed_at,omitempty"`
+	Executions  []lookupExecution `json:"executions"`
+	ServiceTier string            `json:"service_tier,omitempty"`
 }
 
 // lookupData is the self-service usage response: the authenticated key's own
@@ -259,23 +255,18 @@ func (h *Handler) lookupCapture(ctx context.Context, key credit.Key, query url.V
 // sanitizeLookupKey projects a ledger key onto its public self-service shape.
 func sanitizeLookupKey(key credit.Key) lookupKey {
 	return lookupKey{
-		ID:                  key.ID,
-		Label:               key.Spec.Label,
-		Enabled:             key.Spec.Enabled,
-		QuotaMicroUSD:       key.Spec.QuotaMicroUSD,
-		DailyMicroUSD:       key.Spec.DailyMicroUSD,
-		WeeklyMicroUSD:      key.Spec.WeeklyMicroUSD,
-		MonthlyMicroUSD:     key.Spec.MonthlyMicroUSD,
-		MaxConcurrent:       key.Spec.MaxConcurrent,
-		AllowedModels:       key.Spec.AllowedModels,
-		ModelTokenLimits:    key.Spec.ModelTokenLimits,
-		ExpiresAt:           key.Spec.ExpiresAt,
-		SpentMicroUSD:       key.SpentMicroUSD,
-		QuotaUsedMicroUSD:   key.QuotaUsedMicroUSD,
-		DailyUsedMicroUSD:   key.DailyUsedMicroUSD,
-		WeeklyUsedMicroUSD:  key.WeeklyUsedMicroUSD,
-		MonthlyUsedMicroUSD: key.MonthlyUsedMicroUSD,
-		CreatedAt:           key.CreatedAt,
+		ID:               key.ID,
+		Label:            key.Spec.Label,
+		Enabled:          key.Spec.Enabled,
+		QuotaMicroUSD:    key.Spec.QuotaMicroUSD,
+		DailyMicroUSD:    key.Spec.DailyMicroUSD,
+		WeeklyMicroUSD:   key.Spec.WeeklyMicroUSD,
+		MonthlyMicroUSD:  key.Spec.MonthlyMicroUSD,
+		MaxConcurrent:    key.Spec.MaxConcurrent,
+		AllowedModels:    key.Spec.AllowedModels,
+		ModelTokenLimits: key.Spec.ModelTokenLimits,
+		ExpiresAt:        key.Spec.ExpiresAt,
+		CreatedAt:        key.CreatedAt,
 	}
 }
 
@@ -300,19 +291,15 @@ func sanitizeLookupRequest(item credit.Request) lookupRequest {
 		})
 	}
 	return lookupRequest{
-		ID:                 item.ID,
-		TraceID:            item.TraceID,
-		Model:              item.Model,
-		Outcome:            item.Outcome,
-		State:              item.State,
-		StartedAt:          item.StartedAt,
-		CompletedAt:        item.CompletedAt,
-		AdjustmentMicroUSD: item.AdjustmentMicroUSD,
-		Price:              item.Price,
-		Executions:         executions,
-		PriceTiers:         item.PriceTiers,
-		ServiceTier:        item.ServiceTier,
-		ImageCount:         item.ImageCount,
+		ID:          item.ID,
+		TraceID:     item.TraceID,
+		Model:       item.Model,
+		Outcome:     item.Outcome,
+		State:       item.State,
+		StartedAt:   item.StartedAt,
+		CompletedAt: item.CompletedAt,
+		Executions:  executions,
+		ServiceTier: item.ServiceTier,
 	}
 }
 

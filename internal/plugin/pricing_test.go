@@ -2,8 +2,7 @@ package plugin
 
 import (
 	"context"
-	"net/http"
-	"strings"
+	"fmt"
 	"testing"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
@@ -14,21 +13,6 @@ import (
 // pricingStore is the optional advanced-pricing capability of the live store.
 type pricingStore interface {
 	PutPricingRule(ctx context.Context, rule credit.PricingRule) error
-}
-
-// Reject exponential expansion before allocating large integers, while
-// retaining ordinary exact JSON integer spellings.
-func TestImageCountNumericParsingIsBounded(t *testing.T) {
-	for _, raw := range []string{"1e999999999", "1e-999999999", strings.Repeat("9", 4096), `"3"`, "3.2"} {
-		if _, ok := integralInt64([]byte(raw)); ok {
-			t.Fatalf("accepted unsupported image count %q", raw[:min(len(raw), 40)])
-		}
-	}
-	for _, raw := range []string{"3", "3.0", "3e0", "0.3e1"} {
-		if got, ok := integralInt64([]byte(raw)); !ok || got != 3 {
-			t.Fatalf("%s = %d,%v, want 3,true", raw, got, ok)
-		}
-	}
 }
 
 // interceptBody admits one request with a caller-supplied body.
@@ -49,12 +33,11 @@ func ownUsage(id, trace, principal string, detail pluginapi.UsageDetail) plugina
 	}
 }
 
-// TestInterceptorReadsPricingMetadataWithoutMutating pins that the interceptor
-// reads the requested image count from a private body copy, leaves the forwarded
-// request byte-identical, and still answers with the unchanged zero-value
-// envelope. Admission charges nothing: the frozen count is what the ledger bills
-// once the proven successful lifecycle reports usage.
-func TestInterceptorReadsPricingMetadataWithoutMutating(t *testing.T) {
+// TestInterceptorLeavesImageBillingToQueryTime pins that the interceptor no
+// longer derives a billable image count from the request body. Admission charges
+// nothing, the forwarded body stays byte-identical, and a per-image price yields
+// a null execution cost because the host does not report a real image count.
+func TestInterceptorLeavesImageBillingToQueryTime(t *testing.T) {
 	h := newHarness(t)
 	store := h.store()
 	ctx := context.Background()
@@ -75,16 +58,23 @@ func TestInterceptorReadsPricingMetadataWithoutMutating(t *testing.T) {
 	if string(req.Body) != original {
 		t.Fatalf("interceptor mutated the forwarded body: %s", req.Body)
 	}
-	key, err := store.GetKey(ctx, h.key.ID)
-	if err != nil || key.SpentMicroUSD != 0 {
-		t.Fatalf("spent=%d err=%v, want no charge before usage is reported", key.SpentMicroUSD, err)
+	before := h.report(credit.Filter{KeyID: h.key.ID}).Summary
+	if before.Executions != 0 || before.CostMicroUSD != 0 {
+		t.Fatalf("admission created a priced execution: %+v", before)
 	}
-	// The proven successful lifecycle bills the frozen count exactly once.
-	h.usage(ownUsage("exec-img", "trace-img", h.key.Principal, pluginapi.UsageDetail{InputTokens: 1, OutputTokens: 1, TotalTokens: 2}))
+	h.usage(pluginapi.UsageRecord{
+		RequestID: "exec-img", TraceID: "trace-img", Provider: "openai", Model: "img-model",
+		APIKey: h.key.Principal, AccessProvider: "plugin:cliproxyapi-credit-manager:" + authProviderID,
+		Detail: pluginapi.UsageDetail{InputTokens: 1, OutputTokens: 1, TotalTokens: 2},
+	})
 	h.complete("req-img", "trace-img", pluginapi.RequestCompletionSucceeded)
-	key, err = store.GetKey(ctx, h.key.ID)
-	if err != nil || key.SpentMicroUSD != 150_000 {
-		t.Fatalf("spent=%d err=%v, want the three-image charge 150000", key.SpentMicroUSD, err)
+	report := h.report(credit.Filter{KeyID: h.key.ID})
+	if report.Summary.CostMicroUSD != 0 || report.Summary.UnpricedExecutions != 1 {
+		t.Fatalf("per-image summary = %+v, want one unpriced execution", report.Summary)
+	}
+	if len(report.Items) != 1 || len(report.Items[0].Executions) != 1 ||
+		report.Items[0].Executions[0].CostMicroUSD != nil {
+		t.Fatalf("per-image execution must expose null cost: %+v", report.Items)
 	}
 }
 
@@ -112,17 +102,11 @@ func TestInterceptorAppliesRequestedServiceTier(t *testing.T) {
 	}
 	// "standard" and "priority" have the same length, so only the tier differs.
 	settle("req-a", "standard")
-	afterBase, err := store.GetKey(ctx, h.key.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
+	afterBase := h.report(credit.Filter{KeyID: h.key.ID}).Summary.CostMicroUSD
 	settle("req-b", "priority")
-	afterPriority, err := store.GetKey(ctx, h.key.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	baseCharge := afterBase.SpentMicroUSD
-	priorityCharge := afterPriority.SpentMicroUSD - baseCharge
+	afterPriority := h.report(credit.Filter{KeyID: h.key.ID}).Summary.CostMicroUSD
+	baseCharge := afterBase
+	priorityCharge := afterPriority - baseCharge
 	if baseCharge <= 0 || priorityCharge <= baseCharge {
 		t.Fatalf("priority charge = %d, base charge = %d; the service tier must raise the billed rate", priorityCharge, baseCharge)
 	}
@@ -154,13 +138,13 @@ func TestUsageServiceTierSelectionOrderAndPersistence(t *testing.T) {
 	first.ResponseServiceTier = "priority"
 	h.usage(first)
 	h.complete("req-1", "trace-1", pluginapi.RequestCompletionSucceeded)
-	if key, err := store.GetKey(ctx, h.key.ID); err != nil || key.SpentMicroUSD != 91 {
-		t.Fatalf("priority spend = %d err=%v, want 91", key.SpentMicroUSD, err)
+	if cost := h.report(credit.Filter{KeyID: h.key.ID}).Summary.CostMicroUSD; cost != 91 {
+		t.Fatalf("priority cost = %d, want 91", cost)
 	}
-	// A late identical replay must not charge again.
+	// A late identical replay must not add another execution.
 	h.usage(first)
-	if key, err := store.GetKey(ctx, h.key.ID); err != nil || key.SpentMicroUSD != 91 {
-		t.Fatalf("replay changed spend: %d err=%v", key.SpentMicroUSD, err)
+	if cost := h.report(credit.Filter{KeyID: h.key.ID}).Summary.CostMicroUSD; cost != 91 {
+		t.Fatalf("replay changed cost: %d", cost)
 	}
 	// No upstream tier: the flex tier frozen at admission is used.
 	if resp := h.interceptBody("req-2", "trace-2", `{"model":"test-model","tier":"flex"}`); resp.Terminate {
@@ -168,8 +152,8 @@ func TestUsageServiceTierSelectionOrderAndPersistence(t *testing.T) {
 	}
 	h.usage(ownUsage("exec-2", "trace-2", h.key.Principal, pluginapi.UsageDetail{InputTokens: 1, OutputTokens: 10, TotalTokens: 11}))
 	h.complete("req-2", "trace-2", pluginapi.RequestCompletionSucceeded)
-	if key, err := store.GetKey(ctx, h.key.ID); err != nil || key.SpentMicroUSD != 132 {
-		t.Fatalf("frozen flex spend = %d err=%v, want 132", key.SpentMicroUSD, err)
+	if cost := h.report(credit.Filter{KeyID: h.key.ID}).Summary.CostMicroUSD; cost != 132 {
+		t.Fatalf("frozen flex cost = %d, want 132", cost)
 	}
 	report, err := store.Report(ctx, credit.Filter{KeyID: h.key.ID})
 	if err != nil {
@@ -210,34 +194,22 @@ func TestUsageReportedDefaultTierDoesNotInheritFrozen(t *testing.T) {
 	usage.ServiceTier = "default"
 	h.usage(usage)
 	h.complete("req-1", "trace-1", pluginapi.RequestCompletionSucceeded)
-	if key, err := store.GetKey(ctx, h.key.ID); err != nil || key.SpentMicroUSD != 21 {
-		t.Fatalf("spend = %d err = %v, want 21 at the base rate, never the frozen priority rate", key.SpentMicroUSD, err)
+	if cost := h.report(credit.Filter{KeyID: h.key.ID}).Summary.CostMicroUSD; cost != 21 {
+		t.Fatalf("cost = %d, want 21 at the base rate, never the frozen priority rate", cost)
 	}
 }
 
-// TestInterceptorRefusesUnsupportedImageCount pins the admission contract of the
-// requested image count: an explicit unsupported value fails closed for a
-// per-image price instead of being silently billed for a clamped number, an
-// omitted value means one image, and the same hint on a token request is
-// irrelevant rather than a rejection. The forwarded body is never modified and
-// admission alone never charges.
-func TestInterceptorRefusesUnsupportedImageCount(t *testing.T) {
+// TestInterceptorNeverGatesOnImageHints pins that no request-body image hint
+// (including values that used to be rejected) can refuse admission: image
+// accounting is not a request fact and per-image executions stay unpriced.
+func TestInterceptorNeverGatesOnImageHints(t *testing.T) {
 	h := newHarness(t)
 	store := h.store()
 	ctx := context.Background()
 	if err := store.PutPrice(ctx, credit.Price{Model: "img-model", BillingMode: "per_image", PerImageMicroUSD: 50_000}); err != nil {
 		t.Fatalf("PutPrice: %v", err)
 	}
-	// A per-image intercept must request the image model explicitly: the harness
-	// body helper keeps its own default model.
-	imageIntercept := func(id, body string) pluginapi.RequestInterceptResponse {
-		return h.intercept(pluginapi.RequestInterceptRequest{
-			RequestID: id, TraceID: "trace-" + id, Model: "img-model", RequestedModel: "img-model",
-			Body:     []byte(body),
-			Metadata: map[string]any{"caller_scope": h.key.Scope, "request_path": "/v1/images"},
-		})
-	}
-	for _, body := range []string{
+	for i, body := range []string{
 		`{"model":"img-model","n":100}`,
 		`{"model":"img-model","n":33}`,
 		`{"model":"img-model","n":0}`,
@@ -246,45 +218,25 @@ func TestInterceptorRefusesUnsupportedImageCount(t *testing.T) {
 		`{"model":"img-model","n":"3"}`,
 		`{"model":"img-model","n":1e30}`,
 		`{"model":"img-model","n_images":64}`,
+		`{"model":"img-model"}`,
 	} {
 		raw := []byte(body)
 		original := string(raw)
 		resp := h.intercept(pluginapi.RequestInterceptRequest{
-			RequestID: "req-bad", TraceID: "trace-bad", Model: "img-model", RequestedModel: "img-model",
+			RequestID: fmt.Sprintf("req-%d", i), TraceID: fmt.Sprintf("trace-%d", i),
+			Model: "img-model", RequestedModel: "img-model",
 			Body:     raw,
 			Metadata: map[string]any{"caller_scope": h.key.Scope, "request_path": "/v1/images"},
 		})
-		if !resp.Terminate || resp.StatusCode != http.StatusBadRequest {
-			t.Fatalf("body %s: resp = %+v, want a fail-closed 400", body, resp)
+		if resp.Terminate {
+			t.Fatalf("body %s: resp = %+v, image hints must not gate admission", body, resp)
 		}
 		if string(raw) != original {
 			t.Fatalf("body %s mutated: %s", body, raw)
 		}
-		if key, err := store.GetKey(ctx, h.key.ID); err != nil || key.SpentMicroUSD != 0 {
-			t.Fatalf("body %s: spent = %d err = %v, want no charge", body, key.SpentMicroUSD, err)
-		}
 	}
-	// An omitted count is one image, billed once the lifecycle proves success.
-	if resp := imageIntercept("req-default", `{"model":"img-model"}`); resp.Terminate {
-		t.Fatalf("omitted count: %+v", resp)
-	}
-	h.usage(ownUsage("exec-default", "trace-req-default", h.key.Principal, pluginapi.UsageDetail{InputTokens: 1, TotalTokens: 1}))
-	h.complete("req-default", "trace-req-default", pluginapi.RequestCompletionSucceeded)
-	if key, err := store.GetKey(ctx, h.key.ID); err != nil || key.SpentMicroUSD != 50_000 {
-		t.Fatalf("omitted count spent = %d err = %v, want 50000 for one image", key.SpentMicroUSD, err)
-	}
-	// A supported count is billed exactly.
-	if resp := imageIntercept("req-two", `{"model":"img-model","n":2}`); resp.Terminate {
-		t.Fatalf("supported count: %+v", resp)
-	}
-	h.usage(ownUsage("exec-two", "trace-req-two", h.key.Principal, pluginapi.UsageDetail{InputTokens: 1, TotalTokens: 1}))
-	h.complete("req-two", "trace-req-two", pluginapi.RequestCompletionSucceeded)
-	if key, err := store.GetKey(ctx, h.key.ID); err != nil || key.SpentMicroUSD != 150_000 {
-		t.Fatalf("two-image spent = %d err = %v, want 150000", key.SpentMicroUSD, err)
-	}
-	// A token price ignores the hint: an image hint is not a billing input there,
-	// so it must never turn into a rejection.
+	// The same hint on a token request is irrelevant too.
 	if resp := h.interceptBody("req-token", "trace-token", `{"model":"test-model","n":100}`); resp.Terminate {
-		t.Fatalf("token request with an irrelevant image hint was refused: %+v", resp)
+		t.Fatalf("token request with an image hint was refused: %+v", resp)
 	}
 }

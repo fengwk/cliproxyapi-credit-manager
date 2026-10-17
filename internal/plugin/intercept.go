@@ -1,13 +1,10 @@
 package plugin
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
-	"math/big"
 	"net/http"
-	"strconv"
 	"strings"
 	"time"
 
@@ -87,10 +84,11 @@ func (m *Manager) interceptBefore(req pluginapi.RequestInterceptRequest) plugina
 	}
 
 	// The current CPA contract always populates RequestedModel with the
-	// client-requested id, which is the only id this plugin may price, match
-	// against model allow lists and freeze for billing. Falling back to the
-	// resolved upstream Model would silently bill a different id, so a request
-	// without a requested model is refused before any accounting row is created.
+	// client-requested id, which is the id this plugin matches against model
+	// allow lists and records as the request model. Costs are derived later
+	// from the exact usage model, so falling back to the resolved upstream
+	// Model here would silently grant the wrong model, and a request without a
+	// requested model is refused before any accounting row is created.
 	model := strings.TrimSpace(req.RequestedModel)
 	if model == "" {
 		return terminate(http.StatusBadRequest, "requested model is required")
@@ -110,21 +108,16 @@ func (m *Manager) interceptBefore(req pluginapi.RequestInterceptRequest) plugina
 		// lifecycle completion, so it must not be admitted for billing.
 		return terminate(http.StatusBadRequest, "request trace is required")
 	}
-	// The requested image count is only a billing input for a per-image price;
-	// the ledger decides whether an unsupported declared value is refused.
-	// Nothing here estimates amount or tokens: admission checks the actual used
-	// quotas and key concurrency only, so a positive remaining quota admits even
-	// a very large declared output limit or input payload.
-	imageCount, imageCountDeclared := requestImageCount(req.Body)
+	// Nothing here estimates amount or tokens: admission checks the actual
+	// token counters and key concurrency only, so a very large declared output
+	// limit or input payload is still admitted.
 	if _, errAdmit := deps.store.Admit(ctx, credit.AdmitInput{
-		ID:                 strings.TrimSpace(req.RequestID),
-		TraceID:            traceID,
-		KeyID:              key.ID,
-		RequestedModel:     model,
-		ServiceTier:        requestServiceTier(req.Body),
-		ImageCount:         imageCount,
-		ImageCountDeclared: imageCountDeclared,
-		At:                 m.now(),
+		ID:             strings.TrimSpace(req.RequestID),
+		TraceID:        traceID,
+		KeyID:          key.ID,
+		RequestedModel: model,
+		ServiceTier:    requestServiceTier(req.Body),
+		At:             m.now(),
 	}); errAdmit != nil {
 		if !isBusinessRejection(errAdmit) {
 			// A storage or transaction failure refuses this request and is
@@ -229,77 +222,6 @@ func requestServiceTier(body []byte) string {
 	return ""
 }
 
-// requestImageCount reads the requested image count from the raw request body
-// without modifying it. It returns the declared count and whether the request
-// declared one at all.
-//
-// The value is the count the operator asked for, not the number of images an
-// upstream actually returned (the plugin never inspects the response). It is
-// never clamped: the ledger refuses an unsupported count for a per-image price
-// so a request can not be billed for a different number of images than it
-// asked for. A present but unusable value (non-integer, fractional, or outside
-// the int64 range) reports declared with a zero count, which the ledger refuses
-// for a per-image price. A value that is irrelevant to the billing mode, such
-// as the sampling hint on a token request, never causes a rejection.
-func requestImageCount(body []byte) (int64, bool) {
-	if len(body) == 0 {
-		return 0, false
-	}
-	var fields map[string]json.RawMessage
-	if err := json.Unmarshal(body, &fields); err != nil {
-		return 0, false
-	}
-	for _, name := range []string{"n", "n_images", "num_images", "image_count"} {
-		raw, ok := fields[name]
-		if !ok {
-			continue
-		}
-		value, ok := integralInt64(raw)
-		if !ok {
-			return 0, true
-		}
-		return value, true
-	}
-	return 0, false
-}
-
-// integralInt64 decodes a JSON number that denotes an exact integer within the
-// int64 range. A string, fractional, non-numeric or out-of-range value is
-// rejected so the caller can fail closed instead of inventing a billable count.
-// Exponent and trailing-zero forms are accepted only when they denote an exact
-// integer (2.0 and 1e2 are integers, 2.5 and 1e30 are not).
-func integralInt64(raw json.RawMessage) (int64, bool) {
-	raw = bytes.TrimSpace(raw)
-	if len(raw) > 64 {
-		return 0, false
-	}
-	// Bound exponent expansion before big.Rat sees untrusted request numbers.
-	if i := bytes.IndexAny(raw, "eE"); i >= 0 {
-		exponent, err := strconv.ParseInt(string(raw[i+1:]), 10, 16)
-		if err != nil || exponent < -64 || exponent > 64 {
-			return 0, false
-		}
-	}
-	decoder := json.NewDecoder(bytes.NewReader(raw))
-	decoder.UseNumber()
-	var decoded any
-	if err := decoder.Decode(&decoded); err != nil {
-		return 0, false
-	}
-	number, ok := decoded.(json.Number)
-	if !ok {
-		return 0, false
-	}
-	if value, err := number.Int64(); err == nil {
-		return value, true
-	}
-	rational, ok := new(big.Rat).SetString(number.String())
-	if !ok || !rational.IsInt() || !rational.Num().IsInt64() {
-		return 0, false
-	}
-	return rational.Num().Int64(), true
-}
-
 // isBusinessRejection reports whether a credit failure refuses one request
 // because of that request, its key or its model. Those are normal outcomes: the
 // caller gets an error response while every other key keeps working. Only an
@@ -315,7 +237,6 @@ func isBusinessRejection(err error) bool {
 		errors.Is(err, credit.ErrConcurrency),
 		errors.Is(err, credit.ErrUnauthorized),
 		errors.Is(err, credit.ErrDenied),
-		errors.Is(err, credit.ErrUnpriced),
 		errors.Is(err, credit.ErrConflict),
 		errors.Is(err, credit.ErrInvalid):
 		return true
@@ -329,7 +250,7 @@ func admitStatus(err error) int {
 	switch {
 	case errors.Is(err, credit.ErrQuota), errors.Is(err, credit.ErrConcurrency):
 		return http.StatusTooManyRequests
-	case errors.Is(err, credit.ErrUnauthorized), errors.Is(err, credit.ErrDenied), errors.Is(err, credit.ErrUnpriced):
+	case errors.Is(err, credit.ErrUnauthorized), errors.Is(err, credit.ErrDenied):
 		return http.StatusForbidden
 	case errors.Is(err, credit.ErrConflict):
 		return http.StatusConflict
@@ -350,8 +271,6 @@ func admitMessage(err error) string {
 		return "too many concurrent requests"
 	case errors.Is(err, credit.ErrUnauthorized), errors.Is(err, credit.ErrDenied):
 		return "request is not permitted"
-	case errors.Is(err, credit.ErrUnpriced):
-		return "model pricing is not configured or is disabled; contact the administrator"
 	case errors.Is(err, credit.ErrConflict):
 		return "conflicting request"
 	default:

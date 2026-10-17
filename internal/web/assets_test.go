@@ -100,7 +100,6 @@ func TestAppJSUsesDocumentedEndpoints(t *testing.T) {
 		"/api/prices",
 		"/api/usage",
 		"/api/capture",
-		"/api/resolve",
 		"/api/health",
 		// 凭据页：CPA v8 凭据列表与插件额度查询。
 		"/v8/management/credentials",
@@ -144,11 +143,9 @@ func TestAppJSAccountingWording(t *testing.T) {
 	js := readAsset(t, "app.js")
 
 	required := []string{
-		"adjustment_micro_usd", // 人工补记的契约字段
-		"失败请求",                 // summary.failed 是失败请求数，不是失败执行数
-		"未结算请求",                // summary.pending 是 active+pending
+		"失败请求",  // summary.failed 是失败请求数，不是失败执行数
+		"未结算请求", // summary.pending 是 active+pending
 		"执行成本",
-		"人工补记",
 		"已知用量照常入账",
 	}
 	for _, token := range required {

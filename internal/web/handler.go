@@ -161,7 +161,7 @@ func (h *Handler) Handle(req pluginapi.ManagementRequest) pluginapi.ManagementRe
 	switch req.Method + " " + strings.TrimPrefix(req.Path, BasePath) {
 	case "GET /api/overview":
 		return h.HandleAnalytics(ctx, req)
-	case "POST /api/reveal", "POST /api/delete-key", "POST /api/reset-spend",
+	case "POST /api/reveal", "POST /api/delete-key", "POST /api/reset-tokens",
 		"GET /api/callers", "POST /api/callers", "PUT /api/callers", "GET /api/audit":
 		return h.HandleKeyManagement(ctx, req)
 	case "GET /api/keys":
@@ -261,18 +261,6 @@ func (h *Handler) Handle(req pluginapi.ManagementRequest) pluginapi.ManagementRe
 			return failure(err)
 		}
 		return response(200, detail)
-	case "POST /api/resolve":
-		var in struct {
-			ID string `json:"id"`
-			credit.Resolution
-		}
-		if err := decode(req.Body, &in); err != nil {
-			return failure(err)
-		}
-		if err := h.db.Resolve(ctx, in.ID, in.Resolution); err != nil {
-			return failure(err)
-		}
-		return response(200, map[string]bool{"ok": true})
 	case "GET /api/health":
 		message := ""
 		if h.health != nil {

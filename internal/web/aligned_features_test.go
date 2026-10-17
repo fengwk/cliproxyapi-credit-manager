@@ -20,7 +20,7 @@ func TestAlignedManagementRoutesUseSharedGate(t *testing.T) {
 	for _, route := range []struct{ method, path string }{
 		{"GET", "/api/overview"}, {"GET", "/api/callers"}, {"POST", "/api/callers"},
 		{"PUT", "/api/callers"}, {"GET", "/api/audit"}, {"POST", "/api/reveal"},
-		{"POST", "/api/delete-key"}, {"POST", "/api/reset-spend"},
+		{"POST", "/api/delete-key"}, {"POST", "/api/reset-tokens"},
 		{"GET", "/api/model-catalog"}, {"GET", "/api/exchange-rate"},
 		{"GET", "/api/pricing-rules"}, {"PUT", "/api/pricing-rules"},
 		{"POST", "/api/delete-price-rule"}, {"GET", "/api/price-preview"},
@@ -59,7 +59,8 @@ func TestLookupModelsAreFullSelectionAndOwnKeyOnly(t *testing.T) {
 	if caller.StatusCode != http.StatusCreated {
 		t.Fatalf("caller=%d %s", caller.StatusCode, caller.Body)
 	}
-	alpha := createTestKey(t, h.db, "synthetic-model-owner", credit.KeySpec{CallerID: "operator-only-caller"})
+	alpha := createTestKey(t, h.db, "synthetic-model-owner",
+		credit.KeySpec{CallerID: "operator-only-caller", QuotaMicroUSD: 510})
 	beta := createTestKey(t, h.db, "synthetic-model-foreign", credit.KeySpec{})
 	for i := 0; i < 51; i++ {
 		seedRequest(t, h.db, alpha, fmt.Sprintf("alpha-%d", i), fmt.Sprintf("trace-alpha-%d", i))
@@ -87,7 +88,7 @@ func TestLookupModelsAreFullSelectionAndOwnKeyOnly(t *testing.T) {
 			t.Errorf("customer lookup leaked %q", secret)
 		}
 	}
-	reset := h.Handle(managementRequest("POST", "/api/reset-spend",
+	reset := h.Handle(managementRequest("POST", "/api/reset-tokens",
 		`{"id":"`+alpha.ID+`","total":true,"daily":true,"weekly":true,"monthly":true,"reason":"new allocation"}`))
 	if reset.StatusCode != http.StatusOK {
 		t.Fatalf("reset=%d %s", reset.StatusCode, reset.Body)
@@ -96,8 +97,18 @@ func TestLookupModelsAreFullSelectionAndOwnKeyOnly(t *testing.T) {
 	if err := json.Unmarshal(got.Body, &out); err != nil {
 		t.Fatal(err)
 	}
-	if out.Key.SpentMicroUSD != 510 || out.Key.QuotaUsedMicroUSD != 0 ||
-		out.Key.DailyUsedMicroUSD != 0 || out.Summary.CostMicroUSD != 510 {
-		t.Fatalf("reset erased history or customer quota view is stale: %+v", out)
+	// A token reset changes only the effective token baseline: it never erases
+	// history or the display budget, and no retired financial field reappears.
+	if out.Key.QuotaMicroUSD != 510 || out.Summary.CostMicroUSD != 510 {
+		t.Fatalf("token reset changed history or the display budget: %+v", out)
+	}
+	for _, retired := range []string{
+		"spent_micro_usd", "quota_used_micro_usd", "daily_used_micro_usd",
+		"weekly_used_micro_usd", "monthly_used_micro_usd", "adjustment_micro_usd",
+		"price_tiers", "pricing_rule_id", "image_count",
+	} {
+		if strings.Contains(string(got.Body), retired) {
+			t.Errorf("customer lookup still exposes retired field %q", retired)
+		}
 	}
 }

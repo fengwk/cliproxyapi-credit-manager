@@ -407,7 +407,133 @@ func TestLookupDataIsConfinedAndSanitized(t *testing.T) {
 	}
 }
 
-// TestLookupDeniesInactiveKeys mirrors the inference-time Authenticate contract:
+// TestLookupPricingIsQueryTimeActualModelAndBudgetOnly pins the customer read
+// contract end to end: the four budget figures remain display data, no retired
+// financial field is serialized, an execution is priced by its actual usage
+// model (never the request alias), and adding a price recomputes already stored
+// history. A partial-quality execution stays explicitly unpriced.
+func TestLookupPricingIsQueryTimeActualModelAndBudgetOnly(t *testing.T) {
+	h := testHandler(t)
+	ctx := context.Background()
+	key := createTestKey(t, h.db, "synthetic-priced-key", credit.KeySpec{
+		Label:         "priced",
+		QuotaMicroUSD: 1, DailyMicroUSD: 2, WeeklyMicroUSD: 3, MonthlyMicroUSD: 4,
+	})
+	seed := func(requestID, traceID, requestedModel, usageModel, quality, tier string, input int64) {
+		t.Helper()
+		if _, err := h.db.Admit(ctx, credit.AdmitInput{
+			ID: requestID, TraceID: traceID, KeyID: key.ID, RequestedModel: requestedModel,
+			ServiceTier: tier,
+		}); err != nil {
+			t.Fatalf("Admit(%s): %v", requestID, err)
+		}
+		if err := h.db.RecordUsage(ctx, credit.Usage{
+			ID: "exec-" + requestID, RequestID: requestID, TraceID: traceID, KeyID: key.ID,
+			Provider: "openai", Model: usageModel,
+			Tokens: credit.Tokens{Input: input, Total: input}, Quality: quality,
+		}); err != nil {
+			t.Fatalf("RecordUsage(%s): %v", requestID, err)
+		}
+		if err := h.db.Complete(ctx, credit.Completion{ID: requestID, TraceID: traceID, Outcome: credit.OutcomeSucceeded}); err != nil {
+			t.Fatalf("Complete(%s): %v", requestID, err)
+		}
+	}
+	// The first request is an alias whose actual execution model is m1; the
+	// second is partial-quality usage for m2 and can never be priced.
+	seed("req-priced", "trace-priced", "alias-model", "m1", credit.QualityComplete, "priority", 10)
+	seed("req-partial", "trace-partial", "m2", "m2", credit.QualityPartial, "", 5)
+
+	lookup := func() (lookupData, string) {
+		t.Helper()
+		got := lookupCall(t, h, PublicLookupData, "synthetic-priced-key", nil)
+		if got.StatusCode != http.StatusOK {
+			t.Fatalf("lookup = %d %s", got.StatusCode, got.Body)
+		}
+		var out lookupData
+		if err := json.Unmarshal(got.Body, &out); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		return out, string(got.Body)
+	}
+	costByRequest := func(out lookupData) map[string]*int64 {
+		costs := map[string]*int64{}
+		for _, item := range out.Items {
+			for _, execution := range item.Executions {
+				costs[item.ID] = execution.CostMicroUSD
+			}
+		}
+		return costs
+	}
+
+	out, body := lookup()
+	if out.Key.QuotaMicroUSD != 1 || out.Key.DailyMicroUSD != 2 ||
+		out.Key.WeeklyMicroUSD != 3 || out.Key.MonthlyMicroUSD != 4 {
+		t.Fatalf("display budgets = %+v, want the four stored figures", out.Key)
+	}
+	if out.Summary.CostMicroUSD != 0 || out.Summary.UnpricedExecutions != 2 {
+		t.Fatalf("unpriced summary = %+v", out.Summary)
+	}
+	for id, cost := range costByRequest(out) {
+		if cost != nil {
+			t.Fatalf("request %s cost = %d before any price, want null", id, *cost)
+		}
+	}
+	for _, item := range out.Items {
+		if item.ID == "req-priced" && item.ServiceTier != "priority" {
+			t.Fatalf("request service_tier = %q, want the request fact priority", item.ServiceTier)
+		}
+	}
+	if !strings.Contains(body, `"service_tier":"priority"`) {
+		t.Fatalf("lookup must retain the request service_tier: %s", body)
+	}
+	if !strings.Contains(body, `"cost_micro_usd":null`) {
+		t.Fatalf("unpriced cost must be explicit null: %s", body)
+	}
+	for _, retired := range []string{
+		"spent_micro_usd", "quota_used_micro_usd", "daily_used_micro_usd",
+		"weekly_used_micro_usd", "monthly_used_micro_usd", "adjustment_micro_usd",
+		"price_tiers", "pricing_rule_id", "image_count",
+	} {
+		if strings.Contains(body, retired) {
+			t.Errorf("lookup exposes retired field %q: %s", retired, body)
+		}
+	}
+
+	// Pricing the request alias must not price an execution whose actual model
+	// is m1.
+	if err := h.db.PutPrice(ctx, credit.Price{Model: "alias-model", Rates: credit.Rates{Input: 9_000_000}}); err != nil {
+		t.Fatal(err)
+	}
+	out, _ = lookup()
+	if out.Summary.CostMicroUSD != 0 || out.Summary.UnpricedExecutions != 2 {
+		t.Fatalf("request alias was priced instead of the actual model: %+v", out.Summary)
+	}
+
+	// Adding the actual model price recomputes the existing execution.
+	if err := h.db.PutPrice(ctx, credit.Price{Model: "m1", Rates: credit.Rates{Input: 1_000_000}}); err != nil {
+		t.Fatal(err)
+	}
+	out, _ = lookup()
+	if out.Summary.CostMicroUSD != 10 || out.Summary.UnpricedExecutions != 1 {
+		t.Fatalf("partial summary = %+v, want 10 priced + one unpriced", out.Summary)
+	}
+	if cost := costByRequest(out)["req-priced"]; cost == nil || *cost != 10 {
+		t.Fatalf("actual-model cost = %v, want 10", cost)
+	}
+
+	// A partial-quality execution stays null even after its model is priced.
+	if err := h.db.PutPrice(ctx, credit.Price{Model: "m2", Rates: credit.Rates{Input: 1_000_000}}); err != nil {
+		t.Fatal(err)
+	}
+	out, _ = lookup()
+	if out.Summary.CostMicroUSD != 10 || out.Summary.UnpricedExecutions != 1 {
+		t.Fatalf("partial execution became priced: %+v", out.Summary)
+	}
+	if cost := costByRequest(out)["req-partial"]; cost != nil {
+		t.Fatalf("partial-quality cost = %d, want null", *cost)
+	}
+}
+
 // disabled, expired and rotated-out material all fail closed.
 func TestLookupDeniesInactiveKeys(t *testing.T) {
 	h := testHandler(t)

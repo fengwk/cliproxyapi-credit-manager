@@ -17,7 +17,7 @@ import (
 type keyManagement interface {
 	RevealKey(ctx context.Context, id string) (string, error)
 	DeleteKey(ctx context.Context, id, reason string) error
-	ResetSpend(ctx context.Context, spec credit.ResetSpec) (credit.ResetResult, error)
+	ResetTokens(ctx context.Context, spec credit.ResetSpec) (credit.ResetResult, error)
 	ListCallers(ctx context.Context) ([]credit.Caller, error)
 	CreateCaller(ctx context.Context, spec credit.CallerSpec) (credit.Caller, error)
 	UpdateCaller(ctx context.Context, spec credit.CallerSpec) (credit.Caller, error)
@@ -59,12 +59,12 @@ func (h *Handler) HandleKeyManagement(ctx context.Context, req pluginapi.Managem
 			return failure(err)
 		}
 		return response(http.StatusOK, map[string]bool{"ok": true})
-	case "POST /api/reset-spend":
+	case "POST /api/reset-tokens":
 		var in credit.ResetSpec
 		if err := decode(req.Body, &in); err != nil {
 			return failure(err)
 		}
-		result, err := km.ResetSpend(ctx, in)
+		result, err := km.ResetTokens(ctx, in)
 		if err != nil {
 			return failure(err)
 		}

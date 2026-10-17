@@ -91,13 +91,13 @@ func TestKeyManagementRoutes(t *testing.T) {
 	}
 
 	// Reset requires a scope and a reason.
-	if got := h.HandleKeyManagement(ctx, managementRequest("POST", "/api/reset-spend", `{"total":true,"reason":"x"}`)); got.StatusCode != http.StatusBadRequest {
+	if got := h.HandleKeyManagement(ctx, managementRequest("POST", "/api/reset-tokens", `{"total":true,"reason":"x"}`)); got.StatusCode != http.StatusBadRequest {
 		t.Fatalf("reset without scope = %d %s", got.StatusCode, got.Body)
 	}
-	if got := h.HandleKeyManagement(ctx, managementRequest("POST", "/api/reset-spend", `{"id":"`+key.ID+`","total":true}`)); got.StatusCode != http.StatusBadRequest {
+	if got := h.HandleKeyManagement(ctx, managementRequest("POST", "/api/reset-tokens", `{"id":"`+key.ID+`","total":true}`)); got.StatusCode != http.StatusBadRequest {
 		t.Fatalf("reset without reason = %d %s", got.StatusCode, got.Body)
 	}
-	reset := h.HandleKeyManagement(ctx, managementRequest("POST", "/api/reset-spend",
+	reset := h.HandleKeyManagement(ctx, managementRequest("POST", "/api/reset-tokens",
 		`{"id":"`+key.ID+`","total":true,"daily":true,"reason":"goodwill"}`))
 	if reset.StatusCode != http.StatusOK {
 		t.Fatalf("reset = %d %s", reset.StatusCode, reset.Body)
