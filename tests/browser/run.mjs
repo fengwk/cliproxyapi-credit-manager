@@ -1033,7 +1033,7 @@ async function main() {
     check('状态页展示降级与最近错误', healthText.includes('降级') && healthText.includes('status = degraded') && healthText.includes('mock 财务维护失败'), healthText.replace(/\n/g, ' ').slice(0, 160));
     check('状态页展示捕获状态与容量', healthText.includes('已启用') && healthText.includes('50.0 MiB') && healthText.includes('WAL'));
     check('状态页展示保留月数与丢弃计数', healthText.includes('历史保留月数') && healthText.includes('捕获丢弃计数'));
-    check('未知字段原样列出', (await cdp.text('#health-extra')).includes('max_pending_requests'));
+    check('未知字段原样列出', (await cdp.text('#health-extra')).includes('request_capture'));
     await cdp.screenshot('11-health.png', { fullPage: true });
 
     /* --- 10. 清除密钥 --- */

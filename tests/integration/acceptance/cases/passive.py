@@ -1,8 +1,8 @@
 """Passive boundary: no background work and no retired configuration.
 
-The plugin no longer owns any background execution: it declares no executor/
+The plugin no longer owns background model execution: it declares no executor/
 router/scheduler callback, registers no host model-execution bridge, and starts
-no worker. The optional warmup feature and its `warmup.*` settings were removed
+no model-probe worker. The optional warmup feature and its `warmup.*` settings were removed
 entirely, and `max_pending_requests` (the per-key unresolved-request cap) went
 with the admission backlog gate. Those settings must now be a clear *config
 error*, never silently ignored or re-enabled.
@@ -13,6 +13,7 @@ the plugin registration state and the management response.
 
 from __future__ import annotations
 
+import json
 import time
 from pathlib import Path
 
@@ -81,7 +82,7 @@ def no_background_execution(ctx):
 
 
 @case("passive.retired_settings_rejected",
-      "retired warmup/max_pending_requests settings are a clear config error that never poisons the running plugin")
+      "saved retired settings refuse plugin registration; removing them restores service without losing the ledger")
 def retired_settings_rejected(ctx):
     ctx.recreate_host("passive-retired")
     item, key = ctx.new_key(label="passive-retired")
@@ -91,19 +92,34 @@ def retired_settings_rejected(ctx):
     for setting, (_yaml, body) in RETIRED_SETTINGS.items():
         response = ctx.manager.config_call("PATCH", body=body)
         statuses[setting] = response.status
-        # A configuration that cannot be applied is refused (documented 400 for a
-        # parse error, 409 for a refused reload) rather than accepted as a no-op.
-        check(response.status in (400, 409),
-              f"a retired {setting} setting must be refused, got {response.status}")
-        evidence = (response.text + _log_text(ctx)).lower()
-        check(setting in evidence,
-              f"the rejection must name the retired {setting!r} setting: {response.text[:200]!r}")
+        # CPA saves generic plugin config before its file watcher reloads the
+        # library. HTTP 200 acknowledges the save, not successful registration.
+        check_eq(response.status, 200, "CPA saved the generic configuration")
+        check(ctx.wait_until(lambda: f"field {setting} not found" in _log_text(ctx)),
+              f"plugin validation must name the retired {setting!r} field")
 
-    # The refused reconfiguration leaves the previous configuration serving:
-    # health stays ok and a normal request is still admitted and billed.
-    check_eq(ctx.manager.health().json()["status"], "ok", "a rejected reload does not poison health")
-    check_eq(ctx.client.chat(key, MODEL).status, 200, "the plugin keeps serving after a rejected reload")
-    check(ctx.wait_until(lambda: _spent(ctx, item["id"]) == 14), "the request after the rejection is billed normally")
+        def unregistered():
+            status, raw = ctx.host.management("GET", "/v0/management/plugins")
+            if status != 200:
+                return False
+            entries = json.loads(raw).get("plugins", [])
+            entry = next((e for e in entries if e["id"] == ctx.plugin_id), None)
+            return entry is not None and not entry.get("registered")
+
+        check(ctx.wait_until(unregistered), "the invalid saved configuration never registers")
+        before = ctx.mock.count()
+        check_eq(ctx.client.chat(key, MODEL).status, 401, "the native guard denies the key without its plugin")
+        check_eq(ctx.mock.count(), before, "invalid configuration cannot execute customer traffic")
+
+        restored = ctx.manager.config_call("PATCH", body={setting: None})
+        check_eq(restored.status, 200, "the retired field is removed from the saved configuration")
+        registered = ctx.host.plugin_registration(timeout=15)
+        entry = next((e for e in registered.get("plugins", []) if e["id"] == ctx.plugin_id), {})
+        check(entry.get("registered"), "the corrected configuration restores registration")
+        check_eq(ctx.manager.health().json()["status"], "ok", "the corrected configuration restores health")
+
+    check_eq(ctx.client.chat(key, MODEL).status, 200, "the restored plugin authenticates the original key")
+    check(ctx.wait_until(lambda: _spent(ctx, item["id"]) == 14), "the original ledger survives both reloads")
     check_eq(ctx.mock.count("/chat/completions"), 1, "exactly the accepted request reached upstream")
     return {"statuses": statuses, "key_spent": _spent(ctx, item["id"]), "health": "ok"}
 

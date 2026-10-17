@@ -145,8 +145,8 @@ func scanRequest(scan func(...any) error) (*reqRow, error) {
 	}
 	r.snapshot = snapshot
 	if snapshot != nil {
-		// The frozen snapshot is authoritative; the legacy rate columns are
-		// only a downgrade-compatible mirror of the same price.
+		// The frozen snapshot is authoritative; the legacy rate columns only
+		// mirror the same price.
 		r.price = snapshot.Price
 	} else {
 		r.price = priceFromRequestRow(in, out, cr, cw, version, reasoning, r.model)

@@ -205,7 +205,7 @@ func (m *Manager) apply(raw []byte, hostSchema uint32) ([]byte, error) {
 
 	cfg, err := config.Parse(raw)
 	if err != nil {
-		return errorEnvelope(&PluginError{Code: "invalid_config", Message: "invalid plugin configuration", HTTPStatus: http.StatusBadRequest})
+		return errorEnvelope(&PluginError{Code: "invalid_config", Message: err.Error(), HTTPStatus: http.StatusBadRequest})
 	}
 
 	m.mu.Lock()

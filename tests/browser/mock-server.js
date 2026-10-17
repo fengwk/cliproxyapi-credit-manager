@@ -436,8 +436,8 @@ const HEALTH = {
   config: {
     data_dir: '/tmp/cm-mock-data',
     retention_months: 3,
-    max_pending_requests: 128,
-    capture: { enabled: true, retention: '24h', max_body_bytes: 1048576, max_storage_bytes: 1073741824 },
+    history: { retention_months: 3 },
+    request_capture: { enabled: true, retention: '24h', max_body_bytes: 1048576, max_storage_bytes: 1073741824 },
   },
 };
 

@@ -17,7 +17,7 @@ quotas are soft limits on actual used amounts (`used >= limit` rejects the *next
 request). Actual usage is always charged in full, even past a quota. Unknown or
 missing usage stays visibly pending without freezing money, and no independent
 backlog gate (`max_pending_requests`) blocks later admissions. The plugin runs no
-background work and declares no host model-execution callback.
+background model execution and declares no host model-execution callback.
 
 ## Safety and isolation
 
@@ -133,7 +133,7 @@ Each case's host lives at `<artifacts>/host-<n>-<case>/` with `config.yaml`,
 | `namespace` | Request model vs execution/response model are kept distinct for an aliased model; billing uses the requested model's price. |
 | `lifecycle` | Unknown usage stays pending (never free) with no hold, and it does not block the next admission; client cancel does not hang or fabricate a charge; restart retains the settled balance and keeps unfinished work pending. |
 | `retry` | A 429 on the first upstream credential fails over, one client request, two independent per-attempt usage rows (failed-unknown not written off); all-failures never bill as free. |
-| `passive` | No background execution: no upstream activity or credential selection without a client request. Retired settings are a config error, not a silent no-op: a hot-reload of `warmup`/`max_pending_requests` is refused and the plugin keeps serving, and a deployment configured with `warmup` refuses registration with the error in the host log and executes nothing. |
+| `passive` | No background model execution: no upstream activity or credential selection without a client request. CPA can save `warmup`/`max_pending_requests` with HTTP 200, but the subsequent plugin registration refuses these fields and the native guard denies client keys. Removing the fields restores registration and the original ledger. A deployment configured with `warmup` also refuses registration with the field named in the host log. |
 | `affinity` | Native CPA session-affinity scheduling (`routing.session-affinity: true`, default round-robin, two synthetic credentials): an explicit `X-Session-ID` shared by three requests with different user content, and a grown conversation prefix (system+user stable, assistant+user appended) with **no** session header, each keep every request on one credential (identical `AuthID` and upstream key) and bill 3 x 14 = 42. Unrelated requests without a session do alternate the two credentials, so the binding is not a default. A third case binds an explicit session, then reassigns the key's caller and rotates the key material, and asserts the same session stays on the same `AuthID`/upstream key. |
 | `gemini` | Native `generateContent` and `streamGenerateContent` (`alt=sse`) authenticate, forward the upstream Google key and bill. |
 | `browser` | Real isolated Chromium: per-tab session login, optional remembered reload, logout clearing storage/charts, real ECharts/month query, lazy capture-body modal with redaction/64-bit fidelity, customer own-key snapshot lookup, the default overview tab's real ECharts aggregate, an advanced rule saved through the DOM with a lossless 2^53+1 rate, and customer model-data isolation. |

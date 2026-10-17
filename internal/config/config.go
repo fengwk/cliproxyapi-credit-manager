@@ -27,31 +27,6 @@ type History struct {
 	RetentionMonths int `yaml:"retention_months" json:"retention_months"`
 }
 
-// retiredSettings are configuration keys this plugin no longer supports. The
-// removed background warmup and pending-request backlog gate must be refused
-// with a clear error instead of being silently ignored, which would leave an
-// operator believing the retired behavior is still active.
-var retiredSettings = []string{"warmup", "max_pending_requests"}
-
-// rejectRetiredSettings refuses any configuration document that still carries a
-// retired top-level key. A document that does not parse as a mapping is left to
-// the strict decoder so the operator sees the syntax error instead.
-func rejectRetiredSettings(raw []byte) error {
-	if len(bytes.TrimSpace(raw)) == 0 {
-		return nil
-	}
-	var document map[string]yaml.Node
-	if err := yaml.Unmarshal(raw, &document); err != nil {
-		return nil
-	}
-	for _, key := range retiredSettings {
-		if _, present := document[key]; present {
-			return fmt.Errorf("invalid plugin configuration: %s is no longer supported", key)
-		}
-	}
-	return nil
-}
-
 func Parse(raw []byte) (Config, error) {
 	c := Config{
 		DataDir: "./data/cliproxyapi-credit-manager",
@@ -59,9 +34,6 @@ func Parse(raw []byte) (Config, error) {
 		Capture: capture.Config{
 			RetentionText: "24h", MaxBodyBytes: 10 << 20, MaxStorageBytes: 1 << 30,
 		},
-	}
-	if err := rejectRetiredSettings(raw); err != nil {
-		return Config{}, err
 	}
 	if len(bytes.TrimSpace(raw)) != 0 {
 		d := yaml.NewDecoder(bytes.NewReader(raw))

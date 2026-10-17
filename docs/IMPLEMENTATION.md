@@ -119,9 +119,10 @@ No background execution: the plugin registers no executor/router/scheduler and
 issues no outbound host model-execution callback (the removed warmup bridge); the
 ABI probe asserts zero host callbacks.
 Advanced pricing is non-invasive: the interceptor only reads the request body
-(service_tier/tier, and n/n_images/num_images/image_count clamped to 1..32,
-default 1) and never rewrites the request, its headers, its selection or the
-response. The billed service tier is `UsageRecord.ResponseServiceTier`, else
+(service_tier/tier, and n/n_images/num_images/image_count validated in 1..32,
+default 1; unsupported counts are rejected, never clamped) and never rewrites
+the request, its headers, its selection or the response.
+The billed service tier is `UsageRecord.ResponseServiceTier`, else
 `UsageRecord.ServiceTier`, else the tier frozen at admission. LIMITATION: the
 SDK `UsageRecord` exposes no image counters, so per-image billing charges the
 frozen requested image count once on a proven successful lifecycle and cannot
@@ -221,7 +222,6 @@ linux/arm64,darwin/arm64 + checksums.txt. Registration version is bare release
 number for CPA store comparison; health and package metadata retain full commit/sdk.
 Curated notes live at `docs/release-notes-<tag>.md`; the release workflow refuses
 to publish a tag without them. Config example and operations guidance live in
-`config.example.yaml` and `docs/operations.md`. The candidate local version may
-be 0.1.4; no release is authorized by this contract.
+`config.example.yaml` and `docs/operations.md`.
 Do not publish placeholders or hide incomplete requirements. Event delivery is
 memory-only CPA queue: no end-to-end crash-safe exactly-once billing claim.

@@ -57,7 +57,7 @@ def tiny_remaining_admits_large(ctx):
     check(_settled(ctx, item["id"], COST) is not None, "first request settled at 14")
     row = _key(ctx, item["id"])
     check_eq(row["quota_used_micro_usd"], COST, "quota baseline consumed to 14")
-    check_eq(row["quota_micro_usd"], 15, "the configured limit is positive")
+    check_eq(row["spec"]["quota_micro_usd"], 15, "the configured limit is positive")
     check_no_holds(row, "key row")
 
     # A declaration far larger than the 1 microUSD remainder must not be used to
@@ -74,10 +74,10 @@ def tiny_remaining_admits_large(ctx):
     row = _settled(ctx, item["id"], COST * 2)
     check(row is not None, "key reached the actual 28 microUSD")
     check_eq(row["quota_used_micro_usd"], COST * 2, "actual used exceeds the limit after the overrun")
-    check(row["quota_used_micro_usd"] > row["quota_micro_usd"], "the actual charge overran the soft limit")
+    check(row["quota_used_micro_usd"] > row["spec"]["quota_micro_usd"], "the actual charge overran the soft limit")
     return {"declared_max_tokens": 100_000, "body_bytes": len(big),
             "key_spent": row["spent_micro_usd"], "quota_used": row["quota_used_micro_usd"],
-            "quota": row["quota_micro_usd"], "upstream_calls": ctx.mock.count("/chat/completions")}
+            "quota": row["spec"]["quota_micro_usd"], "upstream_calls": ctx.mock.count("/chat/completions")}
 
 
 @case("admission.actual_overrun_then_next_request_denied",
@@ -107,7 +107,7 @@ def actual_overrun_then_denied(ctx):
     check_no_holds(report["summary"], "usage summary")
     check_eq(_key(ctx, item["id"])["spent_micro_usd"], COST * 2, "denial changes no charged amount")
     return {"denied_status": denied.status, "key_spent": row["spent_micro_usd"],
-            "quota_used": row["quota_used_micro_usd"], "limit": row["quota_micro_usd"],
+            "quota_used": row["quota_used_micro_usd"], "limit": row["spec"]["quota_micro_usd"],
             "upstream_calls": ctx.mock.count("/chat/completions")}
 
 
@@ -143,7 +143,7 @@ def concurrent_same_key(ctx):
     check_no_holds(report["summary"], "usage summary")
     check_no_holds(row, "key row")
     return {"statuses": statuses, "key_spent": row["spent_micro_usd"],
-            "quota_used": row["quota_used_micro_usd"], "limit": row["quota_micro_usd"],
+            "quota_used": row["quota_used_micro_usd"], "limit": row["spec"]["quota_micro_usd"],
             "upstream_calls": ctx.mock.count("/chat/completions")}
 
 
@@ -159,10 +159,13 @@ def unknown_usage_no_backlog(ctx):
     ctx.mock.default_script = Script(omit_usage=True)
     for index in range(BACKLOG_PROBE):
         check_eq(ctx.client.chat(key, "synthetic-chat").status, 200, f"unresolved request {index + 1} admitted")
-    report = ctx.wait_until(
-        lambda: (r := ctx.usage_rows(key_id=item["id"], page_size=50))
-        if r["total"] >= BACKLOG_PROBE and r["summary"].get("pending") == BACKLOG_PROBE else None,
-        timeout=20)
+    def pending_report():
+        report = ctx.usage_rows(key_id=item["id"], page_size=50)
+        if report["total"] == BACKLOG_PROBE and report["summary"]["pending"] == BACKLOG_PROBE:
+            return report
+        return None
+
+    report = ctx.wait_until(pending_report, timeout=20)
     check(report is not None, f"{BACKLOG_PROBE} unresolved requests are recorded as pending")
     check_eq(report["total"], BACKLOG_PROBE, "exactly the admitted requests are recorded")
     check_eq(report["summary"]["pending"], BACKLOG_PROBE, "every unresolved request stays pending")
@@ -170,12 +173,14 @@ def unknown_usage_no_backlog(ctx):
     check_eq(_key(ctx, item["id"])["spent_micro_usd"], 0, "no money is held or charged for unknown usage")
     check_no_holds(_key(ctx, item["id"]), "key row with unresolved requests")
 
-    # Another key is unaffected, and a normal request on it still bills actual usage.
+    # Both the same key and another key still admit and bill reliable usage.
     ctx.mock.default_script = Script()
+    check_eq(ctx.client.chat(key, "synthetic-chat").status, 200, "the same key admits after 20 pending requests")
+    check(_settled(ctx, item["id"], COST) is not None, "the same key bills reliable usage after the backlog")
     check_eq(ctx.client.chat(other_key, "synthetic-chat").status, 200, "a second key is admitted")
     row = _settled(ctx, other["id"], COST)
     check(row is not None, "the second key settles normally")
-    check_eq(ctx.mock.count("/chat/completions"), BACKLOG_PROBE + 1, "every admitted request reached upstream")
+    check_eq(ctx.mock.count("/chat/completions"), BACKLOG_PROBE + 2, "every admitted request reached upstream")
     return {"pending": report["summary"]["pending"], "probe": BACKLOG_PROBE,
             "other_key_spent": row["spent_micro_usd"], "upstream_calls": ctx.mock.count("/chat/completions")}
 

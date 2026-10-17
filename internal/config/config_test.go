@@ -39,7 +39,11 @@ func TestRetiredSettingsRejected(t *testing.T) {
 		if err == nil {
 			t.Fatalf("accepted retired setting %q", raw)
 		}
-		if !strings.Contains(err.Error(), "no longer supported") {
+		setting := "warmup"
+		if strings.Contains(raw, "max_pending_requests") {
+			setting = "max_pending_requests"
+		}
+		if !strings.Contains(err.Error(), "field "+setting+" not found") {
 			t.Fatalf("retired setting %q error = %v, want an explicit removed-setting error", raw, err)
 		}
 	}
