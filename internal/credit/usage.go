@@ -28,12 +28,15 @@ type usageRow struct {
 	statusCode    int
 	tokens        Tokens
 	raw           pluginapi.UsageDetail
-	cost          *int64
-	charged       bool
-	reliable      bool
-	at            time.Time
-	latencyMS     int64
-	ttftMS        int64
+	// reliable mirrors the persisted trust verdict: only trustworthy usage is
+	// consumed against the admission counters and priced at read time.
+	reliable  bool
+	at        time.Time
+	latencyMS int64
+	ttftMS    int64
+	// cost is a query-time projection, never a persisted column. A nil cost is
+	// reported as JSON null.
+	cost *int64
 }
 
 func (u *usageRow) toUsage() Usage {
@@ -63,6 +66,20 @@ func (u *usageRow) toUsage() Usage {
 		out.CostMicroUSD = &v
 	}
 	return out
+}
+
+// applyCost prices one execution row from the current price book. An unpriced
+// execution keeps a nil cost, which the API renders as an explicit null.
+func (b *priceBook) applyCost(u *usageRow) error {
+	cost, priced, err := b.executionCost(u.model, u.tokens, u.serviceTier, u.reliable)
+	if err != nil {
+		return err
+	}
+	if priced {
+		v := cost
+		u.cost = &v
+	}
+	return nil
 }
 
 // material holds every caller-supplied field that must not silently change for
@@ -106,34 +123,27 @@ func (u Usage) material() usageMaterial {
 const usageColumns = `id, request_id, trace_id, key_id, provider, auth_id, auth_index, executor,
 	model, response_model, quality, failed, status_code, tokens_input, tokens_cache_read,
 	tokens_cache_write, tokens_output, tokens_reasoning, tokens_total, raw_input, raw_output,
-	raw_reasoning, raw_cached, raw_cache_read, raw_cache_create, raw_total, cost_micro_usd,
-	charged, reliable, at, latency_ms, ttft_ms, service_tier`
+	raw_reasoning, raw_cached, raw_cache_read, raw_cache_create, raw_total,
+	reliable, at, latency_ms, ttft_ms, service_tier`
 
 func scanUsage(scan func(...any) error) (*usageRow, error) {
 	var (
 		u        usageRow
 		failed   int
-		charged  int
 		reliable int
 		at       int64
-		cost     sql.NullInt64
 	)
 	if err := scan(&u.id, &u.requestID, &u.traceID, &u.keyID, &u.provider, &u.authID, &u.authIndex,
 		&u.executor, &u.model, &u.responseModel, &u.quality, &failed, &u.statusCode,
 		&u.tokens.Input, &u.tokens.CacheRead, &u.tokens.CacheWrite, &u.tokens.Output, &u.tokens.Reasoning,
 		&u.tokens.Total, &u.raw.InputTokens, &u.raw.OutputTokens, &u.raw.ReasoningTokens,
 		&u.raw.CachedTokens, &u.raw.CacheReadTokens, &u.raw.CacheCreationTokens, &u.raw.TotalTokens,
-		&cost, &charged, &reliable, &at, &u.latencyMS, &u.ttftMS, &u.serviceTier); err != nil {
+		&reliable, &at, &u.latencyMS, &u.ttftMS, &u.serviceTier); err != nil {
 		return nil, err
 	}
 	u.failed = failed != 0
-	u.charged = charged != 0
 	u.reliable = reliable != 0
 	u.at = fromUnixNano(at)
-	if cost.Valid {
-		v := cost.Int64
-		u.cost = &v
-	}
 	return &u, nil
 }
 
@@ -215,16 +225,19 @@ func accountingReliable(u Usage) bool {
 }
 
 // RecordUsage attaches one execution event to a persisted request. Unknown or
-// zero accounting is retained as unknown and never billed as a fake zero.
+// zero accounting is retained as unreliable rather than being treated as a
+// trustworthy zero.
 //
-// The cost is always derived by the core from the request price snapshot; a
-// caller supplied cost is rejected so quality and money can never disagree.
+// Recording never prices anything: no price is read, no amount is written, so a
+// missing price or a rate whose product would overflow int64 cannot prevent the
+// usage from being stored. A caller supplied cost is still rejected, because the
+// cost is a read-time projection that must never be injectable.
 func (s *Store) RecordUsage(ctx context.Context, usage Usage) error {
 	if strings.TrimSpace(usage.ID) == "" || strings.TrimSpace(usage.TraceID) == "" || strings.TrimSpace(usage.KeyID) == "" {
 		return fmt.Errorf("%w: usage id, trace id and key id are required", ErrInvalid)
 	}
 	if usage.CostMicroUSD != nil {
-		return fmt.Errorf("%w: usage cost is derived from the request price snapshot", ErrInvalid)
+		return fmt.Errorf("%w: usage cost is derived at read time and cannot be supplied", ErrInvalid)
 	}
 	tokens, err := normalizeTokens(usage.Tokens)
 	if err != nil {
@@ -252,16 +265,15 @@ func (s *Store) RecordUsage(ctx context.Context, usage Usage) error {
 		// Canonicalize the request id before comparison: the native bridge only
 		// supplies a trace, so an empty id must still replay idempotently.
 		usage.RequestID = req.id
-		// The billed service tier is the reported one, else the tier frozen at
-		// admission. Only an *omitted* tier falls back: a reported tier that
+		// The reported service tier is a usage fact; only an *omitted* tier
+		// falls back to the tier recorded on the request. A reported tier that
 		// normalizes to "none" (for example "default" or "auto") is an explicit
-		// statement that no special tier applies, so inheriting the frozen one
-		// would overcharge. The normalized value is what is persisted, so a
-		// replay is compared against it instead of silently repricing.
+		// statement that no special tier applies, so inheriting the request tier
+		// would misattribute the execution.
 		if reported := strings.TrimSpace(usage.ServiceTier); reported != "" {
 			usage.ServiceTier = normalizeServiceTier(reported)
 		} else {
-			usage.ServiceTier = normalizeServiceTier(req.snapshot.ServiceTier)
+			usage.ServiceTier = req.serviceTier
 		}
 		existing, err := loadUsageByID(ctx, tx, usage.ID)
 		switch {
@@ -281,67 +293,26 @@ func (s *Store) RecordUsage(ctx context.Context, usage Usage) error {
 		default:
 			return err
 		}
-		var cost *int64
-		if reliable {
-			if req.snapshot.Price.IsPerImage() {
-				// A reliable per-image attempt is *known* accounting worth zero:
-				// the frozen requested count is billed once for the whole
-				// successful lifecycle (see bookPerImageOnProvenSuccess), so a
-				// per-attempt cost stays an explicit zero rather than an unknown
-				// NULL, which would leave report and analytics at zero.
-				zero := int64(0)
-				cost = &zero
-			} else {
-				// Token prices settle from actual usage: the frozen service
-				// tier applies first, and the highest context tier matching the
-				// actual canonical prompt size applies otherwise.
-				v, err := requestCost(req.snapshot.Price, req.snapshot.Tiers, tokens, usage.ServiceTier)
-				if err != nil {
-					return err
-				}
-				cost = &v
-			}
-		}
 		if _, err := tx.ExecContext(ctx, `INSERT INTO usages (`+usageColumns+`) VALUES
-			(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+			(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 			usage.ID, req.id, usage.TraceID, usage.KeyID, usage.Provider, usage.AuthID, usage.AuthIndex,
 			usage.Executor, usage.Model, usage.ResponseModel, usage.Quality, boolInt(usage.Failed),
 			usage.StatusCode, tokens.Input, tokens.CacheRead, tokens.CacheWrite, tokens.Output,
 			tokens.Reasoning, tokens.Total, usage.Raw.InputTokens, usage.Raw.OutputTokens,
 			usage.Raw.ReasoningTokens, usage.Raw.CachedTokens, usage.Raw.CacheReadTokens,
-			usage.Raw.CacheCreationTokens, usage.Raw.TotalTokens, cost, 0, boolInt(reliable),
+			usage.Raw.CacheCreationTokens, usage.Raw.TotalTokens, boolInt(reliable),
 			unixNano(at), usage.LatencyMS, usage.TTFTMS, usage.ServiceTier); err != nil {
 			return fmt.Errorf("insert usage: %w", err)
 		}
 		if reliable {
-			// Consumed tokens count against the quota counters immediately.
+			// Consumed tokens count against the admission counters immediately.
 			if err := addTokens(ctx, tx, req.keyID, req.model, req.startedAt, tokens.Total); err != nil {
 				return err
 			}
 		}
-		// A trustworthy per-execution cost is booked in the same transaction
-		// that records it, even while the request stays open, so a later
-		// write-off can never discard a real charge. A per-image attempt has no
-		// per-execution charge: its single lifecycle charge is booked below.
-		if cost != nil && !req.snapshot.Price.IsPerImage() {
-			if err := s.applyCharge(ctx, tx, req, usage.ID, *cost); err != nil {
-				return err
-			}
-		}
-		// A per-image price is booked once per proven successful lifecycle, not
-		// once per execution attempt.
-		if err := s.bookPerImageOnProvenSuccess(ctx, tx, req); err != nil {
-			return err
-		}
-		if !reliable && req.state == stateSettled && req.resolved == resolvedAuto {
-			// Untrustworthy accounting arrived after the request was closed
-			// automatically: reopen it so the work stays visible until an
-			// administrator decides. A manually resolved request is left
-			// closed because an administrator already ruled on it.
-			//
-			// The test is the reliable flag, not a missing per-execution cost:
-			// a per-image request bills once per lifecycle, so its reliable
-			// usage rows legitimately carry no cost.
+		if !reliable && req.state == stateSettled {
+			// Untrustworthy accounting arrived after the request was closed:
+			// reopen it so the work stays visible. A price is not involved.
 			if err := s.reopenRequest(ctx, tx, req); err != nil {
 				return err
 			}
@@ -377,7 +348,8 @@ func (u *usageRow) materialEqual(in Usage) bool {
 }
 
 // Complete records a terminal lifecycle event. Concurrency is released once and
-// the request is closed only for trustworthy accounting.
+// the request is closed only for trustworthy usage. No amount is booked: a
+// completed request is a lifecycle fact, not a settlement of money.
 func (s *Store) Complete(ctx context.Context, c Completion) error {
 	if strings.TrimSpace(c.ID) == "" {
 		return fmt.Errorf("%w: completion id is required", ErrInvalid)
@@ -398,7 +370,7 @@ func (s *Store) Complete(ctx context.Context, c Completion) error {
 		}
 		if req.outcome != "" {
 			// A recorded outcome is authoritative: a repeated completion must
-			// agree, otherwise the ledger would silently change what was
+			// agree, otherwise the lifecycle would silently change what was
 			// already recorded. An agreeing repeat is a no-op, whether the
 			// request is already closed or still unresolved.
 			if req.outcome != c.Outcome || req.statusCode != c.StatusCode {
@@ -408,27 +380,7 @@ func (s *Store) Complete(ctx context.Context, c Completion) error {
 			if req.state == stateSettled {
 				return nil
 			}
-			// Still unresolved: a late usage may have made it closable.
-			if err := s.bookPerImageOnProvenSuccess(ctx, tx, req); err != nil {
-				return err
-			}
 			return s.evaluateSettle(ctx, tx, req, at)
-		}
-		if req.state == stateSettled {
-			if req.resolved == resolvedAuto {
-				// Unreachable by construction: an automatic close always
-				// records an outcome.
-				return nil
-			}
-			// An administrator closed this request before its completion
-			// arrived. Record that outcome metadata once, without reopening the
-			// request.
-			if _, err := tx.ExecContext(ctx, `UPDATE requests SET outcome = ?, status_code = ?,
-				completed_at = ? WHERE id = ?`,
-				c.Outcome, c.StatusCode, unixNano(at), req.id); err != nil {
-				return fmt.Errorf("record late completion: %w", err)
-			}
-			return nil
 		}
 		if _, err := tx.ExecContext(ctx, `UPDATE requests SET state = ?, outcome = ?, status_code = ?, completed_at = ?
 			WHERE id = ?`, statePending, c.Outcome, c.StatusCode, unixNano(at), req.id); err != nil {
@@ -438,50 +390,6 @@ func (s *Store) Complete(ctx context.Context, c Completion) error {
 		req.outcome = c.Outcome
 		req.statusCode = c.StatusCode
 		req.completedAt = &at
-		if err := s.bookPerImageOnProvenSuccess(ctx, tx, req); err != nil {
-			return err
-		}
 		return s.evaluateSettle(ctx, tx, req, at)
 	})
-}
-
-// bookPerImageOnProvenSuccess charges the frozen per-image price exactly once.
-//
-// A per-image request is billed for the requested image count only when its
-// lifecycle is proven successful: a failed, canceled or rejected lifecycle is
-// never charged, a retried or failed attempt is not charged per attempt, and an
-// unknown or still missing completion keeps the request pending. The first
-// charged usage row is the durable "already booked" marker, so a replay, a late
-// duplicate or a second successful execution can never double charge.
-func (s *Store) bookPerImageOnProvenSuccess(ctx context.Context, tx *sql.Tx, req *reqRow) error {
-	if !req.snapshot.Price.IsPerImage() || req.outcome != OutcomeSucceeded {
-		return nil
-	}
-	booked, err := counterValue(ctx, tx,
-		`SELECT COUNT(*) FROM usages WHERE request_id = ? AND charged = 1`, req.id)
-	if err != nil || booked > 0 {
-		return err
-	}
-	agg, err := usageStats(ctx, tx, req.id)
-	if err != nil {
-		return err
-	}
-	if agg.success == 0 || agg.reliable == 0 || agg.unknown > 0 {
-		return nil
-	}
-	var usageID string
-	err = tx.QueryRowContext(ctx,
-		`SELECT id FROM usages WHERE request_id = ? AND reliable = 1 AND failed = 0 ORDER BY at, id LIMIT 1`,
-		req.id).Scan(&usageID)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil
-	}
-	if err != nil {
-		return fmt.Errorf("load per-image usage: %w", err)
-	}
-	amount, err := perImageCost(req.snapshot.Price, req.snapshot.ImageCount)
-	if err != nil {
-		return err
-	}
-	return s.applyCharge(ctx, tx, req, usageID, amount)
 }

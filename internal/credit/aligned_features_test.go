@@ -7,8 +7,9 @@ import (
 )
 
 // Audit storage is part of the mutation transaction, not a best-effort side
-// effect: failed audit writes must roll back money, rules and resolutions.
-func TestFinancialManagementAuditIsTransactional(t *testing.T) {
+// effect: a failed audit write must roll back the price and rule change, and it
+// must never leave a phantom lifecycle change behind.
+func TestPricingManagementAuditIsTransactional(t *testing.T) {
 	h := newHarness(t)
 	ctx := h.ctx()
 	key, _ := h.mustKey(KeySpec{Enabled: true})
@@ -19,7 +20,7 @@ func TestFinancialManagementAuditIsTransactional(t *testing.T) {
 	}
 	req := h.mustAdmit(AdmitInput{ID: "pending", TraceID: "trace", KeyID: key.ID, RequestedModel: "m"})
 	h.mustComplete(Completion{ID: req.ID, Outcome: OutcomeSucceeded})
-	for _, action := range []string{ActionPriceUpdate, ActionRuleUpdate, ActionRuleDelete, ActionResolve} {
+	for _, action := range []string{ActionPriceUpdate, ActionRuleUpdate, ActionRuleDelete} {
 		t.Run(action, func(t *testing.T) {
 			if _, err := h.store.db.ExecContext(ctx,
 				`CREATE TEMP TRIGGER audit_failure BEFORE INSERT ON audit_events WHEN NEW.action = '`+action+`'
@@ -41,8 +42,6 @@ func TestFinancialManagementAuditIsTransactional(t *testing.T) {
 				err = h.store.PutPricingRule(ctx, modified)
 			case ActionRuleDelete:
 				err = h.store.DeletePricingRule(ctx, rule.ID)
-			case ActionResolve:
-				err = h.store.Resolve(ctx, req.ID, Resolution{Action: ActionCharge, AmountMicroUSD: 123, Reason: "review"})
 			}
 			if err == nil || !strings.Contains(err.Error(), "audit") {
 				t.Fatalf("audit failure was ignored: %v", err)
@@ -55,16 +54,15 @@ func TestFinancialManagementAuditIsTransactional(t *testing.T) {
 			if err != nil || len(rules) != 1 || rules[0].Price.Rates.Input != 2_000_000 {
 				t.Fatalf("failed audit changed rule: %+v %v", rules, err)
 			}
-			if got := h.key(key.ID); got.SpentMicroUSD != 0 || got.QuotaUsedMicroUSD != 0 {
-				t.Fatalf("failed audit changed ledger: %+v", got)
+			// Nothing durable moved: the request is still pending and the
+			// derived report is still empty.
+			if h.request(req.ID).State != statePending {
+				t.Fatal("failed audit closed the unresolved request")
 			}
-			if h.request(req.ID).State != statePending || h.report(key.ID).Summary.AdjustmentMicroUSD != 0 {
-				t.Fatal("failed audit closed the unresolved request or left a phantom adjustment")
+			if sum := h.report(key.ID).Summary; sum.CostMicroUSD != 0 || sum.UnpricedExecutions != 0 {
+				t.Fatalf("failed audit changed the derived report: %+v", sum)
 			}
 		})
-	}
-	if err := h.store.Resolve(ctx, req.ID, Resolution{Action: ActionCharge, AmountMicroUSD: 123, Reason: "review"}); err != nil {
-		t.Fatal(err)
 	}
 	page, err := h.store.Audit(ctx, AuditFilter{})
 	if err != nil {
@@ -74,13 +72,15 @@ func TestFinancialManagementAuditIsTransactional(t *testing.T) {
 	for _, event := range page.Items {
 		count[event.Action]++
 	}
-	if count[ActionPriceUpdate] != 1 || count[ActionRuleUpdate] != 1 || count[ActionResolve] != 1 || count[ActionRuleDelete] != 0 {
+	if count[ActionPriceUpdate] != 1 || count[ActionRuleUpdate] != 1 || count[ActionRuleDelete] != 0 {
 		t.Fatalf("phantom or missing audit events: %+v", count)
 	}
 }
 
 // Throughput's numerator must cover only executions whose measured latency
-// contributes to its denominator; unmeasured output cannot inflate the rate.
+// contributes to its denominator; unmeasured output cannot inflate the rate. The
+// per-model cost of the same slice is priced by each execution's actual model,
+// which here has no price at all.
 func TestModelEfficiencyPairsOutputWithMeasuredLatency(t *testing.T) {
 	h := newHarness(t)
 	key, _ := h.mustKey(KeySpec{Enabled: true})
@@ -103,32 +103,49 @@ func TestModelEfficiencyPairsOutputWithMeasuredLatency(t *testing.T) {
 	if m.OutputTokens != 120 || m.MeasuredOutputTokens != 20 || m.LatencyMS != 1000 || m.LatencySamples != 1 || m.TTFTMS != 12 || m.TTFTSamples != 1 {
 		t.Fatalf("inconsistent throughput sample: %+v", m)
 	}
+	// The requested model is the grouping dimension, and the executions are
+	// unpriced because their actual model has no price.
+	if m.Model != "m" || m.CostMicroUSD != 0 || m.UnpricedExecutions != 2 {
+		t.Fatalf("model cost = %+v, want the alias executions unpriced under the requested model", m)
+	}
 }
 
-// Reset metadata follows the same retention rule as its period counters.
-// Lifetime baselines remain durable after old detail and periods disappear.
+// Reset metadata follows the same retention rule as its period counters. The
+// lifetime token baseline remains durable after old detail and periods
+// disappear, and no monetary table is involved at all.
 func TestCleanupPrunesPeriodResetBaselinesNotLifetime(t *testing.T) {
 	h := newHarness(t)
-	key, _ := h.mustKey(KeySpec{Enabled: true})
+	key, _ := h.mustKey(KeySpec{Enabled: true,
+		ModelTokenLimits: []ModelTokenLimit{{Model: "m", Total: 10, Daily: 10, Weekly: 10, Monthly: 10}}})
 	h.mustPrice("m", Rates{Input: 1_000_000})
 	req := h.mustAdmit(AdmitInput{ID: "r", TraceID: "t", KeyID: key.ID, RequestedModel: "m"})
 	h.mustUsage(usageFor("u", req, "m", tokens(10, 0, 0, 0, 0)))
 	h.mustComplete(Completion{ID: req.ID, Outcome: OutcomeSucceeded})
-	_, err := h.store.ResetSpend(h.ctx(), ResetSpec{KeyID: key.ID, Total: true, Daily: true, Weekly: true, Monthly: true, Reason: "new allocation"})
-	if err != nil {
+	if _, err := h.store.ResetTokens(h.ctx(), ResetSpec{KeyID: key.ID, Total: true, Daily: true, Weekly: true, Monthly: true, Reason: "new allocation"}); err != nil {
 		t.Fatal(err)
 	}
 	h.clock.advance(365 * 24 * time.Hour)
 	if _, err := h.store.Cleanup(h.ctx()); err != nil {
 		t.Fatal(err)
 	}
-	for _, table := range []string{"key_money_baselines", "key_token_baselines"} {
-		n, err := counterValue(h.ctx(), h.store.db, `SELECT COUNT(*) FROM `+table+` WHERE win != ?`, windowTotal)
-		if err != nil || n != 0 {
-			t.Fatalf("%s retained aged periods: %d %v", table, n, err)
-		}
+	n, err := counterValue(h.ctx(), h.store.db,
+		`SELECT COUNT(*) FROM key_token_baselines WHERE win != ?`, windowTotal)
+	if err != nil || n != 0 {
+		t.Fatalf("aged period baselines retained: %d %v", n, err)
 	}
-	if k := h.key(key.ID); k.SpentMicroUSD != 10 || k.QuotaUsedMicroUSD != 0 {
-		t.Fatalf("cleanup erased lifetime reset: %+v", k)
+	lifetime, err := counterValue(h.ctx(), h.store.db,
+		`SELECT COUNT(*) FROM key_token_baselines WHERE win = ?`, windowTotal)
+	if err != nil || lifetime != 1 {
+		t.Fatalf("lifetime baseline = %d (%v), want it kept", lifetime, err)
+	}
+	// The durable lifetime counter survived the cleanup, so the effective usage
+	// the reset removed is still exactly the reset baseline.
+	total, err := tokenCounter(h.ctx(), h.store.db, key.ID, "m", windowTotal, "")
+	if err != nil || total != 10 {
+		t.Fatalf("lifetime token counter = %d (%v), want 10 kept", total, err)
+	}
+	effective, err := effectiveToken(h.ctx(), h.store.db, key.ID, "m", windowTotal, "", total)
+	if err != nil || effective != 0 {
+		t.Fatalf("effective usage after reset = %d (%v), want 0", effective, err)
 	}
 }

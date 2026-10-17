@@ -2,7 +2,6 @@ package credit
 
 import (
 	"context"
-	"database/sql"
 	"fmt"
 	"math"
 	"slices"
@@ -10,14 +9,16 @@ import (
 	"time"
 )
 
-// Report summarizes and pages request history. Aggregation happens in SQLite;
-// only the current page hydrates nested executions.
+// Report summarizes and pages request history. Counters and token totals are
+// aggregated in SQLite; monetary values are derived from the same executions
+// through the price book loaded for this query. Only the current page hydrates
+// nested executions.
 func (s *Store) Report(ctx context.Context, f Filter) (Report, error) {
 	return s.report(ctx, f, false)
 }
 
 // LookupReport includes full-selection model metrics without widening the
-// paged item query. Both sets are read from the same financial snapshot.
+// paged item query. Both sets are read from the same snapshot.
 func (s *Store) LookupReport(ctx context.Context, f Filter) (Report, error) {
 	return s.report(ctx, f, true)
 }
@@ -40,9 +41,15 @@ func (s *Store) report(ctx context.Context, f Filter, includeModels bool) (Repor
 	bucketExpr, bucketArgs := trendBucket(f.Bucket)
 
 	// All derived numbers come from one read transaction so a concurrent writer
-	// cannot make the page, the total and the trend disagree.
+	// cannot make the page, the total, the trend and the price book disagree.
 	var out Report
 	err = s.withSnapshot(ctx, func(q querier) error {
+		// The price book is loaded exactly once per query and reused for the
+		// summary, the trend, the model breakdown and the page.
+		book, err := loadPriceBook(ctx, q)
+		if err != nil {
+			return err
+		}
 		summary, err := s.reportSummary(ctx, q, where, args, execWhere, execArgs)
 		if err != nil {
 			return err
@@ -51,11 +58,24 @@ func (s *Store) report(ctx context.Context, f Filter, includeModels bool) (Repor
 		if err != nil {
 			return err
 		}
+		costs, err := s.projectCosts(ctx, q, book, where, args, execWhere, execArgs,
+			bucketExpr, bucketArgs, includeModels)
+		if err != nil {
+			return err
+		}
+		summary.CostMicroUSD = costs.total.cost
+		summary.UnpricedExecutions = costs.total.unpriced
 		trend, err := s.reportTrend(ctx, q, where, args, execWhere, execArgs, bucketExpr, bucketArgs)
 		if err != nil {
 			return err
 		}
-		items, err := s.reportItems(ctx, q, where, args, execWhere, execArgs, size, offset)
+		for i := range trend {
+			if bucket, ok := costs.buckets[trend[i].Time.UnixNano()]; ok {
+				trend[i].Summary.CostMicroUSD = bucket.cost
+				trend[i].Summary.UnpricedExecutions = bucket.unpriced
+			}
+		}
+		items, err := s.reportItems(ctx, q, book, where, args, execWhere, execArgs, size, offset)
 		if err != nil {
 			return err
 		}
@@ -69,10 +89,19 @@ func (s *Store) report(ctx context.Context, f Filter, includeModels bool) (Repor
 			RetentionFrom: s.retentionFrom(now),
 		}
 		if includeModels {
-			out.Models, err = s.reportModels(ctx, q, where, args, execWhere, execArgs)
+			models, err := s.reportModels(ctx, q, where, args, execWhere, execArgs)
 			if err != nil {
 				return err
 			}
+			// The per-model cost comes from the same projection as the summary
+			// and the trend, so the model rows reconcile exactly with both.
+			for i := range models {
+				if tally, ok := costs.models[models[i].Model]; ok {
+					models[i].Summary.CostMicroUSD = tally.cost
+					models[i].Summary.UnpricedExecutions = tally.unpriced
+				}
+			}
+			out.Models = models
 		}
 		return nil
 	})
@@ -228,9 +257,12 @@ func buildPredicates(f Filter, from, to time.Time) (string, []any, string, []any
 	return strings.Join(conds, " AND "), args, execWhere, execArgs
 }
 
+// execAggregate is the SQLite-side aggregate of a selection's executions:
+// counts and token sums. Amounts are deliberately absent, because a cost is
+// derived in Go from the current price book, not summed from a persisted
+// column.
 const execAggregate = `COUNT(*),
-	COALESCE(SUM(CASE WHEN u.cost_micro_usd IS NOT NULL THEN 1 ELSE 0 END),0),
-	COALESCE(SUM(COALESCE(u.cost_micro_usd,0)),0),
+	COALESCE(SUM(u.reliable),0),
 	COALESCE(SUM(u.tokens_input),0),
 	COALESCE(SUM(u.tokens_cache_read),0),
 	COALESCE(SUM(u.tokens_cache_write),0),
@@ -242,9 +274,10 @@ const execAggregate = `COUNT(*),
 
 type execTotals struct {
 	executions int64
-	known      int64
-	cost       int64
-	tokens     Tokens
+	// reliable is the count of trustworthy executions. It is the usage-side
+	// definition of CompleteExecutions and never depends on a price.
+	reliable int64
+	tokens   Tokens
 	// completeCacheRead and completeInputTotal are restricted to executions of
 	// complete quality. A NULL or partial quality row contributes zero to both,
 	// so the ratio below never mixes trustworthy counters with partial ones.
@@ -254,18 +287,19 @@ type execTotals struct {
 
 func scanExecTotals(scan func(...any) error) (execTotals, error) {
 	var t execTotals
-	err := scan(&t.executions, &t.known, &t.cost, &t.tokens.Input, &t.tokens.CacheRead,
+	err := scan(&t.executions, &t.reliable, &t.tokens.Input, &t.tokens.CacheRead,
 		&t.tokens.CacheWrite, &t.tokens.Output, &t.tokens.Reasoning, &t.tokens.Total,
 		&t.completeCacheRead, &t.completeInputTotal)
 	return t, err
 }
 
 // apply folds one aggregate batch into a summary. The token totals keep their
-// documented all-executions meaning; only CacheReadRatio is complete-only.
+// documented all-executions meaning; only CacheReadRatio is complete-only. The
+// monetary fields stay untouched: the caller fills them from the cost
+// projection of the same selection.
 func (t execTotals) apply(sum *Summary) error {
 	sum.Executions = t.executions
-	sum.CompleteExecutions = t.known
-	sum.CostMicroUSD = t.cost
+	sum.CompleteExecutions = t.reliable
 	sum.Tokens = t.tokens
 	canonical, err := checkedAdd(t.completeInputTotal, t.completeCacheRead)
 	if err != nil {
@@ -297,26 +331,105 @@ func (s *Store) reportSummary(ctx context.Context, q querier, where string, args
 	if err := totals.apply(&sum); err != nil {
 		return Summary{}, err
 	}
-	adjustments, err := adjustmentTotals(ctx, q, where, args)
-	if err != nil {
-		return Summary{}, err
-	}
-	sum.AdjustmentMicroUSD = adjustments
 	return sum, nil
 }
 
-// adjustmentTotals sums manual Resolve charges of the filtered requests. The
-// predicate is the request-level one: an adjustment belongs to a request, not
-// to a single execution, so it is reported whole whenever the request is
-// reported. CostMicroUSD stays execution derived, and cost + adjustments
-// reconciles with the key ledger spend for the same request selection.
-func adjustmentTotals(ctx context.Context, q querier, where string, args []any) (int64, error) {
-	total, err := counterValue(ctx, q, `SELECT COALESCE(SUM(a.amount_micro_usd),0) FROM adjustments a
-		JOIN requests r ON r.id = a.request_id WHERE `+where, args...)
-	if err != nil {
-		return 0, fmt.Errorf("summarize adjustments: %w", err)
+// costTally accumulates the query-time cost of a set of executions: the strict
+// sum of the priced ones and the count of the unpriced ones.
+type costTally struct {
+	cost     int64
+	unpriced int64
+}
+
+func (t *costTally) add(cost int64, priced bool) error {
+	if !priced {
+		t.unpriced++
+		return nil
 	}
-	return total, nil
+	next, err := checkedAdd(t.cost, cost)
+	if err != nil {
+		return fmt.Errorf("sum execution costs: %w", err)
+	}
+	t.cost = next
+	return nil
+}
+
+// selectionCosts is the whole-selection cost projection: the total, the
+// per-trend-bucket totals and, when requested, the per-request-model totals.
+type selectionCosts struct {
+	total   costTally
+	buckets map[int64]*costTally
+	models  map[string]*costTally
+}
+
+// projectCosts streams the minimal execution projection of the selection once
+// and prices every execution in Go against the price book loaded for this
+// query.
+//
+// It is a single pass with a per-actual-model match cache, so it never issues a
+// price query per execution. Results accumulate into maps keyed by trend bucket
+// and request model, so memory grows with the number of groups and not with the
+// number of executions, and the page size never limits what the summary, the
+// trend or the model breakdown covers. Per execution the amount is computed and
+// rounded as an exact integer and then summed strictly; a single execution whose
+// product cannot be represented is counted as unpriced instead of corrupting
+// the total.
+func (s *Store) projectCosts(ctx context.Context, q querier, book *priceBook,
+	where string, args []any, execWhere string, execArgs []any,
+	bucketExpr string, bucketArgs []any, includeModels bool) (selectionCosts, error) {
+	costs := selectionCosts{buckets: map[int64]*costTally{}, models: map[string]*costTally{}}
+	query := `SELECT ` + bucketExpr + ` AS bucket, r.model, u.model, u.reliable, u.service_tier,
+		u.tokens_input, u.tokens_cache_read, u.tokens_cache_write, u.tokens_output, u.tokens_reasoning
+		FROM usages u JOIN requests r ON r.id = u.request_id
+		WHERE ` + where + ` AND ` + execWhere
+	queryArgs := append(append([]any{}, bucketArgs...), append(append([]any{}, args...), execArgs...)...)
+	rows, err := q.QueryContext(ctx, query, queryArgs...)
+	if err != nil {
+		return costs, fmt.Errorf("project execution costs: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var (
+			bucket                    int64
+			requestModel, model, tier string
+			reliable                  int
+			tokens                    Tokens
+		)
+		if err := rows.Scan(&bucket, &requestModel, &model, &reliable, &tier,
+			&tokens.Input, &tokens.CacheRead, &tokens.CacheWrite, &tokens.Output,
+			&tokens.Reasoning); err != nil {
+			return costs, fmt.Errorf("scan execution cost: %w", err)
+		}
+		cost, priced, err := book.executionCost(model, tokens, tier, reliable != 0)
+		if err != nil {
+			return costs, err
+		}
+		if err := costs.total.add(cost, priced); err != nil {
+			return costs, err
+		}
+		tally, ok := costs.buckets[bucket]
+		if !ok {
+			tally = &costTally{}
+			costs.buckets[bucket] = tally
+		}
+		if err := tally.add(cost, priced); err != nil {
+			return costs, err
+		}
+		if includeModels {
+			modelTally, ok := costs.models[requestModel]
+			if !ok {
+				modelTally = &costTally{}
+				costs.models[requestModel] = modelTally
+			}
+			if err := modelTally.add(cost, priced); err != nil {
+				return costs, err
+			}
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return costs, fmt.Errorf("iterate execution costs: %w", err)
+	}
+	return costs, nil
 }
 
 func (s *Store) reportTrend(ctx context.Context, q querier, where string, args []any, execWhere string, execArgs []any, bucketExpr string, bucketArgs []any) ([]Point, error) {
@@ -359,7 +472,7 @@ func (s *Store) reportTrend(ctx context.Context, q querier, where string, args [
 	for execRows.Next() {
 		var b int64
 		var totals execTotals
-		err := execRows.Scan(&b, &totals.executions, &totals.known, &totals.cost, &totals.tokens.Input,
+		err := execRows.Scan(&b, &totals.executions, &totals.reliable, &totals.tokens.Input,
 			&totals.tokens.CacheRead, &totals.tokens.CacheWrite, &totals.tokens.Output,
 			&totals.tokens.Reasoning, &totals.tokens.Total,
 			&totals.completeCacheRead, &totals.completeInputTotal)
@@ -380,36 +493,9 @@ func (s *Store) reportTrend(ctx context.Context, q querier, where string, args [
 		return nil, fmt.Errorf("iterate trend executions: %w", err)
 	}
 
-	// Adjustments follow the bucket of the request they belong to, so the
-	// trend always sums to the summary total.
-	adjustRows, err := q.QueryContext(ctx, `SELECT `+bucketExpr+` AS bucket,
-		COALESCE(SUM(a.amount_micro_usd),0)
-		FROM adjustments a JOIN requests r ON r.id = a.request_id
-		WHERE `+where+` GROUP BY bucket ORDER BY bucket`,
-		append(append([]any{}, bucketArgs...), args...)...)
-	if err != nil {
-		return nil, fmt.Errorf("trend adjustments: %w", err)
-	}
-	defer adjustRows.Close()
-	for adjustRows.Next() {
-		var (
-			b     int64
-			total int64
-		)
-		if err := adjustRows.Scan(&b, &total); err != nil {
-			return nil, fmt.Errorf("scan trend adjustments: %w", err)
-		}
-		point, ok := points[b]
-		if !ok {
-			point = &Summary{}
-			points[b] = point
-			order = append(order, b)
-		}
-		point.AdjustmentMicroUSD = total
-	}
-	if err := adjustRows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate trend adjustments: %w", err)
-	}
+	// The monetary fields of every point are filled by the caller from the
+	// single cost projection of the same selection, so a trend point can never
+	// disagree with the summary it sums to.
 	slices.Sort(order)
 	out := make([]Point, 0, len(order))
 	for _, b := range order {
@@ -418,7 +504,7 @@ func (s *Store) reportTrend(ctx context.Context, q querier, where string, args [
 	return out, nil
 }
 
-func (s *Store) reportItems(ctx context.Context, q querier, where string, args []any, execWhere string, execArgs []any, size int, offset int64) ([]Request, error) {
+func (s *Store) reportItems(ctx context.Context, q querier, book *priceBook, where string, args []any, execWhere string, execArgs []any, size int, offset int64) ([]Request, error) {
 	rows, err := q.QueryContext(ctx, `SELECT `+requestColumns+` FROM requests r WHERE `+where+`
 		ORDER BY r.started_at DESC, r.id DESC LIMIT ? OFFSET ?`,
 		append(append([]any{}, args...), size, offset)...)
@@ -439,8 +525,9 @@ func (s *Store) reportItems(ctx context.Context, q querier, where string, args [
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("iterate requests: %w", err)
 	}
-	// Nested executions are loaded in one batched query for the page only, and
-	// honour the same execution filter as the summary.
+	// Nested executions are loaded in one batched query for the page only,
+	// honour the same execution filter as the summary, and are priced with the
+	// query's price book.
 	byRequest := map[string][]Usage{}
 	if len(ids) > 0 {
 		query := `SELECT ` + usageColumns + ` FROM usages u WHERE u.request_id IN (` + placeholders(len(ids)) + `) AND ` + execWhere + `
@@ -455,32 +542,13 @@ func (s *Store) reportItems(ctx context.Context, q querier, where string, args [
 			if err != nil {
 				return nil, fmt.Errorf("scan execution: %w", err)
 			}
+			if err := book.applyCost(u); err != nil {
+				return nil, err
+			}
 			byRequest[u.requestID] = append(byRequest[u.requestID], u.toUsage())
 		}
 		if err := execRows.Err(); err != nil {
 			return nil, fmt.Errorf("iterate executions: %w", err)
-		}
-	}
-	adjustments := map[string]int64{}
-	if len(ids) > 0 {
-		adjustRows, err := q.QueryContext(ctx, `SELECT a.request_id, COALESCE(SUM(a.amount_micro_usd),0)
-			FROM adjustments a WHERE a.request_id IN (`+placeholders(len(ids))+`) GROUP BY a.request_id`, ids...)
-		if err != nil {
-			return nil, fmt.Errorf("list adjustments: %w", err)
-		}
-		defer adjustRows.Close()
-		for adjustRows.Next() {
-			var (
-				id    string
-				total int64
-			)
-			if err := adjustRows.Scan(&id, &total); err != nil {
-				return nil, fmt.Errorf("scan adjustments: %w", err)
-			}
-			adjustments[id] = total
-		}
-		if err := adjustRows.Err(); err != nil {
-			return nil, fmt.Errorf("iterate adjustments: %w", err)
 		}
 	}
 	out := make([]Request, 0, len(entries))
@@ -489,75 +557,7 @@ func (s *Store) reportItems(ctx context.Context, q querier, where string, args [
 		if executions == nil {
 			executions = []Usage{}
 		}
-		out = append(out, r.toRequest(executions, adjustments[r.id]))
+		out = append(out, r.toRequest(executions))
 	}
 	return out, nil
-}
-
-// Resolve closes an unresolved request by administrator decision. Known usage
-// is still charged; the action only decides whether the unresolved accounting is
-// released or charged a manual amount.
-func (s *Store) Resolve(ctx context.Context, id string, resolution Resolution) error {
-	if strings.TrimSpace(id) == "" {
-		return fmt.Errorf("%w: request id is required", ErrInvalid)
-	}
-	if strings.TrimSpace(resolution.Reason) == "" {
-		return fmt.Errorf("%w: a resolution reason is required", ErrInvalid)
-	}
-	switch resolution.Action {
-	case ActionRelease, ActionCharge:
-	default:
-		return fmt.Errorf("%w: unsupported resolution action %q", ErrInvalid, resolution.Action)
-	}
-	if resolution.AmountMicroUSD < 0 {
-		return fmt.Errorf("%w: resolution amount must not be negative", ErrInvalid)
-	}
-	amount := resolution.AmountMicroUSD
-	if resolution.Action == ActionRelease {
-		amount = 0
-	}
-	at := s.nowUTC()
-	return s.inTx(ctx, func(tx *sql.Tx) error {
-		req, err := loadRequestByID(ctx, tx, id)
-		if err != nil {
-			return err
-		}
-		// Only a pending request may be resolved: an active execution still
-		// holds a concurrency slot, and resolving it would bypass MaxConcurrent
-		// and HasActive accounting.
-		if req.state != statePending {
-			return fmt.Errorf("%w: request %s is %s, only pending requests can be resolved",
-				ErrConflict, req.id, req.state)
-		}
-		if _, err := tx.ExecContext(ctx, `INSERT INTO adjustments
-			(request_id, key_id, action, amount_micro_usd, reason, at) VALUES(?,?,?,?,?,?)`,
-			req.id, req.keyID, resolution.Action, amount, resolution.Reason, unixNano(at)); err != nil {
-			return fmt.Errorf("record adjustment: %w", err)
-		}
-		if amount > 0 {
-			if err := addMoney(ctx, tx, req.keyID, req.startedAt, amount); err != nil {
-				return err
-			}
-			if err := bumpKeyColumn(ctx, tx, req.keyID, "spent_micro_usd", amount); err != nil {
-				return err
-			}
-			if err := bumpRequestCharge(ctx, tx, req.id, amount); err != nil {
-				return err
-			}
-			next, err := checkedAdd(req.charge, amount)
-			if err != nil {
-				return err
-			}
-			req.charge = next
-		}
-		if err := s.settleRequest(ctx, tx, req, at, resolution.Action); err != nil {
-			return err
-		}
-		key, err := loadKey(ctx, tx, "id = ?", req.keyID)
-		if err != nil {
-			return err
-		}
-		return insertAudit(ctx, tx, at, ActionResolve, req.keyID, key.callerID,
-			resolution.Reason, fmt.Sprintf("request_id=%s action=%s amount_micro_usd=%d", req.id, resolution.Action, amount))
-	})
 }

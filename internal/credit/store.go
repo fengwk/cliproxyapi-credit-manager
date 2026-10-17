@@ -17,10 +17,14 @@ import (
 
 // Lifecycle vocabulary stored in the database. It is part of the internal
 // contract shared with the plugin adapter, not with the database file.
+//
+// The three states describe the usage lifecycle only: they never express a
+// charge or a settlement of money. A request is settled as soon as its usage is
+// trustworthy; whether a price exists for it does not matter.
 const (
 	stateActive  = "active"  // execution in flight, occupies a concurrency slot
-	statePending = "pending" // execution finished/restarted but accounting is unresolved
-	stateSettled = "settled" // closed: known costs charged, no obligation left
+	statePending = "pending" // execution finished/restarted but usage is missing or unreliable
+	stateSettled = "settled" // closed: usage accounting is complete, no obligation left
 
 	OutcomeSucceeded = "succeeded"
 	OutcomeFailed    = "failed"
@@ -37,15 +41,10 @@ const (
 	QualityPartial  = "partial"
 	QualityUnknown  = "unknown"
 
-	ActionRelease = "release"
-	ActionCharge  = "charge"
-
 	windowTotal = "total"
 	windowDay   = "day"
 	windowWeek  = "week"
 	windowMonth = "month"
-
-	resolvedAuto = "auto"
 )
 
 // ErrLocked reports that another process already owns the data directory.
@@ -70,13 +69,18 @@ const (
 	// schemaVersion is the only on-disk format this build understands. It is
 	// stamped into PRAGMA user_version after the whole schema has been created,
 	// so a ledger is either empty or complete. There is no upgrade path from
-	// any other format.
-	schemaVersion = 1
+	// any other format: format 1 carried durable amounts, which this build
+	// deliberately does not, so such a ledger is refused untouched.
+	schemaVersion = 2
 )
 
 // schemaDDL creates the complete current schema: every table, column and index
 // the ledger uses. It is executed exactly once, inside one transaction, on a
 // ledger that is provably empty, and never re-applied or repaired afterwards.
+//
+// No table stores a price, an amount or an adjustment. Every monetary number
+// this package reports is derived at read time from the price book and the
+// recorded executions, so a price edit retroactively changes history.
 const schemaDDL = `
 CREATE TABLE keys (
   id TEXT PRIMARY KEY,
@@ -94,7 +98,6 @@ CREATE TABLE keys (
   allowed_models TEXT NOT NULL DEFAULT '[]',
   expires_at INTEGER,
   created_at INTEGER NOT NULL,
-  spent_micro_usd INTEGER NOT NULL DEFAULT 0,
   key_material_enc BLOB NOT NULL,
   caller_id TEXT NOT NULL DEFAULT '',
   deleted_at INTEGER
@@ -129,9 +132,7 @@ CREATE TABLE requests (
   status_code INTEGER NOT NULL DEFAULT 0,
   started_at INTEGER NOT NULL,
   completed_at INTEGER,
-  charge_micro_usd INTEGER NOT NULL DEFAULT 0,
-  resolved TEXT NOT NULL DEFAULT '',
-  price_snapshot TEXT NOT NULL
+  service_tier TEXT NOT NULL DEFAULT ''
 );
 CREATE UNIQUE INDEX requests_trace ON requests(trace_id);
 CREATE INDEX requests_key_state ON requests(key_id, state);
@@ -165,8 +166,6 @@ CREATE TABLE usages (
   raw_cache_read INTEGER NOT NULL,
   raw_cache_create INTEGER NOT NULL,
   raw_total INTEGER NOT NULL,
-  cost_micro_usd INTEGER,
-  charged INTEGER NOT NULL DEFAULT 0,
   reliable INTEGER NOT NULL DEFAULT 0,
   at INTEGER NOT NULL,
   latency_ms INTEGER NOT NULL DEFAULT 0,
@@ -177,14 +176,6 @@ CREATE INDEX usages_request ON usages(request_id);
 CREATE INDEX usages_trace_key ON usages(trace_id, key_id);
 CREATE INDEX usages_provider ON usages(provider, auth_id);
 CREATE INDEX usages_request_provider ON usages(request_id, provider, auth_id);
-CREATE TABLE key_money_counters (
-  key_id TEXT NOT NULL,
-  win TEXT NOT NULL,
-  period TEXT NOT NULL,
-  micro_usd INTEGER NOT NULL,
-  PRIMARY KEY (key_id, win, period)
-);
-CREATE INDEX key_money_counters_window ON key_money_counters(win, period);
 CREATE TABLE key_token_counters (
   key_id TEXT NOT NULL,
   model TEXT NOT NULL,
@@ -194,16 +185,6 @@ CREATE TABLE key_token_counters (
   PRIMARY KEY (key_id, model, win, period)
 );
 CREATE INDEX key_token_counters_window ON key_token_counters(win, period);
-CREATE TABLE adjustments (
-  seq INTEGER PRIMARY KEY AUTOINCREMENT,
-  request_id TEXT NOT NULL,
-  key_id TEXT NOT NULL,
-  action TEXT NOT NULL,
-  amount_micro_usd INTEGER NOT NULL,
-  reason TEXT NOT NULL,
-  at INTEGER NOT NULL
-);
-CREATE INDEX adjustments_request ON adjustments(request_id);
 CREATE TABLE callers (
   id TEXT PRIMARY KEY,
   display_name TEXT NOT NULL DEFAULT '',
@@ -222,13 +203,6 @@ CREATE TABLE audit_events (
 );
 CREATE INDEX audit_events_key ON audit_events(key_id, seq);
 CREATE INDEX audit_events_caller ON audit_events(caller_id, seq);
-CREATE TABLE key_money_baselines (
-  key_id TEXT NOT NULL,
-  win TEXT NOT NULL,
-  period TEXT NOT NULL,
-  micro_usd INTEGER NOT NULL,
-  PRIMARY KEY (key_id, win, period)
-);
 CREATE TABLE key_token_baselines (
   key_id TEXT NOT NULL,
   model TEXT NOT NULL,
@@ -495,8 +469,8 @@ func (s *Store) initSchema(ctx context.Context) error {
 }
 
 // recoverExecutions converts executions interrupted by a restart into pending
-// requests so their accounting stays visible. Concurrency is released; no money
-// is moved because admission never held any.
+// requests so their usage stays visible. Concurrency is released; no amount is
+// involved anywhere, because admission never held one.
 func (s *Store) recoverExecutions(ctx context.Context) error {
 	return s.inTx(ctx, func(tx *sql.Tx) error {
 		_, err := tx.ExecContext(ctx,

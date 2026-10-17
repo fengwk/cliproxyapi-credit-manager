@@ -236,15 +236,14 @@ func TestRestartMarksActivePending(t *testing.T) {
 	if rep.Summary.Pending != 1 {
 		t.Fatalf("pending summary = %d, want 1", rep.Summary.Pending)
 	}
-	k, err := reopened.GetKey(context.Background(), key.ID)
-	if err != nil {
-		t.Fatalf("get key: %v", err)
+	// Admission never held money or tokens and a restart must not invent any:
+	// the interrupted request stays pending with no durable usage.
+	if got, err := tokenCounter(context.Background(), reopened.db, key.ID, "m1", windowTotal, ""); err != nil || got != 0 {
+		t.Fatalf("tokens after restart = %d (%v), want 0", got, err)
 	}
-	// Admission never held money and a restart must not invent any: the
-	// interrupted request stays pending with an untouched ledger.
-	if k.SpentMicroUSD != 0 || k.QuotaUsedMicroUSD != 0 {
-		t.Fatalf("ledger after restart = spent %d effective %d, want 0/0",
-			k.SpentMicroUSD, k.QuotaUsedMicroUSD)
+	// Nothing is priced without usage, and no unpriced execution is implied.
+	if rep.Summary.CostMicroUSD != 0 || rep.Summary.UnpricedExecutions != 0 {
+		t.Fatalf("cost after restart = %+v, want no amount and no execution", rep.Summary)
 	}
 	// A late usage can still close the restarted request.
 	h2 := &harness{t: t, clock: h.clock, store: reopened, dir: h.dir}
@@ -253,6 +252,11 @@ func TestRestartMarksActivePending(t *testing.T) {
 	settled := h2.request("req-1")
 	if settled.State != stateSettled {
 		t.Fatalf("state = %q, want settled", settled.State)
+	}
+	// The late usage is priced from the current rates at read time: 100 input
+	// at 1 plus 100 output at 2 microUSD per token.
+	if cost, unpriced := h2.costOf(key.ID); cost != 300 || unpriced != 0 {
+		t.Fatalf("derived cost after late usage = %d/%d, want 300", cost, unpriced)
 	}
 }
 
@@ -436,10 +440,10 @@ func TestPriceValidationAndVersioning(t *testing.T) {
 	}
 }
 
-func TestCostRoundsUpOnce(t *testing.T) {
-	price := Price{Model: "m", Rates: Rates{Input: 1_000_000, Output: 3_000_000, CacheRead: 100_000}}
+func TestRateCostRoundsUpOnce(t *testing.T) {
+	rates := Rates{Input: 1_000_000, Output: 3_000_000, CacheRead: 100_000}
 	// 1 input token at 1 microUSD/1M plus 1 cache-read token at 0.1 = 1.1 -> 2.
-	cost, err := computeCost(price, tokens(1, 1, 0, 0, 0))
+	cost, err := ratesCost(rates, tokens(1, 1, 0, 0, 0))
 	if err != nil {
 		t.Fatalf("compute: %v", err)
 	}
@@ -447,7 +451,7 @@ func TestCostRoundsUpOnce(t *testing.T) {
 		t.Fatalf("cost = %d, want 2 (single ceiling over the sum)", cost)
 	}
 	// Reasoning falls back to the output rate when unset.
-	reasoning, err := computeCost(price, tokens(0, 0, 0, 0, 1_000_000))
+	reasoning, err := ratesCost(rates, tokens(0, 0, 0, 0, 1_000_000))
 	if err != nil {
 		t.Fatalf("compute: %v", err)
 	}
@@ -455,18 +459,19 @@ func TestCostRoundsUpOnce(t *testing.T) {
 		t.Fatalf("reasoning cost = %d, want 3000000", reasoning)
 	}
 	explicit := int64(7)
-	withReasoning, err := computeCost(Price{Model: "m", Rates: Rates{Reasoning: &explicit}},
+	withReasoning, err := ratesCost(Rates{Reasoning: &explicit},
 		tokens(0, 0, 0, 0, 1_000_000))
 	if err != nil || withReasoning != 7 {
 		t.Fatalf("explicit reasoning = %d, %v", withReasoning, err)
 	}
 	// All-zero rates mean free, which is explicit and allowed.
-	free, err := computeCost(Price{Model: "m"}, tokens(10, 10, 10, 10, 10))
+	free, err := ratesCost(Rates{}, tokens(10, 10, 10, 10, 10))
 	if err != nil || free != 0 {
 		t.Fatalf("free cost = %d, %v", free, err)
 	}
-	// Absurd rates must overflow safely rather than wrap.
-	if _, err := computeCost(Price{Model: "m", Rates: Rates{Input: 1 << 62}},
+	// Absurd rates must overflow safely rather than wrap; the price book turns
+	// this into "unpriced" rather than failing a report.
+	if _, err := ratesCost(Rates{Input: 1 << 62},
 		Tokens{Input: 1 << 40, Total: 1 << 40}); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("overflow err = %v, want ErrInvalid", err)
 	}

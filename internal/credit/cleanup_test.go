@@ -47,7 +47,6 @@ func TestCleanupPurgesOnlyClosedHistory(t *testing.T) {
 	h.mustUsage(usageFor("u-recent", recent, "m1", tokens(10, 0, 0, 0, 0)))
 	h.mustComplete(Completion{ID: recent.ID, TraceID: recent.TraceID, Outcome: OutcomeSucceeded})
 
-	spentBefore := h.key(key.ID).SpentMicroUSD
 	maint, err := h.store.Cleanup(h.ctx())
 	if err != nil {
 		t.Fatalf("cleanup: %v", err)
@@ -65,16 +64,26 @@ func TestCleanupPurgesOnlyClosedHistory(t *testing.T) {
 	if requests != 2 || usages != 1 {
 		t.Fatalf("remaining requests/usages = %d/%d, want 2/1", requests, usages)
 	}
-	// Durable accounting survives the purge.
-	if got := h.key(key.ID).SpentMicroUSD; got != spentBefore {
-		t.Fatalf("spent after cleanup = %d, want %d", got, spentBefore)
-	}
-	june, err := moneyCounter(h.ctx(), h.store.db, key.ID, windowMonth, "2026-01")
+	// Durable token accounting survives the purge: the admission basis is not
+	// derived from retained history.
+	lifetime, err := tokenCounter(h.ctx(), h.store.db, key.ID, "m1", windowTotal, "")
 	if err != nil {
-		t.Fatalf("january counter: %v", err)
+		t.Fatalf("lifetime token counter: %v", err)
 	}
-	if june != 200 {
-		t.Fatalf("january counter = %d, want 200", june)
+	if lifetime != 210 {
+		t.Fatalf("lifetime tokens = %d, want 210", lifetime)
+	}
+	januaryTokens, err := tokenCounter(h.ctx(), h.store.db, key.ID, "m1", windowMonth, "2026-01")
+	if err != nil {
+		t.Fatalf("january token counter: %v", err)
+	}
+	if januaryTokens != 200 {
+		t.Fatalf("january tokens = %d, want 200", januaryTokens)
+	}
+	// The derived cost reflects only the retained log, so the purged request no
+	// longer contributes any amount.
+	if cost, unpriced := h.costOf(key.ID); cost != 10 || unpriced != 0 {
+		t.Fatalf("cost after cleanup = %d/%d, want only the retained 10", cost, unpriced)
 	}
 	// The purged trace must not resurrect a request from a late event.
 	late := usageFor("u-late", Request{ID: "old", TraceID: "t-old", KeyID: key.ID}, "m1", tokens(1, 0, 0, 0, 0))
@@ -89,10 +98,10 @@ func TestCleanupPurgesOnlyClosedHistory(t *testing.T) {
 	if after != 2 {
 		t.Fatalf("requests after late usage = %d, want 2", after)
 	}
-	// Deleting history must not restore spending power: the key is still at its
-	// lifetime limit.
+	// Deleting history must not restore token headroom: the durable token
+	// counter still blocks admission at a configured limit.
 	spec := h.key(key.ID).Spec
-	spec.QuotaMicroUSD = spentBefore - 1
+	spec.ModelTokenLimits = []ModelTokenLimit{{Model: "m1", Total: 210}}
 	if _, err := h.store.UpdateKey(h.ctx(), key.ID, spec); err != nil {
 		t.Fatalf("update key: %v", err)
 	}
@@ -100,9 +109,9 @@ func TestCleanupPurgesOnlyClosedHistory(t *testing.T) {
 		KeyID: key.ID, RequestedModel: "m1"}); !errors.Is(err, ErrQuota) {
 		t.Fatalf("reserve after purge err = %v, want ErrQuota", err)
 	}
-	// The unresolved request can still be resolved by an administrator.
-	if err := h.store.Resolve(h.ctx(), "stuck", Resolution{Action: ActionRelease, Reason: "manual"}); err != nil {
-		t.Fatalf("resolve stuck: %v", err)
+	// The unresolved request was never purged and keeps its execution rows.
+	if got := h.request("stuck"); got.State != statePending {
+		t.Fatalf("unresolved request = %+v, want pending and retained", got)
 	}
 }
 
@@ -156,13 +165,6 @@ func TestCleanupReclaimsDatabaseAndWAL(t *testing.T) {
 		t.Fatalf("requests remaining = %d, want 0", remaining)
 	}
 	// Counters are kept even though all history is gone.
-	total, err := moneyCounter(ctx, h.store.db, key.ID, windowTotal, "")
-	if err != nil {
-		t.Fatalf("counter: %v", err)
-	}
-	if total != 800 {
-		t.Fatalf("lifetime counter = %d, want 800", total)
-	}
 	used, err := tokenCounter(ctx, h.store.db, key.ID, "m1", windowTotal, "")
 	if err != nil {
 		t.Fatalf("token counter: %v", err)
@@ -221,8 +223,9 @@ func TestCleanupIsRepeatable(t *testing.T) {
 }
 
 // TestCleanupPrunesAgedPeriodsButKeepsTotals bounds the period counter tables:
-// lifetime totals always stay, aged periods go once nothing can charge them,
-// and an unresolved request keeps its own periods alive.
+// lifetime totals always stay, aged periods go once no unresolved request can
+// still add usage to them, and an unresolved request keeps its own periods
+// alive.
 func TestCleanupPrunesAgedPeriodsButKeepsTotals(t *testing.T) {
 	h := newHarness(t)
 	h.mustPrice("m1", Rates{Input: million, Output: million})
@@ -250,12 +253,12 @@ func TestCleanupPrunesAgedPeriodsButKeepsTotals(t *testing.T) {
 
 	assertCounter := func(win, period string, want int64) {
 		t.Helper()
-		got, err := moneyCounter(ctx, h.store.db, key.ID, win, period)
+		got, err := tokenCounter(ctx, h.store.db, key.ID, "m1", win, period)
 		if err != nil {
-			t.Fatalf("money counter %s/%s: %v", win, period, err)
+			t.Fatalf("token counter %s/%s: %v", win, period, err)
 		}
 		if got != want {
-			t.Fatalf("money counter %s/%s = %d, want %d", win, period, got, want)
+			t.Fatalf("token counter %s/%s = %d, want %d", win, period, got, want)
 		}
 	}
 	// Before cleanup both periods are recorded.
@@ -277,7 +280,7 @@ func TestCleanupPrunesAgedPeriodsButKeepsTotals(t *testing.T) {
 	assertCounter(windowDay, dayPeriod(january), 0)
 	assertCounter(windowWeek, weekPeriod(january), 0)
 	assertCounter(windowMonth, monthPeriod(january), 0)
-	// Periods an unresolved request may still charge are kept.
+	// Periods an unresolved request may still extend are kept.
 	assertCounter(windowDay, dayPeriod(february), 100)
 	assertCounter(windowWeek, weekPeriod(february), 100)
 	assertCounter(windowMonth, monthPeriod(february), 100)
@@ -299,13 +302,16 @@ func TestCleanupPrunesAgedPeriodsButKeepsTotals(t *testing.T) {
 		t.Fatalf("january token counter = %d, want pruned", janTokens)
 	}
 
-	// A late charge for the unresolved request still lands in its own period.
-	if err := h.store.Resolve(ctx, stuck.ID, Resolution{Action: ActionCharge, AmountMicroUSD: 40,
-		Reason: "late usage"}); err != nil {
-		t.Fatalf("resolve: %v", err)
-	}
+	// Late trustworthy usage for the unresolved request still lands in its own
+	// admission period, and it is priced at read time without touching status.
+	h.mustUsage(usageFor("u-stuck-late", stuck, "m1", tokens(40, 0, 0, 0, 0)))
 	assertCounter(windowDay, dayPeriod(february), 140)
+	assertCounter(windowWeek, weekPeriod(february), 140)
+	assertCounter(windowMonth, monthPeriod(february), 140)
 	assertCounter(windowTotal, "", 240)
+	if got := h.request(stuck.ID); got.State != statePending {
+		t.Fatalf("state = %q, want pending while the unknown execution is unresolved", got.State)
+	}
 }
 
 // TestCleanupWithoutRunKeepsPeriodHistory proves pruning only happens through
@@ -322,7 +328,7 @@ func TestCleanupWithoutRunKeepsPeriodHistory(t *testing.T) {
 	h.clock.set(testEpoch)
 
 	// No cleanup ran: the aged history and its counters are intact.
-	got, err := moneyCounter(h.ctx(), h.store.db, key.ID, windowMonth, monthPeriod(january))
+	got, err := tokenCounter(h.ctx(), h.store.db, key.ID, "m1", windowMonth, monthPeriod(january))
 	if err != nil || got != 100 {
 		t.Fatalf("january counter without cleanup = %d, %v", got, err)
 	}
@@ -408,7 +414,6 @@ func TestCleanupKeepsRequestReopenedByLateExecution(t *testing.T) {
 	first.At = old
 	h.mustUsage(first)
 	h.mustComplete(Completion{ID: req.ID, TraceID: req.TraceID, Outcome: OutcomeSucceeded, At: old})
-	spent := h.key(key.ID).SpentMicroUSD
 
 	cutoff := h.store.retentionFrom(h.clock.now())
 	stale, err := expiredRequestIDs(ctx, h.store.db, cutoff)
@@ -461,24 +466,13 @@ func TestCleanupKeepsRequestReopenedByLateExecution(t *testing.T) {
 	}
 	kept("after cleanup")
 
-	// Once an administrator closes it the history is collectable.
-	if err := h.store.Resolve(ctx, req.ID, Resolution{Action: ActionRelease, Reason: "operator"}); err != nil {
-		t.Fatalf("resolve: %v", err)
+	// An unresolved request is never purged, no matter how old it is: there is
+	// no administrator override that could close it, and its derived amount
+	// stays visible with only the one trustworthy execution priced.
+	if got := h.request(req.ID); got.State != statePending {
+		t.Fatalf("request = %+v, want pending", got)
 	}
-	maintenance, err = h.store.Cleanup(ctx)
-	if err != nil {
-		t.Fatalf("cleanup after resolve: %v", err)
-	}
-	if maintenance.Deleted != 1 {
-		t.Fatalf("deleted = %d, want 1", maintenance.Deleted)
-	}
-	if n, err := counterValue(ctx, h.store.db, `SELECT COUNT(*) FROM requests WHERE id = ?`, req.ID); err != nil || n != 0 {
-		t.Fatalf("request survived cleanup: %d (%v)", n, err)
-	}
-	if n, err := counterValue(ctx, h.store.db, `SELECT COUNT(*) FROM usages WHERE request_id = ?`, req.ID); err != nil || n != 0 {
-		t.Fatalf("executions survived cleanup: %d (%v)", n, err)
-	}
-	if k := h.key(key.ID); k.SpentMicroUSD != spent {
-		t.Fatalf("ledger after cleanup = %+v, want spent %d", k, spent)
+	if cost, unpriced := h.costOf(key.ID); cost != 5 || unpriced != 1 {
+		t.Fatalf("derived cost = %d/%d, want 5 with one unpriced execution", cost, unpriced)
 	}
 }

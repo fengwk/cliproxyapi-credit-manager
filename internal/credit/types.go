@@ -32,11 +32,17 @@ type KeySpec struct {
 	Enabled  bool   `json:"enabled"`
 	// CallerID is an optional attribution to a caller record. It is metadata
 	// only: it never changes the key's identity, scope or scheduling.
-	CallerID         string            `json:"caller_id,omitempty"`
-	QuotaMicroUSD    int64             `json:"quota_micro_usd"`
-	DailyMicroUSD    int64             `json:"daily_micro_usd"`
-	WeeklyMicroUSD   int64             `json:"weekly_micro_usd"`
-	MonthlyMicroUSD  int64             `json:"monthly_micro_usd"`
+	CallerID string `json:"caller_id,omitempty"`
+	// QuotaMicroUSD, DailyMicroUSD, WeeklyMicroUSD and MonthlyMicroUSD are
+	// display-only budget figures. They are stored and reported so an operator
+	// can compare a key against its intended budget, but they never gate a
+	// request: admission reads prices and amounts nowhere. A zero budget means
+	// "no budget recorded", not "unlimited allowance".
+	QuotaMicroUSD   int64 `json:"quota_micro_usd"`
+	DailyMicroUSD   int64 `json:"daily_micro_usd"`
+	WeeklyMicroUSD  int64 `json:"weekly_micro_usd"`
+	MonthlyMicroUSD int64 `json:"monthly_micro_usd"`
+	// MaxConcurrent and ModelTokenLimits are the only admission limits.
 	MaxConcurrent    int64             `json:"max_concurrent"`
 	AllowedModels    []string          `json:"allowed_models"`
 	ModelTokenLimits []ModelTokenLimit `json:"model_token_limits,omitempty"`
@@ -57,20 +63,11 @@ type Key struct {
 	Scope       string  `json:"scope"`
 	Fingerprint string  `json:"fingerprint"`
 	Spec        KeySpec `json:"spec"`
-	// SpentMicroUSD is the raw, durable lifetime charge. It is never reduced by
-	// a quota reset so existing consumers keep observing the true ledger total.
-	SpentMicroUSD int64 `json:"spent_micro_usd"`
-	// QuotaUsedMicroUSD is the effective lifetime usage: it subtracts the
-	// operator reset baseline from SpentMicroUSD and is what quota admission
-	// enforces. The per period fields are the same view for day/week/month.
-	QuotaUsedMicroUSD   int64  `json:"quota_used_micro_usd"`
-	DailyUsedMicroUSD   int64  `json:"daily_used_micro_usd"`
-	WeeklyUsedMicroUSD  int64  `json:"weekly_used_micro_usd"`
-	MonthlyUsedMicroUSD int64  `json:"monthly_used_micro_usd"`
-	CallerID            string `json:"caller_id,omitempty"`
+	// CallerID is the attribution copied from the spec for convenience.
+	CallerID string `json:"caller_id,omitempty"`
 	// DeletedAt marks a soft deleted key. A soft deleted key keeps its records,
-	// ledger and unresolved requests but can no longer be re-enabled, rotated or
-	// authenticated.
+	// token counters and unresolved requests but can no longer be re-enabled,
+	// rotated or authenticated.
 	DeletedAt *time.Time `json:"deleted_at,omitempty"`
 	CreatedAt time.Time  `json:"created_at"`
 }
@@ -124,26 +121,20 @@ type Tokens struct {
 }
 
 // AdmitInput carries the facts an admission needs to authenticate the key,
-// freeze the effective price and persist the request/key/trace correlation
-// before execution starts. It carries no amount or token estimates: admission
-// only checks already-consumed effective usage.
+// persist the request/key/trace correlation and take a concurrency slot before
+// execution starts. It carries no amount, price or token estimate: admission
+// only checks permissions and already-consumed effective usage, and nothing in
+// it is priced.
 type AdmitInput struct {
 	ID             string
 	TraceID        string
 	KeyID          string
 	RequestedModel string
-	// ServiceTier is the pricing key read from the request body (for example
-	// "priority"). It is normalized before matching; empty means no service
-	// tier and selects context tiers only.
+	// ServiceTier is the request fact read from the request body (for example
+	// "priority"). It is normalized and persisted on the request; a usage
+	// event that omits its own tier inherits it. It never gates admission.
 	ServiceTier string
-	// ImageCount is the requested image count read from the request body and
-	// ImageCountDeclared reports whether the request declared one at all. An
-	// omitted count means one image; an explicit count outside the supported
-	// 1..32 range is refused for a per-image price rather than silently billed
-	// as a different number. Token prices ignore both fields.
-	ImageCount         int64
-	ImageCountDeclared bool
-	At                 time.Time
+	At          time.Time
 }
 
 type Usage struct {
@@ -160,11 +151,19 @@ type Usage struct {
 	Raw           pluginapi.UsageDetail `json:"raw"`
 	Tokens        Tokens                `json:"tokens"`
 	Quality       string                `json:"quality"`
-	// ServiceTier is the normalized pricing key actually used to bill this
-	// execution: the host response tier, else the reported requested tier,
-	// else the tier frozen on the request snapshot.
-	ServiceTier  string    `json:"service_tier,omitempty"`
-	CostMicroUSD *int64    `json:"cost_micro_usd,omitempty"`
+	// ServiceTier is the normalized service tier under which this execution
+	// was reported: the host response tier, else the reported requested tier,
+	// else the tier recorded on the request. It is the tier used when a
+	// query-time price is applied to these tokens.
+	ServiceTier string `json:"service_tier,omitempty"`
+	// CostMicroUSD is purely query derived: it is computed from this
+	// execution's actual normalized tokens, its exact actual Model and the
+	// current price book at read time. It is never persisted, so a price added,
+	// edited or deleted after the fact immediately changes it, and it is null
+	// (never zero) when the execution cannot be priced: no price, unusable
+	// accounting, or a per-image price whose real image count the host does not
+	// report.
+	CostMicroUSD *int64    `json:"cost_micro_usd"`
 	Failed       bool      `json:"failed"`
 	StatusCode   int       `json:"status_code,omitempty"`
 	At           time.Time `json:"at"`
@@ -181,16 +180,12 @@ type Request struct {
 	State       string     `json:"state"`
 	StartedAt   time.Time  `json:"started_at"`
 	CompletedAt *time.Time `json:"completed_at,omitempty"`
-	// AdjustmentMicroUSD totals manual Resolve charges booked against this
-	// request. It is reported next to the execution cost, never inside it, so
-	// manual ledger entries are neither hidden nor double counted.
-	AdjustmentMicroUSD int64       `json:"adjustment_micro_usd"`
-	Price              Price       `json:"price"`
-	Executions         []Usage     `json:"executions"`
-	PricingRuleID      string      `json:"pricing_rule_id,omitempty"`
-	PriceTiers         []PriceTier `json:"price_tiers,omitempty"`
-	ServiceTier        string      `json:"service_tier,omitempty"`
-	ImageCount         int64       `json:"image_count,omitempty"`
+	// Executions carry the per-execution query-time cost; the request itself
+	// freezes no price, so nothing here is a durable amount.
+	Executions []Usage `json:"executions"`
+	// ServiceTier is the request-time tier fact reported by the caller. It is
+	// not a frozen price input: a usage event that omits its tier inherits it.
+	ServiceTier string `json:"service_tier,omitempty"`
 }
 
 type Completion struct {
@@ -199,12 +194,6 @@ type Completion struct {
 	Outcome    string
 	StatusCode int
 	At         time.Time
-}
-
-type Resolution struct {
-	Action         string `json:"action"`
-	AmountMicroUSD int64  `json:"amount_micro_usd"`
-	Reason         string `json:"reason"`
 }
 
 type Filter struct {
@@ -221,16 +210,26 @@ type Filter struct {
 	Bucket   string
 }
 
+// Summary is the aggregate of one selection. Requests, executions and counts
+// come from SQL aggregation over the selection; CostMicroUSD and
+// UnpricedExecutions are derived from the same executions through the current
+// price book, so no summary can observe a stale or durable amount.
 type Summary struct {
-	Requests     int64 `json:"requests"`
-	Executions   int64 `json:"executions"`
-	Failed       int64 `json:"failed"`
-	Pending      int64 `json:"pending"`
+	Requests   int64 `json:"requests"`
+	Executions int64 `json:"executions"`
+	Failed     int64 `json:"failed"`
+	Pending    int64 `json:"pending"`
+	// CostMicroUSD is the strict sum of the priced executions only. An
+	// execution is priced when its actual Model has a usable price in the
+	// current price book and its accounting is trustworthy; every other
+	// execution contributes nothing here and is counted by
+	// UnpricedExecutions instead. Cost is never zero-filled for an unpriced
+	// execution.
 	CostMicroUSD int64 `json:"cost_micro_usd"`
-	// AdjustmentMicroUSD totals manual Resolve charges of the same selection.
-	// CostMicroUSD stays execution derived; cost + adjustments reconciles with
-	// the key ledger spend for the same request set.
-	AdjustmentMicroUSD int64    `json:"adjustment_micro_usd"`
+	// UnpricedExecutions counts executions of the selection that carry no cost
+	// (null), so the dashboard can distinguish "free" (priced zero) from "not
+	// priced".
+	UnpricedExecutions int64    `json:"unpriced_executions"`
 	Tokens             Tokens   `json:"tokens"`
 	CompleteExecutions int64    `json:"complete_executions"`
 	CacheReadRatio     *float64 `json:"cache_read_ratio,omitempty"`
@@ -278,7 +277,6 @@ type Backend interface {
 	Admit(context.Context, AdmitInput) (Request, error)
 	RecordUsage(context.Context, Usage) error
 	Complete(context.Context, Completion) error
-	Resolve(context.Context, string, Resolution) error
 	Report(context.Context, Filter) (Report, error)
 	Cleanup(context.Context) (Maintenance, error)
 }

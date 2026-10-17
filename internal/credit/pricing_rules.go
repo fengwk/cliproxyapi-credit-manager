@@ -3,11 +3,9 @@ package credit
 import (
 	"context"
 	"database/sql"
-	"errors"
 	"fmt"
 	"path"
 	"regexp"
-	"sort"
 	"strings"
 )
 
@@ -39,11 +37,10 @@ const (
 //
 // Rules are evaluated deterministically: priority descending, then match kind
 // (exact before glob before regexp), then rule id ascending. The first matching
-// candidate wins, whether or not its rule is enabled: a disabled winning rule
-// denies the model instead of silently falling through to a lower-priority
-// price. The exact price book is a priority zero exact candidate that a
-// higher-priority rule shadows and that a same-priority pattern rule cannot
-// shadow.
+// enabled candidate wins. A disabled rule takes no part in pricing at all: it is
+// skipped, so it can neither deny a model nor act as a permission filter. The
+// exact price book is a priority zero exact candidate that a higher-priority
+// rule shadows and that a same-priority pattern rule cannot shadow.
 //
 // Rate tiers live only here, next to the price they overlay; a Price value does
 // not repeat them, so a rule and its price can never disagree.
@@ -248,7 +245,6 @@ type pricingCandidate struct {
 	id         string
 	price      Price
 	tiers      []PriceTier
-	rule       *PricingRule
 }
 
 func matchKindRank(kind MatchKind) int {
@@ -275,56 +271,6 @@ func candidateLess(a, b pricingCandidate) bool {
 	return a.id < b.id
 }
 
-// resolvePricing picks the price and tiers frozen into one request admission. It
-// never returns a fabricated zero price: an absent price book entry with no
-// matching rule is ErrUnpriced, and a disabled winning rule denies the model.
-func resolvePricing(ctx context.Context, q querier, model string) (Price, []PriceTier, string, error) {
-	var exact *Price
-	switch p, err := lookupPrice(ctx, q, model); {
-	case err == nil:
-		exact = &p
-	case errors.Is(err, ErrUnpriced):
-	default:
-		return Price{}, nil, "", err
-	}
-	rules, err := listPricingRules(ctx, q)
-	if err != nil {
-		return Price{}, nil, "", err
-	}
-	candidates := make([]pricingCandidate, 0, len(rules)+1)
-	if exact != nil {
-		candidates = append(candidates, pricingCandidate{
-			priority: 0, kindRank: matchKindRankExact, sourceRank: sourceRankPrice, price: *exact,
-		})
-	}
-	for i := range rules {
-		rule := rules[i]
-		matched, err := ruleMatches(rule, model)
-		if err != nil {
-			return Price{}, nil, "", err
-		}
-		if !matched {
-			continue
-		}
-		price := rule.Price
-		price.Model = model
-		candidates = append(candidates, pricingCandidate{
-			priority: rule.Priority, kindRank: matchKindRank(rule.MatchKind), sourceRank: sourceRankRule,
-			id: rule.ID, price: price, tiers: rule.Tiers, rule: &rules[i],
-		})
-	}
-	if len(candidates) == 0 {
-		return Price{}, nil, "", ErrUnpriced
-	}
-	sort.SliceStable(candidates, func(i, j int) bool { return candidateLess(candidates[i], candidates[j]) })
-	winner := candidates[0]
-	if winner.rule != nil && !winner.rule.Enabled {
-		return Price{}, nil, "", fmt.Errorf("%w: model %s is disabled by pricing rule %s",
-			ErrUnpriced, model, winner.rule.ID)
-	}
-	return winner.price, winner.tiers, winner.id, nil
-}
-
 // PriceMatch is the read-only result of a pricing preview: the effective rate
 // card and the cost of the supplied prompt size.
 type PriceMatch struct {
@@ -339,7 +285,8 @@ type PriceMatch struct {
 }
 
 // PreviewPrice resolves the price for a model and reports the effective rates
-// and the cost of inputTokens canonical prompt tokens. It changes nothing.
+// and the cost of inputTokens canonical prompt tokens. It changes nothing and,
+// like every other read path, it resolves against the current price book.
 func (s *Store) PreviewPrice(ctx context.Context, model, serviceTier string, inputTokens int64) (PriceMatch, error) {
 	model = strings.TrimSpace(model)
 	if model == "" {
@@ -348,13 +295,21 @@ func (s *Store) PreviewPrice(ctx context.Context, model, serviceTier string, inp
 	if inputTokens < 0 {
 		return PriceMatch{}, fmt.Errorf("%w: input tokens must not be negative", ErrInvalid)
 	}
-	price, tiers, ruleID, err := resolvePricing(ctx, s.db, model)
+	book, err := loadPriceBook(ctx, s.db)
 	if err != nil {
 		return PriceMatch{}, err
 	}
+	res, err := book.resolve(model)
+	if err != nil {
+		return PriceMatch{}, err
+	}
+	if !res.priced {
+		return PriceMatch{}, fmt.Errorf("%w: model %s", ErrUnpriced, model)
+	}
+	price, tiers := res.price, res.tiers
 	match := PriceMatch{
 		Model:       model,
-		RuleID:      ruleID,
+		RuleID:      res.ruleID,
 		BillingMode: resolveBillingMode(price.BillingMode),
 		ServiceTier: normalizeServiceTier(serviceTier),
 		Tiers:       tiers,

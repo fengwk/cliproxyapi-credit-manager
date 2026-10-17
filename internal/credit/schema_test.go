@@ -15,11 +15,8 @@ import (
 // as an exact set so a forgotten table fails the test, not just a missing
 // feature column.
 var schemaTables = []string{
-	"adjustments",
 	"audit_events",
 	"callers",
-	"key_money_baselines",
-	"key_money_counters",
 	"key_token_baselines",
 	"key_token_counters",
 	"keys",
@@ -32,10 +29,8 @@ var schemaTables = []string{
 
 // schemaIndexes are the named indexes the current format creates explicitly.
 var schemaIndexes = []string{
-	"adjustments_request",
 	"audit_events_caller",
 	"audit_events_key",
-	"key_money_counters_window",
 	"key_token_counters_window",
 	"pricing_rules_resolution",
 	"requests_key_started",
@@ -138,14 +133,12 @@ func TestFreshLedgerCarriesCompleteCurrentSchema(t *testing.T) {
 		}
 	}
 
-	// requests freezes its price in one snapshot column only: the duplicated
-	// legacy rate columns must not exist at all.
+	// No financial figure is durable: requests freeze no price and no amount,
+	// usages persist only observed tokens, and the key carries only its
+	// display budgets. A cost is derived at read time from the price book.
 	requests := pragmaColumns(t, db, "requests")
-	snapshot, ok := requests["price_snapshot"]
-	if !ok || !snapshot.notNull || snapshot.kind != "TEXT" {
-		t.Fatalf("requests.price_snapshot = %+v, want a NOT NULL TEXT column", snapshot)
-	}
 	for _, legacy := range []string{
+		"price_snapshot", "charge_micro_usd", "resolved", "adjustment_micro_usd",
 		"price_input", "price_output", "price_reasoning", "price_cache_read",
 		"price_cache_write", "price_version",
 		"held_micro_usd", "token_estimate", "initial_hold_micro_usd",
@@ -154,19 +147,31 @@ func TestFreshLedgerCarriesCompleteCurrentSchema(t *testing.T) {
 			t.Errorf("requests still carries the removed column %s", legacy)
 		}
 	}
+	usages := pragmaColumns(t, db, "usages")
+	for _, legacy := range []string{"cost_micro_usd", "charged"} {
+		if _, ok := usages[legacy]; ok {
+			t.Errorf("usages still carries the removed column %s", legacy)
+		}
+	}
+	if _, ok := usages["service_tier"]; !ok {
+		t.Error("usages.service_tier is missing")
+	}
 
 	// Recoverable key material is mandatory, and the key feature columns exist.
 	keys := pragmaColumns(t, db, "keys")
 	if material, ok := keys["key_material_enc"]; !ok || !material.notNull || material.kind != "BLOB" {
 		t.Fatalf("keys.key_material_enc = %+v, want a NOT NULL BLOB column", material)
 	}
-	for _, column := range []string{"caller_id", "deleted_at"} {
+	for _, column := range []string{"caller_id", "deleted_at",
+		"quota_micro_usd", "daily_micro_usd", "weekly_micro_usd", "monthly_micro_usd"} {
 		if _, ok := keys[column]; !ok {
 			t.Errorf("keys.%s is missing", column)
 		}
 	}
-	if _, ok := keys["held_micro_usd"]; ok {
-		t.Error("keys still carries the removed column held_micro_usd")
+	for _, legacy := range []string{"spent_micro_usd", "held_micro_usd"} {
+		if _, ok := keys[legacy]; ok {
+			t.Errorf("keys still carries the removed column %s", legacy)
+		}
 	}
 
 	prices := pragmaColumns(t, db, "prices")
@@ -174,9 +179,6 @@ func TestFreshLedgerCarriesCompleteCurrentSchema(t *testing.T) {
 		if _, ok := prices[column]; !ok {
 			t.Errorf("prices.%s is missing", column)
 		}
-	}
-	if _, ok := pragmaColumns(t, db, "usages")["service_tier"]; !ok {
-		t.Error("usages.service_tier is missing")
 	}
 }
 

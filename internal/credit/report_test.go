@@ -291,15 +291,14 @@ func TestReportSnapshotIsConsistentUnderConcurrentWrites(t *testing.T) {
 				return
 			}
 			if i%5 == 0 {
-				// Every fifth write becomes a request with untrustworthy usage
-				// that an administrator closes with a manual charge, so the
-				// adjustment series is exercised under concurrent writes too.
-				if err := h.store.Complete(ctx, Completion{ID: req.ID, TraceID: req.TraceID,
-					Outcome: OutcomeFailed, StatusCode: 502}); err != nil {
+				// Every fifth write uses a model without a price, so the
+				// unpriced series is exercised under concurrent writes too.
+				// Its tokens still count and its state still settles.
+				if err := h.store.RecordUsage(ctx, usageFor("u-"+id, req, "unpriced", tokens(1, 0, 0, 0, 0))); err != nil {
 					return
 				}
-				if err := h.store.Resolve(ctx, req.ID, Resolution{Action: ActionCharge,
-					AmountMicroUSD: 7, Reason: "manual"}); err != nil {
+				if err := h.store.Complete(ctx, Completion{ID: req.ID, TraceID: req.TraceID,
+					Outcome: OutcomeSucceeded}); err != nil {
 					return
 				}
 				continue
@@ -324,11 +323,13 @@ func TestReportSnapshotIsConsistentUnderConcurrentWrites(t *testing.T) {
 		if rep.Summary.Requests != rep.Total {
 			t.Fatalf("summary requests %d != total %d", rep.Summary.Requests, rep.Total)
 		}
-		var bucketSum, bucketCost, bucketAdjustments int64
+		var bucketSum, bucketCost, bucketUnpriced, bucketExecutions, bucketTokens int64
 		for _, p := range rep.Trend {
 			bucketSum += p.Summary.Requests
 			bucketCost += p.Summary.CostMicroUSD
-			bucketAdjustments += p.Summary.AdjustmentMicroUSD
+			bucketUnpriced += p.Summary.UnpricedExecutions
+			bucketExecutions += p.Summary.Executions
+			bucketTokens += p.Summary.Tokens.Total
 		}
 		if bucketSum != rep.Total {
 			t.Fatalf("trend requests %d != total %d", bucketSum, rep.Total)
@@ -336,9 +337,13 @@ func TestReportSnapshotIsConsistentUnderConcurrentWrites(t *testing.T) {
 		if bucketCost != rep.Summary.CostMicroUSD {
 			t.Fatalf("trend cost %d != summary cost %d", bucketCost, rep.Summary.CostMicroUSD)
 		}
-		if bucketAdjustments != rep.Summary.AdjustmentMicroUSD {
-			t.Fatalf("trend adjustments %d != summary adjustments %d",
-				bucketAdjustments, rep.Summary.AdjustmentMicroUSD)
+		if bucketUnpriced != rep.Summary.UnpricedExecutions {
+			t.Fatalf("trend unpriced %d != summary unpriced %d",
+				bucketUnpriced, rep.Summary.UnpricedExecutions)
+		}
+		if bucketExecutions != rep.Summary.Executions || bucketTokens != rep.Summary.Tokens.Total {
+			t.Fatalf("trend executions/tokens %d/%d != summary %d/%d", bucketExecutions,
+				bucketTokens, rep.Summary.Executions, rep.Summary.Tokens.Total)
 		}
 		want := rep.Total
 		if want > int64(rep.PageSize) {
@@ -355,11 +360,12 @@ func TestReportSnapshotIsConsistentUnderConcurrentWrites(t *testing.T) {
 	}
 }
 
-// TestReportSeparatesCostFromAdjustments verifies the ledger view of manual
-// Resolve charges: execution cost stays execution derived, adjustments are
-// reported as their own number, and the pair reconciles with the key ledger
-// without double counting or hiding anything.
-func TestReportSeparatesCostFromAdjustments(t *testing.T) {
+// TestReportPricesOnlyTrustworthyUsage verifies the core report contract: the
+// summary amount is derived from the current price book and the trustworthy
+// executions only, a pending request contributes nothing, and an execution of
+// an unlisted model is counted as unpriced instead of being denied or billed
+// at a fabricated rate.
+func TestReportPricesOnlyTrustworthyUsage(t *testing.T) {
 	h := newHarness(t)
 	h.mustPrice("m1", Rates{Input: million}) // 1 token costs 1 microUSD
 	key, _ := h.mustKey(KeySpec{Enabled: true})
@@ -370,116 +376,136 @@ func TestReportSeparatesCostFromAdjustments(t *testing.T) {
 	// A measured execution: 100 microUSD of real, usage derived cost.
 	measured := h.mustAdmit(AdmitInput{ID: "r1", TraceID: "t1", KeyID: key.ID,
 		RequestedModel: "m1"})
-	h.mustUsage(usageFor("u1", measured, "m1", tokens(100, 0, 0, 0, 0)))
+	measuredUsage := usageFor("u1", measured, "m1", tokens(100, 0, 0, 0, 0))
+	measuredUsage.Provider = "openai"
+	h.mustUsage(measuredUsage)
 	h.mustComplete(Completion{ID: measured.ID, TraceID: measured.TraceID, Outcome: OutcomeSucceeded})
 
-	// A request with no trustworthy usage, closed by an administrator.
+	// A failed request with no trustworthy usage stays pending and unpriced.
 	manual := h.mustAdmit(AdmitInput{ID: "r2", TraceID: "t2", KeyID: key.ID,
 		RequestedModel: "m1"})
 	h.mustComplete(Completion{ID: manual.ID, TraceID: manual.TraceID, Outcome: OutcomeFailed, StatusCode: 502})
 
-	// The adjustment is booked two days after the request itself, so its
-	// period attribution is observable.
-	h.clock.set(testEpoch.AddDate(0, 0, 2).Add(2 * time.Hour))
-	if err := h.store.Resolve(ctx, manual.ID, Resolution{Action: ActionCharge,
-		AmountMicroUSD: 777, Reason: "provider billed out of band"}); err != nil {
-		t.Fatalf("resolve charge: %v", err)
-	}
-	// A third request keeps the later day non-empty in the trend.
-	later := h.mustAdmit(AdmitInput{ID: "r3", TraceID: "t3", KeyID: key.ID,
-		RequestedModel: "m1"})
-	h.mustUsage(usageFor("u3", later, "m1", tokens(10, 0, 0, 0, 0)))
-	h.mustComplete(Completion{ID: later.ID, TraceID: later.TraceID, Outcome: OutcomeSucceeded})
+	// An execution of an unlisted model is still accepted and counted, but it
+	// has no rate to derive an amount from.
+	unpriced := h.mustAdmit(AdmitInput{ID: "r3", TraceID: "t3", KeyID: key.ID,
+		RequestedModel: "m2"})
+	unpricedUsage := usageFor("u3", unpriced, "m2", tokens(5, 0, 0, 0, 0))
+	unpricedUsage.Provider = "anthropic"
+	h.mustUsage(unpricedUsage)
+	h.mustComplete(Completion{ID: unpriced.ID, TraceID: unpriced.TraceID, Outcome: OutcomeSucceeded})
 
-	ledger := h.key(key.ID)
-	if ledger.SpentMicroUSD != 100+777+10 {
-		t.Fatalf("ledger spent = %d, want 887", ledger.SpentMicroUSD)
-	}
+	// A third measured request keeps the later day non-empty in the trend.
+	h.clock.set(testEpoch.AddDate(0, 0, 2).Add(2 * time.Hour))
+	later := h.mustAdmit(AdmitInput{ID: "r4", TraceID: "t4", KeyID: key.ID,
+		RequestedModel: "m1"})
+	laterUsage := usageFor("u4", later, "m1", tokens(10, 0, 0, 0, 0))
+	laterUsage.Provider = "openai"
+	h.mustUsage(laterUsage)
+	h.mustComplete(Completion{ID: later.ID, TraceID: later.TraceID, Outcome: OutcomeSucceeded})
 
 	rep, err := h.store.Report(ctx, Filter{From: from, To: to, Bucket: "day"})
 	if err != nil {
 		t.Fatalf("report: %v", err)
 	}
-	// Manual charges never inflate the measured cost ...
-	if rep.Summary.CostMicroUSD != 110 {
-		t.Fatalf("summary cost = %d, want the usage derived 110", rep.Summary.CostMicroUSD)
+	if rep.Summary.CostMicroUSD != 110 || rep.Summary.UnpricedExecutions != 1 {
+		t.Fatalf("summary cost = %d/%d, want 110 with one unpriced execution",
+			rep.Summary.CostMicroUSD, rep.Summary.UnpricedExecutions)
 	}
-	// ... and they are never hidden either.
-	if rep.Summary.AdjustmentMicroUSD != 777 {
-		t.Fatalf("summary adjustments = %d, want 777", rep.Summary.AdjustmentMicroUSD)
+	if rep.Summary.Executions != 3 || rep.Summary.CompleteExecutions != 3 {
+		t.Fatalf("executions = %+v, want three trustworthy executions", rep.Summary)
 	}
-	// Cost plus adjustments reconstitutes the ledger spend exactly.
-	if ledger.SpentMicroUSD != rep.Summary.CostMicroUSD+rep.Summary.AdjustmentMicroUSD {
-		t.Fatalf("ledger %d != cost %d + adjustments %d", ledger.SpentMicroUSD,
-			rep.Summary.CostMicroUSD, rep.Summary.AdjustmentMicroUSD)
+	if rep.Summary.Tokens.Total != 115 {
+		t.Fatalf("summary tokens = %d, want every execution counted", rep.Summary.Tokens.Total)
+	}
+	if rep.Summary.Pending != 1 {
+		t.Fatalf("pending = %d, want the unmeasured failed request", rep.Summary.Pending)
 	}
 
-	// Items carry the adjustment on the request it belongs to.
+	// Items carry the query-time execution cost, including explicit null for
+	// the unlisted model.
 	items := map[string]Request{}
 	for _, item := range rep.Items {
 		items[item.ID] = item
 	}
-	if len(items) != 3 {
-		t.Fatalf("items = %d, want 3", len(items))
+	if len(items) != 4 {
+		t.Fatalf("items = %d, want 4", len(items))
 	}
-	if items["r2"].AdjustmentMicroUSD != 777 {
-		t.Fatalf("r2 adjustments = %d, want 777", items["r2"].AdjustmentMicroUSD)
+	if c := items["r1"].Executions[0].CostMicroUSD; c == nil || *c != 100 {
+		t.Fatalf("r1 cost = %v, want 100", c)
 	}
-	if items["r1"].AdjustmentMicroUSD != 0 || items["r3"].AdjustmentMicroUSD != 0 {
-		t.Fatalf("unadjusted requests report %d/%d", items["r1"].AdjustmentMicroUSD, items["r3"].AdjustmentMicroUSD)
+	if len(items["r2"].Executions) != 0 {
+		t.Fatalf("r2 executions = %+v, want none", items["r2"].Executions)
 	}
-	if items["r2"].State != stateSettled || items["r2"].Outcome != OutcomeFailed {
-		t.Fatalf("r2 = %+v, want a settled failure", items["r2"])
+	if c := items["r3"].Executions[0].CostMicroUSD; c != nil {
+		t.Fatalf("r3 cost = %v, want null", c)
+	}
+	if items["r2"].State != statePending || items["r3"].State != stateSettled {
+		t.Fatalf("states r2/r3 = %s/%s, want pending/settled", items["r2"].State, items["r3"].State)
 	}
 
-	// The trend attributes an adjustment to the request period, not to the
-	// moment the administrator acted, so buckets keep summing to the summary.
-	var trendCost, trendAdjustments int64
+	// The trend sums equal the summary: no amount is lost between the page,
+	// the buckets and the totals.
+	var trendCost, trendUnpriced int64
 	for _, p := range rep.Trend {
 		trendCost += p.Summary.CostMicroUSD
-		trendAdjustments += p.Summary.AdjustmentMicroUSD
+		trendUnpriced += p.Summary.UnpricedExecutions
 	}
-	if trendCost != rep.Summary.CostMicroUSD || trendAdjustments != rep.Summary.AdjustmentMicroUSD {
-		t.Fatalf("trend sums %d/%d do not match summary %d/%d", trendCost, trendAdjustments,
-			rep.Summary.CostMicroUSD, rep.Summary.AdjustmentMicroUSD)
+	if trendCost != rep.Summary.CostMicroUSD || trendUnpriced != rep.Summary.UnpricedExecutions {
+		t.Fatalf("trend sums %d/%d do not match summary %d/%d", trendCost, trendUnpriced,
+			rep.Summary.CostMicroUSD, rep.Summary.UnpricedExecutions)
 	}
 	if len(rep.Trend) != 2 {
 		t.Fatalf("trend points = %d, want 2", len(rep.Trend))
-	}
-	if rep.Trend[0].Summary.AdjustmentMicroUSD != 777 || rep.Trend[1].Summary.AdjustmentMicroUSD != 0 {
-		t.Fatalf("trend adjustments = %d/%d, want 777/0", rep.Trend[0].Summary.AdjustmentMicroUSD,
-			rep.Trend[1].Summary.AdjustmentMicroUSD)
 	}
 	if rep.Trend[0].Summary.CostMicroUSD != 100 || rep.Trend[1].Summary.CostMicroUSD != 10 {
 		t.Fatalf("trend costs = %d/%d, want 100/10", rep.Trend[0].Summary.CostMicroUSD,
 			rep.Trend[1].Summary.CostMicroUSD)
 	}
+	if rep.Trend[0].Summary.UnpricedExecutions != 1 || rep.Trend[1].Summary.UnpricedExecutions != 0 {
+		t.Fatalf("trend unpriced = %d/%d, want 1/0", rep.Trend[0].Summary.UnpricedExecutions,
+			rep.Trend[1].Summary.UnpricedExecutions)
+	}
 
-	// An execution filter drops a request that has no matching execution,
-	// together with its request level adjustment: the manual charge stays
-	// attached to a request that is not part of the selection.
+	// A price change reprices every retained execution on the next read; no
+	// log row is rewritten and the token counters are untouched.
+	h.mustPrice("m1", Rates{Input: 2 * million})
+	repriced, err := h.store.Report(ctx, Filter{From: from, To: to, Bucket: "day"})
+	if err != nil {
+		t.Fatalf("repriced report: %v", err)
+	}
+	if repriced.Summary.CostMicroUSD != 220 || repriced.Summary.UnpricedExecutions != 1 {
+		t.Fatalf("repriced summary = %+v, want 220 and one unpriced", repriced.Summary)
+	}
+	if repriced.Summary.Tokens.Total != rep.Summary.Tokens.Total {
+		t.Fatalf("repricing changed tokens: %d -> %d", rep.Summary.Tokens.Total, repriced.Summary.Tokens.Total)
+	}
+
+	// Execution filters retain exactly the matching requests; an unpriced
+	// execution is still a matching execution and stays visible as unpriced.
 	byProvider, err := h.store.Report(ctx, Filter{From: from, To: to, Provider: "openai"})
 	if err != nil {
 		t.Fatalf("provider report: %v", err)
 	}
-	if byProvider.Total != 2 || byProvider.Summary.CostMicroUSD != 110 || byProvider.Summary.AdjustmentMicroUSD != 0 {
-		t.Fatalf("openai summary = %+v, want only the two measured requests", byProvider.Summary)
+	if byProvider.Total != 2 || byProvider.Summary.CostMicroUSD != 220 ||
+		byProvider.Summary.UnpricedExecutions != 0 {
+		t.Fatalf("openai summary = %+v, want the two measured requests", byProvider.Summary)
 	}
 	byOther, err := h.store.Report(ctx, Filter{From: from, To: to, Provider: "anthropic"})
 	if err != nil {
 		t.Fatalf("other provider report: %v", err)
 	}
-	if byOther.Total != 0 || byOther.Summary.AdjustmentMicroUSD != 0 || byOther.Summary.CostMicroUSD != 0 {
-		t.Fatalf("unmatched provider summary = %+v, want empty", byOther.Summary)
+	if byOther.Total != 1 || byOther.Summary.CostMicroUSD != 0 || byOther.Summary.UnpricedExecutions != 1 {
+		t.Fatalf("unmatched provider summary = %+v, want the unpriced execution only", byOther.Summary)
 	}
-	// The same holds for a key filter that excludes the adjusted request.
+	// The same holds for a key filter that excludes the measured requests.
 	other, _ := h.mustKey(KeySpec{Enabled: true})
 	byKey, err := h.store.Report(ctx, Filter{From: from, To: to, KeyID: other.ID})
 	if err != nil {
 		t.Fatalf("other key report: %v", err)
 	}
-	if byKey.Summary.AdjustmentMicroUSD != 0 {
-		t.Fatalf("adjustment leaked into an unrelated key: %d", byKey.Summary.AdjustmentMicroUSD)
+	if byKey.Total != 0 || byKey.Summary.CostMicroUSD != 0 || byKey.Summary.UnpricedExecutions != 0 {
+		t.Fatalf("unrelated key summary = %+v, want empty", byKey.Summary)
 	}
 }
 

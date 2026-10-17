@@ -8,13 +8,18 @@ import (
 	"time"
 )
 
-// Cleanup purges closed history older than the retention window. Durable
+// Cleanup purges closed history older than the retention window. Durable token
 // counters and unresolved requests are never removed, and free pages are
 // physically reclaimed from the database and the WAL. Space reclamation is
 // bounded per run, so a single call may leave the file larger than its content;
 // the counters above are exact, the sizes are not.
 //
-// Idempotency note: keyed requests, usages and resolutions stay replayable only
+// Because a request's cost is derived from its executions at read time, deleting
+// expired history also removes it from every reported amount: the selection
+// range is the retained window, and no permanent amount is kept for a purged
+// request.
+//
+// Idempotency note: keyed requests, usages and completions stay replayable only
 // while their history is retained. History older than the retention window is
 // physically deleted, so a very late replay of a long closed request is not
 // recognised again.
@@ -95,10 +100,10 @@ func (s *Store) reclaimSpace(ctx context.Context) error {
 	return nil
 }
 
-// pruneCounters bounds the per-period counter tables. Lifetime totals are the
-// durable record and are never pruned; day/week/month rows disappear only once
-// they are older than the retention window and no unresolved request can still
-// be charged into them. Without a cleanup run nothing is removed.
+// pruneCounters bounds the per-period token counter tables. Lifetime totals are
+// the durable record and are never pruned; day/week/month rows disappear only
+// once they are older than the retention window and no unresolved request can
+// still add usage into them. Without a cleanup run nothing is removed.
 func (s *Store) pruneCounters(ctx context.Context, cutoff time.Time) error {
 	return s.inTx(ctx, func(tx *sql.Tx) error {
 		keep, err := unresolvedPeriods(ctx, tx)
@@ -108,16 +113,11 @@ func (s *Store) pruneCounters(ctx context.Context, cutoff time.Time) error {
 		for _, win := range []string{windowDay, windowWeek, windowMonth} {
 			age := periodOf(win, cutoff)
 			periods := keep[win]
-			if err := pruneCounterTable(ctx, tx, "key_money_counters", win, age, periods); err != nil {
-				return err
-			}
 			if err := pruneCounterTable(ctx, tx, "key_token_counters", win, age, periods); err != nil {
 				return err
 			}
-			for _, table := range []string{"key_money_baselines", "key_token_baselines"} {
-				if err := pruneCounterTable(ctx, tx, table, win, age, periods); err != nil {
-					return err
-				}
+			if err := pruneCounterTable(ctx, tx, "key_token_baselines", win, age, periods); err != nil {
+				return err
 			}
 		}
 		return nil
@@ -273,9 +273,6 @@ func deleteHistory(ctx context.Context, tx *sql.Tx, ids []string, cutoff time.Ti
 	list := placeholders(len(actual))
 	if _, err := tx.ExecContext(ctx, `DELETE FROM usages WHERE request_id IN (`+list+`)`, actualArgs...); err != nil {
 		return 0, fmt.Errorf("delete usages: %w", err)
-	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM adjustments WHERE request_id IN (`+list+`)`, actualArgs...); err != nil {
-		return 0, fmt.Errorf("delete adjustments: %w", err)
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM requests WHERE id IN (`+list+`)`, actualArgs...); err != nil {
 		return 0, fmt.Errorf("delete requests: %w", err)

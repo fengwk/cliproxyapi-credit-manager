@@ -7,8 +7,8 @@ import (
 
 // LookupRequest is the dedicated ownership-scoped lookup used by the customer
 // self-service snapshot endpoint. It must return the owner's own request with
-// its executions and manual adjustments, and must never reveal anything about
-// another key.
+// each execution priced by the current price book, and must never reveal
+// anything about another key.
 func TestLookupRequestReturnsOwnRequest(t *testing.T) {
 	h := newHarness(t)
 	h.mustPrice("m1", Rates{Input: million})
@@ -21,13 +21,10 @@ func TestLookupRequestReturnsOwnRequest(t *testing.T) {
 	h.mustUsage(usageFor("exec-own", measured, "m1", tokens(100, 0, 0, 0, 0)))
 	h.mustComplete(Completion{ID: measured.ID, TraceID: measured.TraceID, Outcome: OutcomeSucceeded})
 
-	manual := h.mustAdmit(AdmitInput{ID: "req-manual", TraceID: "trace-manual", KeyID: key.ID,
-		RequestedModel: "m1"})
-	h.mustComplete(Completion{ID: manual.ID, TraceID: manual.TraceID, Outcome: OutcomeFailed, StatusCode: 502})
-	if err := h.store.Resolve(ctx, manual.ID, Resolution{Action: ActionCharge,
-		AmountMicroUSD: 777, Reason: "provider billed out of band"}); err != nil {
-		t.Fatalf("resolve charge: %v", err)
-	}
+	unpriced := h.mustAdmit(AdmitInput{ID: "req-unpriced", TraceID: "trace-unpriced", KeyID: key.ID,
+		RequestedModel: "unknown-model"})
+	h.mustUsage(usageFor("exec-unpriced", unpriced, "unknown-model", tokens(7, 0, 0, 0, 0)))
+	h.mustComplete(Completion{ID: unpriced.ID, TraceID: unpriced.TraceID, Outcome: OutcomeSucceeded})
 
 	got, err := h.store.LookupRequest(ctx, key.ID, measured.ID)
 	if err != nil {
@@ -39,16 +36,35 @@ func TestLookupRequestReturnsOwnRequest(t *testing.T) {
 	if got.Executions[0].ID != "exec-own" {
 		t.Fatalf("execution id = %q, want exec-own", got.Executions[0].ID)
 	}
-	if got.AdjustmentMicroUSD != 0 {
-		t.Fatalf("measured adjustment = %d, want 0", got.AdjustmentMicroUSD)
+	if got.Executions[0].CostMicroUSD == nil || *got.Executions[0].CostMicroUSD != 100 {
+		t.Fatalf("measured cost = %v, want 100", got.Executions[0].CostMicroUSD)
+	}
+	if got.Executions[0].Tokens.Total != 100 {
+		t.Fatalf("measured tokens = %+v, want 100", got.Executions[0].Tokens)
 	}
 
-	adjusted, err := h.store.LookupRequest(ctx, key.ID, manual.ID)
+	// The same log is repriced by the current price book on every lookup: no
+	// amount was frozen at admission.
+	h.mustPrice("m1", Rates{Input: 2 * million})
+	repriced, err := h.store.LookupRequest(ctx, key.ID, measured.ID)
 	if err != nil {
-		t.Fatalf("lookup adjusted request: %v", err)
+		t.Fatalf("repriced lookup: %v", err)
 	}
-	if adjusted.AdjustmentMicroUSD != 777 {
-		t.Fatalf("adjusted request adjustment = %d, want 777", adjusted.AdjustmentMicroUSD)
+	if c := repriced.Executions[0].CostMicroUSD; c == nil || *c != 200 {
+		t.Fatalf("repriced cost = %v, want 200", c)
+	}
+
+	// A model without a price is still a valid execution: its cost is explicit
+	// null and its tokens remain visible.
+	unknown, err := h.store.LookupRequest(ctx, key.ID, unpriced.ID)
+	if err != nil {
+		t.Fatalf("lookup unpriced request: %v", err)
+	}
+	if len(unknown.Executions) != 1 || unknown.Executions[0].CostMicroUSD != nil {
+		t.Fatalf("unpriced execution = %+v, want a null cost", unknown.Executions)
+	}
+	if unknown.Executions[0].Tokens.Total != 7 {
+		t.Fatalf("unpriced tokens = %+v, want the recorded 7", unknown.Executions[0].Tokens)
 	}
 
 	// The same request is invisible to every other key: a foreign id and an

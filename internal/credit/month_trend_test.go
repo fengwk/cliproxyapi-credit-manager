@@ -94,12 +94,11 @@ func TestReportTrendUsesCalendarMonths(t *testing.T) {
 	}
 }
 
-// TestReportTrendMonthReconcilesSummaryWithAdjustments verifies the month bucket
-// preserves the existing report semantics: every request appears in exactly one
-// bucket (including unresolved and execution-less ones), manual adjustments stay
-// attributed to the request's own month even when booked later, and the trend
-// totals reconcile with the summary and the key ledger.
-func TestReportTrendMonthReconcilesSummaryWithAdjustments(t *testing.T) {
+// TestReportTrendMonthReconcilesSummary verifies the month bucket preserves the
+// existing report semantics: every request appears in exactly one bucket
+// (including unresolved and execution-less ones), a late execution is priced
+// into the request's own month, and the trend totals reconcile with the summary.
+func TestReportTrendMonthReconcilesSummary(t *testing.T) {
 	h := newHarness(t)
 	h.mustPrice("m1", Rates{Input: million, Output: 2 * million})
 	key, _ := h.mustKey(KeySpec{Enabled: true})
@@ -117,18 +116,17 @@ func TestReportTrendMonthReconcilesSummaryWithAdjustments(t *testing.T) {
 	record("b", time.Date(2024, time.February, 20, 8, 0, 0, 0, time.UTC), 30, 10)
 	record("c", time.Date(2024, time.March, 5, 8, 0, 0, 0, time.UTC), 7, 1)
 
-	// A failed request with no trustworthy usage stays pending, then an
-	// administrator charges it in a later month.
+	// A request admitted in February whose execution only arrives in March is
+	// still costed into February: the bucket follows the request, not the log
+	// insertion time, so a late execution cannot move money between months.
 	feb25 := time.Date(2024, time.February, 25, 8, 0, 0, 0, time.UTC)
 	h.clock.set(feb25)
 	manual := h.mustAdmit(AdmitInput{ID: "manual", TraceID: "t-manual", KeyID: key.ID,
 		RequestedModel: "m1", At: feb25})
-	h.mustComplete(Completion{ID: manual.ID, TraceID: manual.TraceID, Outcome: OutcomeFailed, StatusCode: 502, At: feb25})
-	h.clock.set(time.Date(2024, time.March, 20, 8, 0, 0, 0, time.UTC))
-	if err := h.store.Resolve(ctx, "manual", Resolution{Action: ActionCharge,
-		AmountMicroUSD: 500, Reason: "provider billed out of band"}); err != nil {
-		t.Fatalf("resolve charge: %v", err)
-	}
+	march20 := time.Date(2024, time.March, 20, 8, 0, 0, 0, time.UTC)
+	h.clock.set(march20)
+	h.mustUsage(usageFor("u-manual", manual, "m1", tokens(500, 0, 0, 0, 0)))
+	h.mustComplete(Completion{ID: manual.ID, TraceID: manual.TraceID, Outcome: OutcomeSucceeded, At: march20})
 
 	// An unresolved request started in March must stay visible, never dropped.
 	h.clock.set(time.Date(2024, time.March, 28, 8, 0, 0, 0, time.UTC))
@@ -152,11 +150,11 @@ func TestReportTrendMonthReconcilesSummaryWithAdjustments(t *testing.T) {
 		t.Fatalf("total = %d, summary requests = %d, want 6", rep.Total, rep.Summary.Requests)
 	}
 
-	var requests, cost, adjustments, tokensTotal int64
+	var requests, cost, unpriced, tokensTotal int64
 	for _, p := range rep.Trend {
 		requests += p.Summary.Requests
 		cost += p.Summary.CostMicroUSD
-		adjustments += p.Summary.AdjustmentMicroUSD
+		unpriced += p.Summary.UnpricedExecutions
 		tokensTotal += p.Summary.Tokens.Total
 	}
 	// Nothing is dropped: every request sits in exactly one month bucket.
@@ -166,18 +164,19 @@ func TestReportTrendMonthReconcilesSummaryWithAdjustments(t *testing.T) {
 	if cost != rep.Summary.CostMicroUSD {
 		t.Fatalf("bucket cost %d != summary cost %d", cost, rep.Summary.CostMicroUSD)
 	}
-	if adjustments != rep.Summary.AdjustmentMicroUSD {
-		t.Fatalf("bucket adjustments %d != summary adjustments %d", adjustments, rep.Summary.AdjustmentMicroUSD)
+	if unpriced != rep.Summary.UnpricedExecutions {
+		t.Fatalf("bucket unpriced %d != summary unpriced %d", unpriced, rep.Summary.UnpricedExecutions)
 	}
 	if tokensTotal != rep.Summary.Tokens.Total {
 		t.Fatalf("bucket tokens %d != summary tokens %d", tokensTotal, rep.Summary.Tokens.Total)
 	}
 
-	// Per-month attribution: two requests each month, with the 500 microUSD
-	// charge in February (the request's month), not March (when it was booked).
+	// Per-month attribution: two requests each month, with the 500-token late
+	// execution costed in February (the request's month), not March (when it
+	// was recorded).
 	wantRequests := []int64{2, 2, 2}
-	wantCost := []int64{20, 50, 9}
-	wantAdjust := []int64{0, 500, 0}
+	wantCost := []int64{20, 550, 9}
+	wantTokens := []int64{15, 540, 8}
 	for i := range wantRequests {
 		if got := rep.Trend[i].Summary.Requests; got != wantRequests[i] {
 			t.Fatalf("bucket %d requests = %d, want %d", i, got, wantRequests[i])
@@ -185,20 +184,21 @@ func TestReportTrendMonthReconcilesSummaryWithAdjustments(t *testing.T) {
 		if got := rep.Trend[i].Summary.CostMicroUSD; got != wantCost[i] {
 			t.Fatalf("bucket %d cost = %d, want %d", i, got, wantCost[i])
 		}
-		if got := rep.Trend[i].Summary.AdjustmentMicroUSD; got != wantAdjust[i] {
-			t.Fatalf("bucket %d adjustments = %d, want %d", i, got, wantAdjust[i])
+		if got := rep.Trend[i].Summary.Tokens.Total; got != wantTokens[i] {
+			t.Fatalf("bucket %d tokens = %d, want %d", i, got, wantTokens[i])
 		}
+	}
+	if rep.Summary.CostMicroUSD != 579 || rep.Summary.UnpricedExecutions != 0 {
+		t.Fatalf("summary cost = %d/%d, want 579 with nothing unpriced",
+			rep.Summary.CostMicroUSD, rep.Summary.UnpricedExecutions)
+	}
+	if rep.Summary.Tokens.Total != 563 {
+		t.Fatalf("summary tokens = %d, want 563", rep.Summary.Tokens.Total)
 	}
 
 	// The unresolved request is reported as pending, not silently dropped.
-	if rep.Summary.Pending == 0 {
-		t.Fatal("summary reports no pending request although two are unresolved")
-	}
-	// Cost plus adjustments reconstitutes the ledger spend exactly.
-	ledger := h.key(key.ID)
-	if ledger.SpentMicroUSD != rep.Summary.CostMicroUSD+rep.Summary.AdjustmentMicroUSD {
-		t.Fatalf("ledger %d != cost %d + adjustments %d", ledger.SpentMicroUSD,
-			rep.Summary.CostMicroUSD, rep.Summary.AdjustmentMicroUSD)
+	if rep.Summary.Pending != 2 {
+		t.Fatalf("summary pending = %d, want the two unresolved requests", rep.Summary.Pending)
 	}
 }
 

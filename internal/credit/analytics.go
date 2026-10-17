@@ -14,8 +14,10 @@ import (
 //
 // Summary is embedded so every per-model row exposes the same keys and meanings
 // as the report summary: requests, executions, failed, pending, cost_micro_usd,
-// adjustment_micro_usd, tokens, complete_executions and cache_read_ratio. Those
-// additive counters reconcile exactly with the whole-selection summary.
+// unpriced_executions, tokens, complete_executions and cache_read_ratio. Those
+// additive counters reconcile exactly with the whole-selection summary, and the
+// cost of a row is the sum of the per-execution costs of its executions, each
+// priced by its own actual model.
 //
 // The remaining fields are integer sums, never ratios: cost stays integer
 // microUSD and the token counters are whole tokens, so a client renders unit
@@ -55,9 +57,9 @@ type Analytics struct {
 
 // Analytics aggregates a filter over its whole matched set. Summary and trend
 // are the exact report numbers for the same selection, resolved through the
-// shared report range and predicate builder, and all four results are read
-// under one snapshot so a concurrent writer cannot make the summary, the trend
-// and the model breakdown disagree.
+// shared report range and predicate builder, and all results are read under one
+// snapshot with one price book so a concurrent writer (or a price edit) cannot
+// make the summary, the trend and the model breakdown disagree.
 func (s *Store) Analytics(ctx context.Context, f Filter) (Analytics, error) {
 	now := s.nowUTC()
 	from, to, err := s.reportRange(f, now)
@@ -69,17 +71,40 @@ func (s *Store) Analytics(ctx context.Context, f Filter) (Analytics, error) {
 
 	var out Analytics
 	err = s.withSnapshot(ctx, func(q querier) error {
+		book, err := loadPriceBook(ctx, q)
+		if err != nil {
+			return err
+		}
 		summary, err := s.reportSummary(ctx, q, where, args, execWhere, execArgs)
 		if err != nil {
 			return err
 		}
+		costs, err := s.projectCosts(ctx, q, book, where, args, execWhere, execArgs,
+			bucketExpr, bucketArgs, true)
+		if err != nil {
+			return err
+		}
+		summary.CostMicroUSD = costs.total.cost
+		summary.UnpricedExecutions = costs.total.unpriced
 		trend, err := s.reportTrend(ctx, q, where, args, execWhere, execArgs, bucketExpr, bucketArgs)
 		if err != nil {
 			return err
 		}
+		for i := range trend {
+			if bucket, ok := costs.buckets[trend[i].Time.UnixNano()]; ok {
+				trend[i].Summary.CostMicroUSD = bucket.cost
+				trend[i].Summary.UnpricedExecutions = bucket.unpriced
+			}
+		}
 		models, err := s.reportModels(ctx, q, where, args, execWhere, execArgs)
 		if err != nil {
 			return err
+		}
+		for i := range models {
+			if tally, ok := costs.models[models[i].Model]; ok {
+				models[i].Summary.CostMicroUSD = tally.cost
+				models[i].Summary.UnpricedExecutions = tally.unpriced
+			}
 		}
 		out = Analytics{
 			Summary:       summary,
@@ -107,13 +132,18 @@ const modelExecAggregate = execAggregate + `,
 	COALESCE(SUM(u.tokens_output + u.tokens_reasoning),0),
 	COALESCE(SUM(CASE WHEN u.latency_ms > 0 THEN u.tokens_output + u.tokens_reasoning ELSE 0 END),0)`
 
-// reportModels aggregates three model-keyed result sets inside the caller's
-// snapshot: request-level counters, execution-level counters and adjustments.
-// Every query groups and filters in SQLite, so the full matched set is
-// aggregated without listing request detail rows and without one query per
-// model. Request-level rows always sum to the summary because every request has
-// exactly one client model; execution-level rows do too because every execution
-// belongs to exactly one request.
+// reportModels aggregates two model-keyed result sets inside the caller's
+// snapshot: request-level counters and execution-level counters. Every query
+// groups and filters in SQLite, so the full matched set is aggregated without
+// listing request detail rows and without one query per model. Request-level
+// rows always sum to the summary because every request has exactly one client
+// model; execution-level rows do too because every execution belongs to exactly
+// one request. The monetary fields are filled by the caller from the same cost
+// projection the summary uses.
+//
+// A model is the requested (client) model of the request: an execution alias
+// never creates a row of its own. Group cost is therefore the sum of the
+// per-execution costs of the group, each priced by its own actual model.
 func (s *Store) reportModels(ctx context.Context, q querier, where string, args []any, execWhere string, execArgs []any) ([]ModelMetrics, error) {
 	byModel := map[string]*ModelMetrics{}
 	order := []string{}
@@ -167,7 +197,7 @@ func (s *Store) reportModels(ctx context.Context, q querier, where string, args 
 		var model string
 		var totals execTotals
 		var latencyMS, latencySamples, ttftMS, ttftSamples, outputTokens, measuredOutputTokens int64
-		if err := execRows.Scan(&model, &totals.executions, &totals.known, &totals.cost,
+		if err := execRows.Scan(&model, &totals.executions, &totals.reliable,
 			&totals.tokens.Input, &totals.tokens.CacheRead, &totals.tokens.CacheWrite,
 			&totals.tokens.Output, &totals.tokens.Reasoning, &totals.tokens.Total,
 			&totals.completeCacheRead, &totals.completeInputTotal,
@@ -192,29 +222,6 @@ func (s *Store) reportModels(ctx context.Context, q querier, where string, args 
 		return nil, fmt.Errorf("iterate model executions: %w", err)
 	}
 	execRows.Close()
-
-	adjustRows, err := q.QueryContext(ctx, `SELECT r.model, COALESCE(SUM(a.amount_micro_usd),0)
-		FROM adjustments a JOIN requests r ON r.id = a.request_id
-		WHERE `+where+` GROUP BY r.model`, args...)
-	if err != nil {
-		return nil, fmt.Errorf("group adjustments by model: %w", err)
-	}
-	for adjustRows.Next() {
-		var (
-			model string
-			total int64
-		)
-		if err := adjustRows.Scan(&model, &total); err != nil {
-			adjustRows.Close()
-			return nil, fmt.Errorf("scan model adjustments: %w", err)
-		}
-		ensure(model).AdjustmentMicroUSD = total
-	}
-	if err := adjustRows.Err(); err != nil {
-		adjustRows.Close()
-		return nil, fmt.Errorf("iterate model adjustments: %w", err)
-	}
-	adjustRows.Close()
 
 	// A stable model-name order keeps the response reproducible; the client
 	// ranks by the metric it shows.

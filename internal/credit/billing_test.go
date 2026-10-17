@@ -4,7 +4,6 @@ import (
 	"context"
 	"database/sql"
 	"errors"
-	"math"
 	"sync"
 	"testing"
 	"time"
@@ -25,13 +24,21 @@ func billingHarness(t *testing.T, opts ...func(*Options)) (*harness, Key) {
 	return h, key
 }
 
+// costOf is the query-time cost summary of one key's whole test window.
+func (h *harness) costOf(keyID string) (int64, int64) {
+	h.t.Helper()
+	sum := h.report(keyID).Summary
+	return sum.CostMicroUSD, sum.UnpricedExecutions
+}
+
 func TestAdmitValidatesKeyAndInput(t *testing.T) {
 	h, key := billingHarness(t)
 	ctx := h.ctx()
-	// Unknown model has no price: absence denies, it never means free.
-	_, err := h.store.Admit(ctx, AdmitInput{ID: "r1", TraceID: "t1", KeyID: key.ID, RequestedModel: "unknown"})
-	if !errors.Is(err, ErrUnpriced) {
-		t.Fatalf("unpriced err = %v, want ErrUnpriced", err)
+	// A model with no price at all is admitted: admission never reads the price
+	// book, so an unpriced model is an unpriced execution, not a denied one.
+	if _, err := h.store.Admit(ctx, AdmitInput{ID: "r1", TraceID: "t1", KeyID: key.ID,
+		RequestedModel: "unknown"}); err != nil {
+		t.Fatalf("unpriced model admission: %v", err)
 	}
 	// Model permission is exact.
 	spec := key.Spec
@@ -39,15 +46,15 @@ func TestAdmitValidatesKeyAndInput(t *testing.T) {
 	if _, err := h.store.UpdateKey(ctx, key.ID, spec); err != nil {
 		t.Fatalf("update key: %v", err)
 	}
-	h.mustAdmit(AdmitInput{ID: "r1", TraceID: "t1", KeyID: key.ID, RequestedModel: "m1"})
-	if _, err := h.store.Admit(ctx, AdmitInput{ID: "r2", TraceID: "t2", KeyID: key.ID, RequestedModel: "m1"}); err != nil {
+	h.mustAdmit(AdmitInput{ID: "r2", TraceID: "t2", KeyID: key.ID, RequestedModel: "m1"})
+	if _, err := h.store.Admit(ctx, AdmitInput{ID: "r3", TraceID: "t3", KeyID: key.ID, RequestedModel: "m1"}); err != nil {
 		t.Fatalf("allowed model: %v", err)
 	}
 	spec.AllowedModels = []string{"m2"}
 	if _, err := h.store.UpdateKey(ctx, key.ID, spec); err != nil {
 		t.Fatalf("update key: %v", err)
 	}
-	_, err = h.store.Admit(ctx, AdmitInput{ID: "r3", TraceID: "t3", KeyID: key.ID, RequestedModel: "m1"})
+	_, err := h.store.Admit(ctx, AdmitInput{ID: "r4", TraceID: "t4", KeyID: key.ID, RequestedModel: "m1"})
 	if !errors.Is(err, ErrDenied) {
 		t.Fatalf("disallowed model err = %v, want ErrDenied", err)
 	}
@@ -57,7 +64,7 @@ func TestAdmitValidatesKeyAndInput(t *testing.T) {
 	if _, err := h.store.UpdateKey(ctx, key.ID, spec); err != nil {
 		t.Fatalf("update key: %v", err)
 	}
-	_, err = h.store.Admit(ctx, AdmitInput{ID: "r4", TraceID: "t4", KeyID: key.ID, RequestedModel: "m1"})
+	_, err = h.store.Admit(ctx, AdmitInput{ID: "r5", TraceID: "t5", KeyID: key.ID, RequestedModel: "m1"})
 	if !errors.Is(err, ErrUnauthorized) {
 		t.Fatalf("disabled err = %v, want ErrUnauthorized", err)
 	}
@@ -67,7 +74,7 @@ func TestAdmitValidatesKeyAndInput(t *testing.T) {
 	if _, err := h.store.UpdateKey(ctx, key.ID, spec); err != nil {
 		t.Fatalf("update key: %v", err)
 	}
-	_, err = h.store.Admit(ctx, AdmitInput{ID: "r5", TraceID: "t5", KeyID: key.ID, RequestedModel: "m1"})
+	_, err = h.store.Admit(ctx, AdmitInput{ID: "r6", TraceID: "t6", KeyID: key.ID, RequestedModel: "m1"})
 	if !errors.Is(err, ErrUnauthorized) {
 		t.Fatalf("expired err = %v, want ErrUnauthorized", err)
 	}
@@ -80,6 +87,35 @@ func TestAdmitValidatesKeyAndInput(t *testing.T) {
 	}
 }
 
+// TestDollarBudgetsNeverGateAdmission pins the product decision: the four
+// canonical money fields are display-only budgets. A key whose budgets are all
+// far exceeded by actual usage still admits, and no budget value is ever read as
+// a limit.
+func TestDollarBudgetsNeverGateAdmission(t *testing.T) {
+	h := newHarness(t)
+	h.mustPrice("m1", Rates{Input: million}) // 1 token = 1 microUSD
+	key, _ := h.mustKey(KeySpec{
+		Enabled: true, QuotaMicroUSD: 1, DailyMicroUSD: 1, WeeklyMicroUSD: 1, MonthlyMicroUSD: 1})
+	ctx := h.ctx()
+
+	first := h.mustAdmit(AdmitInput{ID: "b1", TraceID: "tb1", KeyID: key.ID, RequestedModel: "m1"})
+	h.mustUsage(usageFor("u-b1", first, "m1", tokens(10_000, 0, 0, 0, 0)))
+	h.mustComplete(Completion{ID: first.ID, TraceID: first.TraceID, Outcome: OutcomeSucceeded})
+	if cost, unpriced := h.costOf(key.ID); cost != 10_000 || unpriced != 0 {
+		t.Fatalf("cost = %d/%d, want 10000 priced executions", cost, unpriced)
+	}
+	// Every budget is exceeded many times over; admission still succeeds.
+	if _, err := h.store.Admit(ctx, AdmitInput{ID: "b2", TraceID: "tb2", KeyID: key.ID,
+		RequestedModel: "m1"}); err != nil {
+		t.Fatalf("admission after exceeding every dollar budget: %v", err)
+	}
+	// The budget figures survive as reported spec values, never as usage.
+	got := h.key(key.ID)
+	if got.Spec.QuotaMicroUSD != 1 || got.Spec.MonthlyMicroUSD != 1 {
+		t.Fatalf("budget figures = %+v, want the configured display values", got.Spec)
+	}
+}
+
 func TestAdmitIdempotentAndConflicting(t *testing.T) {
 	h, key := billingHarness(t)
 	in := AdmitInput{ID: "req-1", TraceID: "trace-1", KeyID: key.ID, RequestedModel: "m1"}
@@ -88,9 +124,12 @@ func TestAdmitIdempotentAndConflicting(t *testing.T) {
 	if first.ID != second.ID || first.TraceID != second.TraceID {
 		t.Fatalf("idempotent admission mismatch: %+v vs %+v", first, second)
 	}
-	// A repeated admission is the same request and moves no money.
-	if got := h.key(key.ID); got.SpentMicroUSD != 0 || got.QuotaUsedMicroUSD != 0 {
-		t.Fatalf("repeated admission changed the ledger: %+v", got)
+	// A repeated admission is the same request and stores no price or amount.
+	if len(first.Executions) != 0 {
+		t.Fatalf("fresh admission carries executions: %+v", first)
+	}
+	if cost, unpriced := h.costOf(key.ID); cost != 0 || unpriced != 0 {
+		t.Fatalf("repeated admission produced cost %d/%d, want none", cost, unpriced)
 	}
 	conflict := in
 	conflict.TraceID = "other-trace"
@@ -110,49 +149,42 @@ func TestAdmitIdempotentAndConflicting(t *testing.T) {
 	}
 }
 
-func TestAdmitQuotaGatesOnEffectiveUsage(t *testing.T) {
-	h := newHarness(t)
-	h.mustPrice("m1", Rates{Input: million, Output: million})
-	key, _ := h.mustKey(KeySpec{Enabled: true, QuotaMicroUSD: 10})
-	ctx := h.ctx()
-
-	// Effective usage is zero, so the first request is admitted even though a
-	// coarse estimate of its cost would exceed the quota: no estimate exists.
-	first := h.mustAdmit(AdmitInput{ID: "q1", TraceID: "tq1", KeyID: key.ID, RequestedModel: "m1"})
-	h.mustUsage(usageFor("u-q1", first, "m1", tokens(9, 0, 0, 0, 0)))
-	h.mustComplete(Completion{ID: first.ID, TraceID: first.TraceID, Outcome: OutcomeSucceeded})
-	if got := h.key(key.ID).SpentMicroUSD; got != 9 {
-		t.Fatalf("spent = %d, want 9", got)
+// TestAdmitRecordsServiceTierFact pins that the request stores the service tier
+// as a request fact, normalized, and that it is what a usage event without its
+// own tier inherits.
+func TestAdmitRecordsServiceTierFact(t *testing.T) {
+	h, key := billingHarness(t)
+	req := h.mustAdmit(AdmitInput{ID: "r1", TraceID: "t1", KeyID: key.ID,
+		RequestedModel: "m1", ServiceTier: "PRIORITY"})
+	if req.ServiceTier != "priority" {
+		t.Fatalf("request service tier = %q, want priority", req.ServiceTier)
 	}
-	// 9 < 10: a positive remainder still admits another request.
-	h.mustAdmit(AdmitInput{ID: "q2", TraceID: "tq2", KeyID: key.ID, RequestedModel: "m1"})
-	second := h.mustAdmit(AdmitInput{ID: "q3", TraceID: "tq3", KeyID: key.ID, RequestedModel: "m1"})
-	// Charging the last microUSD makes effective usage equal the limit, which
-	// now denies the next admission.
-	h.mustUsage(usageFor("u-q3", second, "m1", tokens(1, 0, 0, 0, 0)))
-	h.mustComplete(Completion{ID: second.ID, TraceID: second.TraceID, Outcome: OutcomeSucceeded})
-	if _, err := h.store.Admit(ctx, AdmitInput{ID: "q4", TraceID: "tq4", KeyID: key.ID, RequestedModel: "m1"}); !errors.Is(err, ErrQuota) {
-		t.Fatalf("used == limit err = %v, want ErrQuota", err)
+	h.mustUsage(usageFor("u1", req, "m1", tokens(1, 0, 0, 0, 0)))
+	exec := h.request(req.ID).Executions[0]
+	if exec.ServiceTier != "priority" {
+		t.Fatalf("inherited execution tier = %q, want priority", exec.ServiceTier)
 	}
 }
 
 func TestAdmitConcurrencyAndOverage(t *testing.T) {
 	h := newHarness(t)
 	h.mustPrice("m1", Rates{Input: million})
-	key, _ := h.mustKey(KeySpec{Enabled: true, QuotaMicroUSD: 10, MaxConcurrent: 1})
+	key, _ := h.mustKey(KeySpec{Enabled: true, ModelTokenLimits: []ModelTokenLimit{
+		{Model: "m1", Total: 10}}, MaxConcurrent: 1})
 	ctx := h.ctx()
 
 	active := h.mustAdmit(AdmitInput{ID: "a", TraceID: "ta", KeyID: key.ID, RequestedModel: "m1"})
 	if _, err := h.store.Admit(ctx, AdmitInput{ID: "b", TraceID: "tb", KeyID: key.ID, RequestedModel: "m1"}); !errors.Is(err, ErrConcurrency) {
 		t.Fatalf("concurrency err = %v, want ErrConcurrency", err)
 	}
-	// The actual charge exceeds the quota: it is booked in full, never capped.
+	// Actual usage exceeding the token limit is recorded in full, never capped:
+	// admission only checks what was already consumed when it ran.
 	h.mustUsage(usageFor("u-a", active, "m1", tokens(25, 0, 0, 0, 0)))
 	h.mustComplete(Completion{ID: active.ID, TraceID: active.TraceID, Outcome: OutcomeSucceeded})
-	if got := h.key(key.ID).SpentMicroUSD; got != 25 {
-		t.Fatalf("overage spent = %d, want the full 25", got)
+	if sum := h.report(key.ID).Summary; sum.Tokens.Total != 25 {
+		t.Fatalf("tokens = %d, want the full 25", sum.Tokens.Total)
 	}
-	// Completion released the concurrency slot; the exhausted quota denies.
+	// Completion released the concurrency slot; the exhausted token limit denies.
 	if _, err := h.store.Admit(ctx, AdmitInput{ID: "c", TraceID: "tc", KeyID: key.ID, RequestedModel: "m1"}); !errors.Is(err, ErrQuota) {
 		t.Fatalf("post-overage err = %v, want ErrQuota", err)
 	}
@@ -201,63 +233,78 @@ func TestAdmitReleasesConcurrencyOnlyOnce(t *testing.T) {
 	}
 }
 
-func TestUsageBeforeCompletionIsChargedOnce(t *testing.T) {
+// TestUsageCostIsDerivedOncePerExecution exercises the query-time derivation: a
+// usage recorded while the execution is still active is already priced, a replay
+// does not double it, and a late execution adds its own amount.
+func TestUsageCostIsDerivedOncePerExecution(t *testing.T) {
 	h, key := billingHarness(t)
 	req := h.mustAdmit(AdmitInput{ID: "r1", TraceID: "t1", KeyID: key.ID, RequestedModel: "m1"})
-	// Usage arrives first, while the execution is still active. A trustworthy
-	// charge is booked immediately, well before completion and never estimated.
 	h.mustUsage(usageFor("u1", req, "m1", tokens(100, 0, 0, 100, 0)))
-	if got := h.key(key.ID); got.SpentMicroUSD != 300 {
-		t.Fatalf("active accounting = spent %d, want 300", got.SpentMicroUSD)
+	if cost, unpriced := h.costOf(key.ID); cost != 300 || unpriced != 0 {
+		t.Fatalf("active cost = %d/%d, want 300 priced", cost, unpriced)
 	}
 	h.mustComplete(Completion{ID: req.ID, TraceID: req.TraceID, Outcome: OutcomeSucceeded})
-	got := h.key(key.ID)
-	if got.SpentMicroUSD != 300 {
-		t.Fatalf("settled accounting = spent %d, want 300", got.SpentMicroUSD)
+	if cost, _ := h.costOf(key.ID); cost != 300 {
+		t.Fatalf("settled cost = %d, want 300", cost)
 	}
-	// A duplicate event must not bill twice.
+	// A duplicate event must not be counted twice.
 	h.mustUsage(usageFor("u1", req, "m1", tokens(100, 0, 0, 100, 0)))
-	if got := h.key(key.ID); got.SpentMicroUSD != 300 {
-		t.Fatalf("after replay spent = %d, want 300", got.SpentMicroUSD)
+	if cost, _ := h.costOf(key.ID); cost != 300 {
+		t.Fatalf("after replay cost = %d, want 300", cost)
 	}
-	// A late execution is still charged in full after request completion.
+	// A late execution is priced in full after completion.
 	extra := usageFor("u2", req, "m1", tokens(0, 0, 0, 1000, 0))
-	extra.Provider = "openai"
 	h.mustUsage(extra)
-	if got := h.key(key.ID); got.SpentMicroUSD != 300+2000 {
-		t.Fatalf("late charge spent = %d, want 2300", got.SpentMicroUSD)
+	if cost, _ := h.costOf(key.ID); cost != 300+2000 {
+		t.Fatalf("late cost = %d, want 2300", cost)
+	}
+	// The page shows the same per-execution amounts as the summary.
+	items := h.report(key.ID).Items
+	if len(items) != 1 || len(items[0].Executions) != 2 {
+		t.Fatalf("items = %+v", items)
+	}
+	for _, e := range items[0].Executions {
+		switch e.ID {
+		case "u1":
+			if e.CostMicroUSD == nil || *e.CostMicroUSD != 300 {
+				t.Fatalf("u1 cost = %v, want 300", e.CostMicroUSD)
+			}
+		case "u2":
+			if e.CostMicroUSD == nil || *e.CostMicroUSD != 2000 {
+				t.Fatalf("u2 cost = %v, want 2000", e.CostMicroUSD)
+			}
+		}
 	}
 }
 
-// TestUnknownExecutionBlocksClosureButStillCharges proves that an unreliable
-// execution keeps the request open while every
-// trustworthy charge is booked immediately and never written off twice.
-func TestUnknownExecutionBlocksClosureButStillCharges(t *testing.T) {
+// TestUnknownExecutionBlocksClosure proves that an unreliable execution keeps the
+// request open, contributes no cost, and is counted as unpriced, while a
+// trustworthy sibling is priced immediately.
+func TestUnknownExecutionBlocksClosure(t *testing.T) {
 	h, key := billingHarness(t)
 	req := h.mustAdmit(AdmitInput{ID: "r1", TraceID: "t1", KeyID: key.ID, RequestedModel: "m1"})
 	h.mustComplete(Completion{ID: req.ID, TraceID: req.TraceID, Outcome: OutcomeSucceeded})
 	if got := h.request(req.ID); got.State != statePending {
 		t.Fatalf("state without usage = %q, want pending", got.State)
 	}
-	// Unknown accounting is recorded but never billed as a zero.
 	unknown := usageFor("u-unknown", req, "m1", Tokens{})
 	unknown.Quality = QualityUnknown
 	h.mustUsage(unknown)
 	if got := h.request(req.ID); got.State != statePending {
 		t.Fatalf("state after unknown usage = %q, want pending", got.State)
 	}
-	if got := h.key(key.ID).SpentMicroUSD; got != 0 {
-		t.Fatalf("unknown usage charged %d, want 0", got)
+	if cost, unpriced := h.costOf(key.ID); cost != 0 || unpriced != 1 {
+		t.Fatalf("unknown-only cost = %d/%d, want 0 cost and 1 unpriced", cost, unpriced)
 	}
-	// A trustworthy usage charges immediately but the unknown sibling still
-	// blocks closure.
+	// A trustworthy sibling is priced but the unknown execution still blocks
+	// closure.
 	h.mustUsage(usageFor("u-known", req, "m1", tokens(100, 0, 0, 100, 0)))
 	got := h.request(req.ID)
 	if got.State != statePending {
 		t.Fatalf("state with unknown execution = %q, want pending", got.State)
 	}
-	if spent := h.key(key.ID).SpentMicroUSD; spent != 300 {
-		t.Fatalf("spent = %d, want the immediate 300", spent)
+	if cost, unpriced := h.costOf(key.ID); cost != 300 || unpriced != 1 {
+		t.Fatalf("cost = %d/%d, want 300 with 1 unpriced", cost, unpriced)
 	}
 	// A repeated completion must not change anything while the request is
 	// unresolved, but it is still checked for agreement.
@@ -265,14 +312,11 @@ func TestUnknownExecutionBlocksClosureButStillCharges(t *testing.T) {
 	if got := h.request(req.ID); got.State != statePending {
 		t.Fatalf("state after replay = %q, want pending", got.State)
 	}
-	if len(got.Executions) != 2 {
-		t.Fatalf("executions = %d, want 2", len(got.Executions))
-	}
-	for _, e := range got.Executions {
+	for _, e := range h.request(req.ID).Executions {
 		switch e.ID {
 		case "u-unknown":
 			if e.CostMicroUSD != nil {
-				t.Fatalf("unknown execution must keep an unknown cost, got %d", *e.CostMicroUSD)
+				t.Fatalf("unknown execution must keep a null cost, got %d", *e.CostMicroUSD)
 			}
 		case "u-known":
 			if e.CostMicroUSD == nil || *e.CostMicroUSD != 300 {
@@ -280,20 +324,12 @@ func TestUnknownExecutionBlocksClosureButStillCharges(t *testing.T) {
 			}
 		}
 	}
-	// Only an administrator decision can close it; the charge stays booked.
-	if err := h.store.Resolve(h.ctx(), req.ID, Resolution{Action: ActionRelease, Reason: "unknown accounting"}); err != nil {
-		t.Fatalf("resolve: %v", err)
-	}
-	if k := h.key(key.ID); k.SpentMicroUSD != 300 {
-		t.Fatalf("after resolve spent %d, want 300", k.SpentMicroUSD)
-	}
 }
 
 // TestUnknownExecutionOrderingAndIdempotency covers the event orders the native
 // bridge can produce for one execution set.
 func TestUnknownExecutionOrderingAndIdempotency(t *testing.T) {
 	h, key := billingHarness(t)
-	ctx := h.ctx()
 	reserve := func(id string) Request {
 		return h.mustAdmit(AdmitInput{ID: id, TraceID: "t-" + id, KeyID: key.ID, RequestedModel: "m1"})
 	}
@@ -307,8 +343,8 @@ func TestUnknownExecutionOrderingAndIdempotency(t *testing.T) {
 		t.Fatalf("order A state = %q, want pending", got)
 	}
 	h.mustUsage(usageFor("ua2", a, "m1", tokens(100, 0, 0, 100, 0)))
-	if got := h.key(key.ID).SpentMicroUSD; got != 300 {
-		t.Fatalf("order A spent = %d, want 300", got)
+	if cost, unpriced := h.costOf(key.ID); cost != 300 || unpriced != 1 {
+		t.Fatalf("order A cost = %d/%d, want 300 with 1 unpriced", cost, unpriced)
 	}
 	// Order B: unknown first, trustworthy second, completion last.
 	b := reserve("b")
@@ -320,23 +356,16 @@ func TestUnknownExecutionOrderingAndIdempotency(t *testing.T) {
 	if got := h.request(b.ID).State; got != statePending {
 		t.Fatalf("order B state = %q, want pending", got)
 	}
-	if got := h.key(key.ID).SpentMicroUSD; got != 600 {
-		t.Fatalf("order B spent = %d, want 600", got)
+	if cost, unpriced := h.costOf(key.ID); cost != 600 || unpriced != 2 {
+		t.Fatalf("order B cost = %d/%d, want 600 with 2 unpriced", cost, unpriced)
 	}
-	// Both events are replayable without changing money.
+	// Both events are replayable without changing any derived amount.
 	h.mustUsage(unknownA)
 	h.mustUsage(usageFor("ua2", a, "m1", tokens(100, 0, 0, 100, 0)))
 	h.mustUsage(unknownB)
 	h.mustUsage(usageFor("ub2", b, "m1", tokens(100, 0, 0, 100, 0)))
-	if got := h.key(key.ID).SpentMicroUSD; got != 600 {
-		t.Fatalf("replay spent = %d, want 600", got)
-	}
-	// Resolving with a charge adds on top of the already booked usage.
-	if err := h.store.Resolve(ctx, b.ID, Resolution{Action: ActionCharge, AmountMicroUSD: 50, Reason: "manual"}); err != nil {
-		t.Fatalf("resolve charge: %v", err)
-	}
-	if got := h.key(key.ID).SpentMicroUSD; got != 650 {
-		t.Fatalf("resolve charge spent = %d, want 650", got)
+	if cost, unpriced := h.costOf(key.ID); cost != 600 || unpriced != 2 {
+		t.Fatalf("replay cost = %d/%d, want 600 with 2 unpriced", cost, unpriced)
 	}
 }
 
@@ -383,7 +412,7 @@ func TestCompletionOutcomes(t *testing.T) {
 	if got := h.request(canceled.ID).State; got != stateSettled {
 		t.Fatalf("canceled with usage state = %q, want settled", got)
 	}
-	// A rejection still charges what was reported.
+	// A rejection still prices what was reported.
 	rejected := reserve("r-with-usage")
 	h.mustUsage(usageFor("ur", rejected, "m1", tokens(10, 0, 0, 0, 0)))
 	h.mustComplete(Completion{ID: rejected.ID, TraceID: rejected.TraceID, Outcome: OutcomeRejected, StatusCode: 403})
@@ -405,7 +434,7 @@ func TestCompletionOutcomes(t *testing.T) {
 		t.Fatalf("failed-zero-unknown state = %q, want pending", got)
 	}
 	// An unaccounted execution contradicts a rejection claim, so the request
-	// stays open for reconciliation instead of silently discarding unknown cost.
+	// stays open for reconciliation instead of silently discarding it.
 	rejectedUnknown := reserve("r-unknown")
 	ru := usageFor("uru", rejectedUnknown, "m1", Tokens{})
 	ru.Quality = QualityUnknown
@@ -415,9 +444,9 @@ func TestCompletionOutcomes(t *testing.T) {
 	if got := h.request(rejectedUnknown.ID).State; got != statePending {
 		t.Fatalf("rejected with unknown execution state = %q, want pending", got)
 	}
-	// Money is only booked for trustworthy usage: 100 + 50 + 10 above.
-	if got := h.key(key.ID).SpentMicroUSD; got != 100+50+10 {
-		t.Fatalf("spent = %d, want 160", got)
+	// Only the three trustworthy executions are priced: 100 + 50 + 10.
+	if cost, unpriced := h.costOf(key.ID); cost != 160 || unpriced != 2 {
+		t.Fatalf("cost = %d/%d, want 160 with 2 unpriced", cost, unpriced)
 	}
 }
 
@@ -441,8 +470,8 @@ func TestCompleteValidatesRepeatedOutcomeAndStatus(t *testing.T) {
 	}
 }
 
-// TestUsageRejectsCallerSuppliedCost keeps money and quality from disagreeing:
-// the core always derives the cost from the request price snapshot.
+// TestUsageRejectsCallerSuppliedCost keeps the derived amount from being
+// injected: the cost is a read-time projection, never a stored field.
 func TestUsageRejectsCallerSuppliedCost(t *testing.T) {
 	h, key := billingHarness(t)
 	req := h.mustAdmit(AdmitInput{ID: "r1", TraceID: "t1", KeyID: key.ID, RequestedModel: "m1"})
@@ -452,8 +481,11 @@ func TestUsageRejectsCallerSuppliedCost(t *testing.T) {
 	if err := h.store.RecordUsage(h.ctx(), u); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("caller cost err = %v, want ErrInvalid", err)
 	}
-	if got := h.key(key.ID).SpentMicroUSD; got != 0 {
-		t.Fatalf("spent after rejected cost = %d, want 0", got)
+	if n, err := counterValue(h.ctx(), h.store.db, `SELECT COUNT(*) FROM usages`); err != nil || n != 0 {
+		t.Fatalf("usages = %d (%v), want none stored", n, err)
+	}
+	if got, _ := h.costOf(key.ID); got != 0 {
+		t.Fatalf("cost after rejected usage = %d, want 0", got)
 	}
 }
 
@@ -496,73 +528,9 @@ func TestUsageMatchingRules(t *testing.T) {
 	}
 }
 
-func TestResolveReleaseAndCharge(t *testing.T) {
-	h, key := billingHarness(t)
-	ctx := h.ctx()
-	release := h.mustAdmit(AdmitInput{ID: "r1", TraceID: "t1", KeyID: key.ID, RequestedModel: "m1"})
-	if err := h.store.Resolve(ctx, release.ID, Resolution{Action: ActionRelease, Reason: ""}); !errors.Is(err, ErrInvalid) {
-		t.Fatalf("missing reason err = %v, want ErrInvalid", err)
-	}
-	if err := h.store.Resolve(ctx, release.ID, Resolution{Action: "refund", Reason: "x"}); !errors.Is(err, ErrInvalid) {
-		t.Fatalf("bad action err = %v, want ErrInvalid", err)
-	}
-	// An active execution still owns a concurrency slot, so resolving it would
-	// bypass admission accounting.
-	if err := h.store.Resolve(ctx, release.ID, Resolution{Action: ActionRelease, Reason: "too early"}); !errors.Is(err, ErrConflict) {
-		t.Fatalf("resolving an active request err = %v, want ErrConflict", err)
-	}
-	// A failed lifecycle without a trustworthy execution is what an
-	// administrator actually has to rule on.
-	h.mustComplete(Completion{ID: release.ID, TraceID: release.TraceID, Outcome: OutcomeFailed, StatusCode: 502})
-	if err := h.store.Resolve(ctx, release.ID, Resolution{Action: ActionRelease, Reason: "provider outage"}); err != nil {
-		t.Fatalf("release: %v", err)
-	}
-	got := h.request(release.ID)
-	if got.State != stateSettled {
-		t.Fatalf("state = %q, want settled", got.State)
-	}
-	if k := h.key(key.ID); k.SpentMicroUSD != 0 {
-		t.Fatalf("after release spent %d, want 0", k.SpentMicroUSD)
-	}
-	// A second resolve on a closed request is a conflict, not a silent reprice.
-	if err := h.store.Resolve(ctx, release.ID, Resolution{Action: ActionRelease, Reason: "again"}); !errors.Is(err, ErrConflict) {
-		t.Fatalf("repeat resolve err = %v, want ErrConflict", err)
-	}
-	charge := h.mustAdmit(AdmitInput{ID: "r2", TraceID: "t2", KeyID: key.ID, RequestedModel: "m1"})
-	h.mustComplete(Completion{ID: charge.ID, TraceID: charge.TraceID, Outcome: OutcomeFailed, StatusCode: 502})
-	if err := h.store.Resolve(ctx, charge.ID, Resolution{Action: ActionCharge, AmountMicroUSD: 777, Reason: "manual"}); err != nil {
-		t.Fatalf("charge: %v", err)
-	}
-	if k := h.key(key.ID); k.SpentMicroUSD != 777 {
-		t.Fatalf("after charge spent %d, want 777", k.SpentMicroUSD)
-	}
-	var count int
-	if err := h.store.db.QueryRow(`SELECT COUNT(*) FROM adjustments WHERE request_id = ?`, charge.ID).Scan(&count); err != nil {
-		t.Fatalf("count adjustments: %v", err)
-	}
-	if count != 1 {
-		t.Fatalf("adjustments = %d, want 1", count)
-	}
-	// A released request that already reported usage still charges that usage.
-	partial := h.mustAdmit(AdmitInput{ID: "r3", TraceID: "t3", KeyID: key.ID, RequestedModel: "m1"})
-	h.mustUsage(usageFor("u3", partial, "m1", tokens(100, 0, 0, 0, 0)))
-	// The unaccounted execution keeps the request pending, which is the only
-	// state an administrator may still rule on.
-	unaccounted := usageFor("u3-unknown", partial, "m1", Tokens{})
-	unaccounted.Quality = QualityUnknown
-	h.mustUsage(unaccounted)
-	h.mustComplete(Completion{ID: partial.ID, TraceID: partial.TraceID, Outcome: OutcomeFailed, StatusCode: 500})
-	if err := h.store.Resolve(ctx, partial.ID, Resolution{Action: ActionRelease, Reason: "partial"}); err != nil {
-		t.Fatalf("release partial: %v", err)
-	}
-	if k := h.key(key.ID); k.SpentMicroUSD != 777+100 {
-		t.Fatalf("spent = %d, want 877", k.SpentMicroUSD)
-	}
-}
-
-// TestLateUsageChargesAdmissionPeriod verifies counters follow the admission
-// period, not the time the late event arrived.
-func TestLateUsageChargesAdmissionPeriod(t *testing.T) {
+// TestLateUsageCountsTowardAdmissionPeriod verifies the token counters follow
+// the admission period, not the time the late event arrived.
+func TestLateUsageCountsTowardAdmissionPeriod(t *testing.T) {
 	h, key := billingHarness(t)
 	req := h.mustAdmit(AdmitInput{ID: "r1", TraceID: "t1", KeyID: key.ID, RequestedModel: "m1",
 		At: testEpoch})
@@ -571,47 +539,50 @@ func TestLateUsageChargesAdmissionPeriod(t *testing.T) {
 	h.mustUsage(usageFor("u1", req, "m1", tokens(100, 0, 0, 0, 0)))
 	h.mustComplete(Completion{ID: req.ID, TraceID: req.TraceID, Outcome: OutcomeSucceeded})
 
-	june, err := moneyCounter(h.ctx(), h.store.db, key.ID, windowMonth, "2026-06")
+	june, err := tokenCounter(h.ctx(), h.store.db, key.ID, "m1", windowMonth, "2026-06")
 	if err != nil {
 		t.Fatalf("june counter: %v", err)
 	}
 	if june != 100 {
-		t.Fatalf("june charge = %d, want 100", june)
+		t.Fatalf("june usage = %d, want 100", june)
 	}
-	july, err := moneyCounter(h.ctx(), h.store.db, key.ID, windowMonth, "2026-07")
+	july, err := tokenCounter(h.ctx(), h.store.db, key.ID, "m1", windowMonth, "2026-07")
 	if err != nil {
 		t.Fatalf("july counter: %v", err)
 	}
 	if july != 0 {
-		t.Fatalf("july charge = %d, want 0", july)
+		t.Fatalf("july usage = %d, want 0", july)
 	}
-	total, err := moneyCounter(h.ctx(), h.store.db, key.ID, windowTotal, "")
+	total, err := tokenCounter(h.ctx(), h.store.db, key.ID, "m1", windowTotal, "")
 	if err != nil {
 		t.Fatalf("total counter: %v", err)
 	}
 	if total != 100 {
-		t.Fatalf("total charge = %d, want 100", total)
+		t.Fatalf("total usage = %d, want 100", total)
 	}
-	dayCounter, err := moneyCounter(h.ctx(), h.store.db, key.ID, windowDay, "2026-06-15")
+	dayCounter, err := tokenCounter(h.ctx(), h.store.db, key.ID, "m1", windowDay, "2026-06-15")
 	if err != nil {
 		t.Fatalf("day counter: %v", err)
 	}
 	if dayCounter != 100 {
-		t.Fatalf("day charge = %d, want 100", dayCounter)
+		t.Fatalf("day usage = %d, want 100", dayCounter)
 	}
-	weekCounter, err := moneyCounter(h.ctx(), h.store.db, key.ID, windowWeek, weekPeriod(testEpoch))
+	weekCounter, err := tokenCounter(h.ctx(), h.store.db, key.ID, "m1", windowWeek, weekPeriod(testEpoch))
 	if err != nil {
 		t.Fatalf("week counter: %v", err)
 	}
 	if weekCounter != 100 {
-		t.Fatalf("week charge = %d, want 100", weekCounter)
+		t.Fatalf("week usage = %d, want 100", weekCounter)
 	}
 }
 
-func TestPeriodLimitsResetAcrossPeriods(t *testing.T) {
+// TestTokenDailyLimitResetsAcrossPeriods is the token-window counterpart of the
+// former money-period gate: the limit consumes actual tokens of its own UTC day.
+func TestTokenDailyLimitResetsAcrossPeriods(t *testing.T) {
 	h := newHarness(t)
-	h.mustPrice("m1", Rates{Input: million, Output: million})
-	key, _ := h.mustKey(KeySpec{Enabled: true, DailyMicroUSD: 100})
+	h.mustPrice("m1", Rates{Input: million})
+	key, _ := h.mustKey(KeySpec{Enabled: true,
+		ModelTokenLimits: []ModelTokenLimit{{Model: "m1", Daily: 100}}})
 	ctx := h.ctx()
 	spend := func(id, trace string, amount int64) error {
 		req, err := h.store.Admit(ctx, AdmitInput{ID: id, TraceID: trace, KeyID: key.ID,
@@ -619,7 +590,6 @@ func TestPeriodLimitsResetAcrossPeriods(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		// Settle with the real charge so the daily counter is consumed.
 		h.mustUsage(usageFor("u-"+id, req, "m1", tokens(amount, 0, 0, 0, 0)))
 		h.mustComplete(Completion{ID: req.ID, TraceID: req.TraceID, Outcome: OutcomeSucceeded})
 		return nil
@@ -728,20 +698,123 @@ func itoa(i int) string {
 	return string(b[pos:])
 }
 
-// TestRepricingDoesNotReBillHistory proves the request price snapshot is used
-// for billing: a later price change must not silently reprice in-flight work.
-func TestRepricingDoesNotReBillHistory(t *testing.T) {
-	h, key := billingHarness(t)
+// TestPriceEditRepricesHistory is the core product promise: nothing about a
+// price is stored with a request, so adding, editing and deleting a price
+// immediately changes the reported cost of the same recorded history.
+func TestPriceEditRepricesHistory(t *testing.T) {
+	h := newHarness(t)
+	key, _ := h.mustKey(KeySpec{Enabled: true})
+	// 1) Record history before any price exists.
 	req := h.mustAdmit(AdmitInput{ID: "r1", TraceID: "t1", KeyID: key.ID, RequestedModel: "m1"})
-	h.mustPrice("m1", Rates{Input: 50 * million, Output: 60 * million})
 	h.mustUsage(usageFor("u1", req, "m1", tokens(100, 0, 0, 100, 0)))
 	h.mustComplete(Completion{ID: req.ID, TraceID: req.TraceID, Outcome: OutcomeSucceeded})
-	if got := h.key(key.ID).SpentMicroUSD; got != 300 {
-		t.Fatalf("spent after repricing = %d, want the original 300", got)
+	if got := h.request(req.ID); got.State != stateSettled {
+		t.Fatalf("state = %q, want settled without any price", got.State)
 	}
-	settled := h.request(req.ID)
-	if settled.Price.Rates.Input != million || settled.Price.Version != 1 {
-		t.Fatalf("price snapshot = %+v", settled.Price)
+	if cost, unpriced := h.costOf(key.ID); cost != 0 || unpriced != 1 {
+		t.Fatalf("unpriced history = %d/%d, want 0 cost and 1 unpriced", cost, unpriced)
+	}
+	if exec := h.request(req.ID).Executions[0]; exec.CostMicroUSD != nil {
+		t.Fatalf("unpriced execution cost = %d, want null", *exec.CostMicroUSD)
+	}
+	if sum := h.report(key.ID).Summary; sum.CompleteExecutions != 1 {
+		t.Fatalf("complete executions = %d, want the complete usage counted independently of price", sum.CompleteExecutions)
+	}
+
+	// 2) Adding a price immediately prices the existing history.
+	h.mustPrice("m1", Rates{Input: million, Output: 2 * million})
+	if cost, unpriced := h.costOf(key.ID); cost != 300 || unpriced != 0 {
+		t.Fatalf("after adding a price = %d/%d, want 300 priced", cost, unpriced)
+	}
+
+	// 3) Editing the price recomputes the same history.
+	h.mustPrice("m1", Rates{Input: 10 * million, Output: 20 * million})
+	if cost, _ := h.costOf(key.ID); cost != 3000 {
+		t.Fatalf("after editing the price = %d, want 3000", cost)
+	}
+
+	// 4) Deleting the price makes it unpriced again: no snapshot survives.
+	if _, err := h.store.db.ExecContext(h.ctx(), `DELETE FROM prices WHERE model = ?`, "m1"); err != nil {
+		t.Fatalf("delete price: %v", err)
+	}
+	if cost, unpriced := h.costOf(key.ID); cost != 0 || unpriced != 1 {
+		t.Fatalf("after deleting the price = %d/%d, want unpriced again", cost, unpriced)
+	}
+}
+
+// TestExecutionIsPricedByItsActualModel pins the pricing dimension: the exact
+// usage.Model prices an execution, never the request alias and never the
+// response model.
+func TestExecutionIsPricedByItsActualModel(t *testing.T) {
+	h := newHarness(t)
+	h.mustPrice("alias", Rates{Input: million})
+	h.mustPrice("actual", Rates{Input: 50 * million})
+	h.mustPrice("response", Rates{Input: 99 * million})
+	key, _ := h.mustKey(KeySpec{Enabled: true})
+
+	req := h.mustAdmit(AdmitInput{ID: "r1", TraceID: "t1", KeyID: key.ID, RequestedModel: "alias"})
+	exec := usageFor("u1", req, "actual", tokens(10, 0, 0, 0, 0))
+	exec.ResponseModel = "response"
+	h.mustUsage(exec)
+	h.mustComplete(Completion{ID: req.ID, TraceID: req.TraceID, Outcome: OutcomeSucceeded})
+	// 10 tokens at the actual model's 50 microUSD/1M = 500.
+	if cost, unpriced := h.costOf(key.ID); cost != 500 || unpriced != 0 {
+		t.Fatalf("cost = %d/%d, want 500 priced by the actual model", cost, unpriced)
+	}
+	// The request keeps its alias for permissions and grouping, and the
+	// unpriced alias itself is not what was priced.
+	items := h.report(key.ID).Items
+	if items[0].Model != "alias" {
+		t.Fatalf("request model = %q, want the alias", items[0].Model)
+	}
+	if items[0].Executions[0].Model != "actual" || items[0].Executions[0].ResponseModel != "response" {
+		t.Fatalf("execution = %+v, want the actual model and response model preserved", items[0].Executions[0])
+	}
+}
+
+// TestFailedAndRetriedExecutionsAreAllPriced pins that every reliable execution
+// is priced, including failed attempts of a request that eventually succeeded.
+func TestFailedAndRetriedExecutionsAreAllPriced(t *testing.T) {
+	h, key := billingHarness(t)
+	req := h.mustAdmit(AdmitInput{ID: "r1", TraceID: "t1", KeyID: key.ID, RequestedModel: "m1"})
+	failed := usageFor("u1", req, "m1", tokens(100, 0, 0, 0, 0))
+	failed.Failed = true
+	h.mustUsage(failed)
+	h.mustUsage(usageFor("u2", req, "m1", tokens(0, 0, 0, 100, 0)))
+	h.mustComplete(Completion{ID: req.ID, TraceID: req.TraceID, Outcome: OutcomeSucceeded})
+	if got := h.request(req.ID); got.State != stateSettled {
+		t.Fatalf("state = %q, want settled", got.State)
+	}
+	// 100 input tokens = 100 microUSD, 100 output tokens = 200 microUSD.
+	if cost, unpriced := h.costOf(key.ID); cost != 300 || unpriced != 0 {
+		t.Fatalf("cost = %d/%d, want 300 for both attempts", cost, unpriced)
+	}
+}
+
+// TestProviderFilteredReportPricesTheSameExecutions keeps an execution filter
+// from changing what a selected amount means.
+func TestProviderFilteredReportPricesTheSameExecutions(t *testing.T) {
+	h, key := billingHarness(t)
+	req := h.mustAdmit(AdmitInput{ID: "r1", TraceID: "t1", KeyID: key.ID, RequestedModel: "m1"})
+	h.mustUsage(usageFor("u1", req, "m1", tokens(100, 0, 0, 0, 0)))
+	other := usageFor("u2", req, "m1", tokens(0, 0, 0, 100, 0))
+	other.Provider = "other"
+	h.mustUsage(other)
+	h.mustComplete(Completion{ID: req.ID, TraceID: req.TraceID, Outcome: OutcomeSucceeded})
+
+	rep, err := h.store.Report(h.ctx(), Filter{KeyID: key.ID, Provider: "openai",
+		From: testEpoch.AddDate(-1, 0, 0), To: h.clock.now().Add(time.Hour), PageSize: 10})
+	if err != nil {
+		t.Fatalf("report: %v", err)
+	}
+	if rep.Summary.CostMicroUSD != 100 || rep.Summary.Executions != 1 {
+		t.Fatalf("filtered summary = %+v, want the openai execution only", rep.Summary)
+	}
+	if len(rep.Items) != 1 || len(rep.Items[0].Executions) != 1 {
+		t.Fatalf("filtered items = %+v", rep.Items)
+	}
+	if rep.Items[0].Executions[0].CostMicroUSD == nil || *rep.Items[0].Executions[0].CostMicroUSD != 100 {
+		t.Fatalf("filtered execution cost = %v, want 100", rep.Items[0].Executions[0].CostMicroUSD)
 	}
 }
 
@@ -788,12 +861,12 @@ func TestUsageReplayWithEmptyRequestID(t *testing.T) {
 	u.RequestID = ""
 	h.mustUsage(u)
 	h.mustUsage(u) // must be a no-op, not a conflict
-	if got := h.key(key.ID).SpentMicroUSD; got != 30 {
-		t.Fatalf("spent after replay = %d, want 30", got)
-	}
 	got := h.request(req.ID)
 	if len(got.Executions) != 1 {
 		t.Fatalf("executions = %d, want 1", len(got.Executions))
+	}
+	if cost, _ := h.costOf(key.ID); cost != 30 {
+		t.Fatalf("cost after replay = %d, want 30", cost)
 	}
 	// The stored event is canonicalized onto the matching request.
 	if got.Executions[0].RequestID != req.ID {
@@ -869,15 +942,16 @@ func TestSecondInstanceCannotOwnLockedDirectory(t *testing.T) {
 }
 
 // TestZeroRatePriceStillRequiresUsage keeps "free" distinct from "unaccounted":
-// an all-zero rate is a real price, not evidence that nothing ran.
+// an all-zero rate is a real price, so a complete execution is priced zero while
+// an unaccounted one stays unpriced.
 func TestZeroRatePriceStillRequiresUsage(t *testing.T) {
 	h := newHarness(t)
 	h.mustPrice("free", Rates{})
 	key, _ := h.mustKey(KeySpec{Enabled: true})
 	req := h.mustAdmit(AdmitInput{ID: "r1", TraceID: "t1", KeyID: key.ID, RequestedModel: "free"})
 	h.mustComplete(Completion{ID: req.ID, TraceID: req.TraceID, Outcome: OutcomeSucceeded})
-	if got := h.request(req.ID).State; got != statePending {
-		t.Fatalf("free success without usage state = %q, want pending", got)
+	if got := h.request(req.ID); got.State != statePending {
+		t.Fatalf("free success without usage state = %q, want pending", got.State)
 	}
 	// An explicit complete declaration closes it at zero cost.
 	u := usageFor("u1", req, "free", Tokens{})
@@ -886,74 +960,12 @@ func TestZeroRatePriceStillRequiresUsage(t *testing.T) {
 	if got := h.request(req.ID); got.State != stateSettled {
 		t.Fatalf("state = %q, want settled", got.State)
 	}
-	if got := h.key(key.ID).SpentMicroUSD; got != 0 {
-		t.Fatalf("spent = %d, want 0", got)
+	sum := h.report(key.ID).Summary
+	if sum.CostMicroUSD != 0 || sum.UnpricedExecutions != 0 {
+		t.Fatalf("free summary = %+v, want a priced zero and no unpriced execution", sum)
 	}
-}
-
-// TestPeriodLimitsGateOnActualUsage proves that a period money limit is a soft
-// admission gate on already-charged usage: a fresh window admits, and once the
-// window's actual usage has reached the limit the next admission is refused.
-func TestPeriodLimitsGateOnActualUsage(t *testing.T) {
-	cases := []struct {
-		name  string
-		apply func(*KeySpec)
-	}{
-		{"daily", func(s *KeySpec) { s.DailyMicroUSD = 100 }},
-		{"weekly", func(s *KeySpec) { s.WeeklyMicroUSD = 100 }},
-		{"monthly", func(s *KeySpec) { s.MonthlyMicroUSD = 100 }}}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			h := newHarness(t)
-			h.mustPrice("m1", Rates{Input: million}) // 1 token costs 1 microUSD
-			spec := KeySpec{Enabled: true}
-			tc.apply(&spec)
-			key, _ := h.mustKey(spec)
-			ctx := h.ctx()
-
-			first := h.mustAdmit(AdmitInput{ID: "r1", TraceID: "t1", KeyID: key.ID,
-				RequestedModel: "m1"})
-			// Nothing charged yet: several concurrent admissions are allowed.
-			if _, err := h.store.Admit(ctx, AdmitInput{ID: "r2", TraceID: "t2", KeyID: key.ID,
-				RequestedModel: "m1"}); err != nil {
-				t.Fatalf("concurrent admission in a fresh window: %v", err)
-			}
-			// The actual charge consumes the window; used == limit denies.
-			h.mustUsage(usageFor("u1", first, "m1", tokens(100, 0, 0, 0, 0)))
-			h.mustComplete(Completion{ID: first.ID, TraceID: first.TraceID, Outcome: OutcomeSucceeded})
-			if _, err := h.store.Admit(ctx, AdmitInput{ID: "r3", TraceID: "t3", KeyID: key.ID,
-				RequestedModel: "m1"}); !errors.Is(err, ErrQuota) {
-				t.Fatalf("used == limit err = %v, want ErrQuota", err)
-			}
-		})
-	}
-}
-
-// TestPeriodLimitsUseTheirOwnWindow keeps windows independent: usage charged in
-// January must not occupy February's monthly window.
-func TestPeriodLimitsUseTheirOwnWindow(t *testing.T) {
-	h := newHarness(t)
-	h.mustPrice("m1", Rates{Input: million})
-	key, _ := h.mustKey(KeySpec{Enabled: true, MonthlyMicroUSD: 100})
-	jan := time.Date(2026, time.January, 10, 12, 0, 0, 0, time.UTC)
-	h.clock.set(jan)
-	first := h.mustAdmit(AdmitInput{ID: "r1", TraceID: "t1", KeyID: key.ID,
-		RequestedModel: "m1", At: jan})
-	h.mustUsage(usageFor("u1", first, "m1", tokens(100, 0, 0, 0, 0)))
-	h.mustComplete(Completion{ID: first.ID, TraceID: first.TraceID, Outcome: OutcomeSucceeded})
-	if _, err := h.store.Admit(h.ctx(), AdmitInput{ID: "r1b", TraceID: "t1b", KeyID: key.ID,
-		RequestedModel: "m1", At: jan}); !errors.Is(err, ErrQuota) {
-		t.Fatalf("same month err = %v, want ErrQuota", err)
-	}
-	// February is a fresh window even though January usage stays durable.
-	feb := time.Date(2026, time.February, 3, 9, 0, 0, 0, time.UTC)
-	h.clock.set(feb)
-	if _, err := h.store.Admit(h.ctx(), AdmitInput{ID: "r2", TraceID: "t2", KeyID: key.ID,
-		RequestedModel: "m1", At: feb}); err != nil {
-		t.Fatalf("february admission: %v", err)
-	}
-	if got := h.key(key.ID).SpentMicroUSD; got != 100 {
-		t.Fatalf("lifetime spend = %d, want the January charge preserved", got)
+	if exec := h.request(req.ID).Executions[0]; exec.CostMicroUSD == nil || *exec.CostMicroUSD != 0 {
+		t.Fatalf("free execution cost = %v, want an explicit zero", exec.CostMicroUSD)
 	}
 }
 
@@ -1006,155 +1018,105 @@ func TestTokenLimitsUseTheirOwnWindow(t *testing.T) {
 	}
 }
 
-// TestLedgerArithmeticDoesNotOverflowToReal drives the ledger near MaxInt64.
-// SQLite would silently store an overflowing INTEGER sum as a REAL, so every
-// accumulator must reject the operation and roll the transaction back instead
-// of corrupting money or token accounting.
-func TestLedgerArithmeticDoesNotOverflowToReal(t *testing.T) {
-	const rate = 1_000_000_000_000          // microUSD per 1M tokens
-	const tokensNearMax = 9_000_000_000_000 // * rate / 1M = 9e18 microUSD per charge
-
-	// Guard helper: no monetary or token value may be stored as a float.
-	assertExactIntegers := func(t *testing.T, h *harness, keyID, requestID string) {
-		t.Helper()
-		checks := []struct {
-			name  string
-			query string
-			args  []any
-		}{
-			{"key money", `SELECT COUNT(*) FROM keys WHERE id = ? AND typeof(spent_micro_usd) <> 'integer'`, []any{keyID}},
-			{"money counters", `SELECT COUNT(*) FROM key_money_counters WHERE key_id = ? AND typeof(micro_usd) <> 'integer'`, []any{keyID}},
-			{"token counters", `SELECT COUNT(*) FROM key_token_counters WHERE key_id = ? AND typeof(tokens) <> 'integer'`, []any{keyID}},
-			{"request charge", `SELECT COUNT(*) FROM requests WHERE id = ? AND typeof(charge_micro_usd) <> 'integer'`, []any{requestID}}}
-		for _, c := range checks {
-			bad, err := counterValue(context.Background(), h.store.db, c.query, c.args...)
-			if err != nil {
-				t.Fatalf("%s: %v", c.name, err)
-			}
-			if bad != 0 {
-				t.Fatalf("%s: %d values were stored as REAL", c.name, bad)
-			}
-		}
-	}
-
-	t.Run("money", func(t *testing.T) {
-		h := newHarness(t)
-		h.mustPrice("big", Rates{Input: rate})
-		key, _ := h.mustKey(KeySpec{Enabled: true})
-		req := h.mustAdmit(AdmitInput{ID: "r1", TraceID: "t1", KeyID: key.ID,
-			RequestedModel: "big"})
-		h.mustUsage(usageFor("u1", req, "big", tokens(tokensNearMax, 0, 0, 0, 0)))
-		before := h.key(key.ID)
-		if before.SpentMicroUSD < math.MaxInt64/2 {
-			t.Fatalf("spent = %d, not near the int64 boundary as intended", before.SpentMicroUSD)
-		}
-		// A second identical charge would push the accumulated total past int64.
-		err := h.store.RecordUsage(h.ctx(), usageFor("u2", req, "big", tokens(tokensNearMax, 0, 0, 0, 0)))
-		if err == nil {
-			t.Fatal("second charge: want an overflow error, got nil")
-		}
-		if !errors.Is(err, ErrInvalid) {
-			t.Fatalf("second charge err = %v, want ErrInvalid", err)
-		}
-		after := h.key(key.ID)
-		if after.SpentMicroUSD != before.SpentMicroUSD {
-			t.Fatalf("ledger moved after a rejected charge: %+v -> %+v", before, after)
-		}
-		if n, err := counterValue(h.ctx(), h.store.db,
-			`SELECT COUNT(*) FROM usages WHERE request_id = ?`, req.ID); err != nil || n != 1 {
-			t.Fatalf("usages = %d (%v), want the rejected execution rolled back", n, err)
-		}
-		assertExactIntegers(t, h, key.ID, req.ID)
-
-		// Completing the request keeps the charged spend exact: no hold is
-		// released and nothing is written off.
-		h.mustComplete(Completion{ID: req.ID, TraceID: req.TraceID, Outcome: OutcomeSucceeded})
-		final := h.key(key.ID)
-		if final.SpentMicroUSD != before.SpentMicroUSD {
-			t.Fatalf("after completion spent %d, want %d preserved", final.SpentMicroUSD, before.SpentMicroUSD)
-		}
-		assertExactIntegers(t, h, key.ID, req.ID)
-	})
-
-	t.Run("tokens", func(t *testing.T) {
-		h := newHarness(t)
-		h.mustPrice("t", Rates{Input: 1}) // cheap money, huge token counts
-		key, _ := h.mustKey(KeySpec{Enabled: true})
-		const huge = int64(9_000_000_000_000_000_000)
-		req := h.mustAdmit(AdmitInput{ID: "r1", TraceID: "t1", KeyID: key.ID,
-			RequestedModel: "t"})
-		// Raw counters are left empty: this case is about the durable token
-		// counters, not about an inconsistent provider payload.
-		first := usageFor("u1", req, "t", tokens(huge, 0, 0, 0, 0))
-		first.Raw = pluginapi.UsageDetail{}
-		h.mustUsage(first)
-		// The token counters now sit one charge below the int64 limit.
-		second := usageFor("u2", req, "t", tokens(huge, 0, 0, 0, 0))
-		second.Raw = pluginapi.UsageDetail{}
-		err := h.store.RecordUsage(h.ctx(), second)
-		if err == nil || !errors.Is(err, ErrInvalid) {
-			t.Fatalf("token counter overflow err = %v, want ErrInvalid", err)
-		}
-		if n, err := counterValue(h.ctx(), h.store.db,
-			`SELECT COALESCE(SUM(tokens),0) FROM key_token_counters WHERE key_id = ? AND win = ?`,
-			key.ID, windowTotal); err != nil || n != huge {
-			t.Fatalf("token counter = %d (%v), want %d unchanged", n, err, huge)
-		}
-		assertExactIntegers(t, h, key.ID, req.ID)
-	})
-}
-
-// TestResolveRequiresPendingRequest verifies the state machine: an active
-// execution owns a concurrency slot, so only an administrator decision on an
-// already pending request may close it.
-func TestResolveRequiresPendingRequest(t *testing.T) {
+// TestTokenCountersNeverOverflowToReal drives the token counters near MaxInt64.
+// SQLite would silently store an overflowing INTEGER sum as a REAL, so the
+// accumulator must reject the operation and roll the transaction back instead of
+// corrupting the admission basis.
+func TestTokenCountersNeverOverflowToReal(t *testing.T) {
 	h := newHarness(t)
-	h.mustPrice("m1", Rates{Input: million})
-	key, _ := h.mustKey(KeySpec{Enabled: true, MaxConcurrent: 1})
-	ctx := h.ctx()
-
-	active := h.mustAdmit(AdmitInput{ID: "a", TraceID: "ta", KeyID: key.ID,
-		RequestedModel: "m1"})
-	if err := h.store.Resolve(ctx, active.ID, Resolution{Action: ActionRelease, Reason: "sneaky"}); !errors.Is(err, ErrConflict) {
-		t.Fatalf("resolve active err = %v, want ErrConflict", err)
+	h.mustPrice("t", Rates{Input: 1})
+	key, _ := h.mustKey(KeySpec{Enabled: true})
+	const huge = int64(9_000_000_000_000_000_000)
+	req := h.mustAdmit(AdmitInput{ID: "r1", TraceID: "t1", KeyID: key.ID, RequestedModel: "t"})
+	// Raw counters are left empty: this case is about the durable token
+	// counters, not about an inconsistent provider payload.
+	first := usageFor("u1", req, "t", tokens(huge, 0, 0, 0, 0))
+	first.Raw = pluginapi.UsageDetail{}
+	h.mustUsage(first)
+	second := usageFor("u2", req, "t", tokens(huge, 0, 0, 0, 0))
+	second.Raw = pluginapi.UsageDetail{}
+	err := h.store.RecordUsage(h.ctx(), second)
+	if err == nil || !errors.Is(err, ErrInvalid) {
+		t.Fatalf("token counter overflow err = %v, want ErrInvalid", err)
 	}
-	if has, err := h.store.HasActive(ctx); err != nil || !has {
-		t.Fatalf("HasActive = %v/%v, want true", has, err)
+	if n, err := counterValue(h.ctx(), h.store.db,
+		`SELECT COALESCE(SUM(tokens),0) FROM key_token_counters WHERE key_id = ? AND win = ?`,
+		key.ID, windowTotal); err != nil || n != huge {
+		t.Fatalf("token counter = %d (%v), want %d unchanged", n, err, huge)
 	}
-	// The concurrency slot is still owned by the active execution.
-	if _, err := h.store.Admit(ctx, AdmitInput{ID: "b", TraceID: "tb", KeyID: key.ID,
-		RequestedModel: "m1"}); !errors.Is(err, ErrConcurrency) {
-		t.Fatalf("second reserve err = %v, want ErrConcurrency", err)
-	}
-
-	// Once the lifecycle closes without trustworthy accounting the request is
-	// pending and an administrator may rule on it.
-	h.mustComplete(Completion{ID: active.ID, TraceID: active.TraceID, Outcome: OutcomeFailed, StatusCode: 500})
-	if err := h.store.Resolve(ctx, active.ID, Resolution{Action: ActionRelease, Reason: "manual"}); err != nil {
-		t.Fatalf("resolve pending: %v", err)
-	}
-	if has, err := h.store.HasActive(ctx); err != nil || has {
-		t.Fatalf("HasActive = %v/%v, want false", has, err)
-	}
-	if _, err := h.store.Admit(ctx, AdmitInput{ID: "b", TraceID: "tb", KeyID: key.ID,
-		RequestedModel: "m1"}); err != nil {
-		t.Fatalf("slot after resolve: %v", err)
+	bad, err := counterValue(h.ctx(), h.store.db,
+		`SELECT COUNT(*) FROM key_token_counters WHERE key_id = ? AND typeof(tokens) <> 'integer'`, key.ID)
+	if err != nil || bad != 0 {
+		t.Fatalf("token counters stored as REAL: %d (%v)", bad, err)
 	}
 }
 
-// TestLateCompletionAfterManualResolve proves a completion that arrives after
-// an administrator closed a restarted request only records its metadata: the
-// settlement and the booked money stay untouched.
-func TestLateCompletionAfterManualResolve(t *testing.T) {
+// TestRecordUsageSurvivesAnOverflowingPrice proves that pricing can never block
+// recording: a rate whose product with the actual tokens exceeds int64 is stored
+// fine, and only the derived report treats the execution as unpriced.
+func TestRecordUsageSurvivesAnOverflowingPrice(t *testing.T) {
+	h := newHarness(t)
+	h.mustPrice("big", Rates{Input: 1 << 62})
+	key, _ := h.mustKey(KeySpec{Enabled: true})
+	req := h.mustAdmit(AdmitInput{ID: "r1", TraceID: "t1", KeyID: key.ID, RequestedModel: "big"})
+	h.mustUsage(usageFor("u1", req, "big", tokens(1<<40, 0, 0, 0, 0)))
+	h.mustComplete(Completion{ID: req.ID, TraceID: req.TraceID, Outcome: OutcomeSucceeded})
+	if got := h.request(req.ID); got.State != stateSettled {
+		t.Fatalf("state = %q, want settled", got.State)
+	}
+	n, err := counterValue(h.ctx(), h.store.db, `SELECT COUNT(*) FROM usages WHERE request_id = ?`, req.ID)
+	if err != nil || n != 1 {
+		t.Fatalf("usages = %d (%v), want the execution stored", n, err)
+	}
+	// The unrepresentable amount is reported as unpriced rather than corrupting
+	// or failing the whole report.
+	cost, unpriced := h.costOf(key.ID)
+	if cost != 0 || unpriced != 1 {
+		t.Fatalf("cost = %d/%d, want the overflowing execution unpriced", cost, unpriced)
+	}
+}
+
+// TestDerivedAmountsAreExactIntegers keeps money exact beyond 2^53: a large but
+// representable amount must round-trip as an exact integer microUSD value.
+func TestDerivedAmountsAreExactIntegers(t *testing.T) {
+	h := newHarness(t)
+	// 1 microUSD per 1M tokens with 1e16 tokens: 1e16 microUSD exactly, both
+	// well beyond 2^53 and still far below MaxInt64.
+	h.mustPrice("m1", Rates{Input: 1_000_000})
+	key, _ := h.mustKey(KeySpec{Enabled: true})
+	const bigTokens = int64(10_000_000_000_000_000)
+	req := h.mustAdmit(AdmitInput{ID: "r1", TraceID: "t1", KeyID: key.ID, RequestedModel: "m1"})
+	h.mustUsage(usageFor("u1", req, "m1", tokens(bigTokens, 0, 0, 0, 0)))
+	h.mustComplete(Completion{ID: req.ID, TraceID: req.TraceID, Outcome: OutcomeSucceeded})
+	const want = int64(10_000_000_000_000_000)
+	if cost, unpriced := h.costOf(key.ID); cost != want || unpriced != 0 {
+		t.Fatalf("cost = %d/%d, want %d exactly", cost, unpriced, want)
+	}
+	exec := h.request(req.ID).Executions[0]
+	if exec.CostMicroUSD == nil || *exec.CostMicroUSD != want {
+		t.Fatalf("execution cost = %v, want %d", exec.CostMicroUSD, want)
+	}
+	// The stored tokens round-trip without loss.
+	if exec.Tokens.Input != bigTokens || exec.Tokens.Total != bigTokens {
+		t.Fatalf("stored tokens = %+v, want %d preserved", exec.Tokens, bigTokens)
+	}
+	if bigTokens <= 1<<53 || want <= 1<<53 {
+		t.Fatal("the case must exceed 2^53 to be meaningful")
+	}
+}
+
+// TestLateCompletionAfterRestartKeepsRecordedOutcome proves the restart
+// transition and a later completion agree: the request stays pending until its
+// usage is trustworthy, a completion that agrees is idempotent, and a
+// disagreeing one is refused.
+func TestLateCompletionAfterRestartKeepsRecordedOutcome(t *testing.T) {
 	h := newHarness(t)
 	h.mustPrice("m1", Rates{Input: million})
 	key, _ := h.mustKey(KeySpec{Enabled: true})
 	ctx := h.ctx()
 
-	req := h.mustAdmit(AdmitInput{ID: "r1", TraceID: "t1", KeyID: key.ID,
-		RequestedModel: "m1"})
-	// A restart turns the in flight execution into pending without an outcome,
-	// which is exactly what an administrator then has to decide about.
+	req := h.mustAdmit(AdmitInput{ID: "r1", TraceID: "t1", KeyID: key.ID, RequestedModel: "m1"})
+	// A restart turns the in flight execution into pending without an outcome.
 	if err := h.store.Close(); err != nil {
 		t.Fatalf("close: %v", err)
 	}
@@ -1166,33 +1128,21 @@ func TestLateCompletionAfterManualResolve(t *testing.T) {
 	if got := h.request(req.ID); got.State != statePending || got.Outcome != "" {
 		t.Fatalf("after restart = %+v, want a pending request without outcome", got)
 	}
-	if err := h.store.Resolve(ctx, req.ID, Resolution{Action: ActionRelease, Reason: "operator"}); err != nil {
-		t.Fatalf("resolve: %v", err)
-	}
-	settled := h.request(req.ID)
-	if settled.State != stateSettled {
-		t.Fatalf("state = %q, want settled", settled.State)
-	}
-	spent := h.key(key.ID).SpentMicroUSD
-
-	// The first late completion records the outcome only.
+	// A completion with no trustworthy usage cannot close it.
 	h.mustComplete(Completion{ID: req.ID, TraceID: req.TraceID, Outcome: OutcomeSucceeded, StatusCode: 200})
-	after := h.request(req.ID)
-	if after.State != stateSettled || after.Outcome != OutcomeSucceeded {
-		t.Fatalf("late completion = %+v, want settled with the outcome recorded", after)
+	if got := h.request(req.ID); got.State != statePending || got.Outcome != OutcomeSucceeded {
+		t.Fatalf("after completion = %+v, want pending with the outcome recorded", got)
 	}
-	if k := h.key(key.ID); k.SpentMicroUSD != spent {
-		t.Fatalf("late completion changed money: spent %d, want %d", k.SpentMicroUSD, spent)
+	// The late usage then settles it, and the amount is derived, not stored.
+	h.mustUsage(usageFor("u1", req, "m1", tokens(100, 0, 0, 0, 0)))
+	if got := h.request(req.ID); got.State != stateSettled {
+		t.Fatalf("state = %q, want settled", got.State)
 	}
-	var resolved string
-	if err := h.store.db.QueryRow(`SELECT resolved FROM requests WHERE id = ?`, req.ID).Scan(&resolved); err != nil {
-		t.Fatalf("read resolved: %v", err)
+	if cost, _ := h.costOf(key.ID); cost != 100 {
+		t.Fatalf("cost = %d, want 100", cost)
 	}
-	if resolved != ActionRelease {
-		t.Fatalf("resolved = %q, want the administrator decision kept", resolved)
-	}
-	// Repeating the same completion stays idempotent, so a retried native
-	// event never turns into a failure.
+	// Repeating the same completion stays idempotent, so a retried native event
+	// never turns into a failure.
 	if err := h.store.Complete(ctx, Completion{ID: req.ID, TraceID: req.TraceID,
 		Outcome: OutcomeSucceeded, StatusCode: 200}); err != nil {
 		t.Fatalf("repeated late completion: %v", err)
@@ -1202,8 +1152,8 @@ func TestLateCompletionAfterManualResolve(t *testing.T) {
 		Outcome: OutcomeFailed, StatusCode: 500}); !errors.Is(err, ErrConflict) {
 		t.Fatalf("conflicting completion err = %v, want ErrConflict", err)
 	}
-	if k := h.key(key.ID); k.SpentMicroUSD != spent {
-		t.Fatalf("refused completions changed money: %+v", k)
+	if cost, _ := h.costOf(key.ID); cost != 100 {
+		t.Fatalf("refused completions changed cost: %d", cost)
 	}
 }
 
@@ -1216,14 +1166,13 @@ func TestLateUnaccountedExecutionReopensSettledRequest(t *testing.T) {
 	key, _ := h.mustKey(KeySpec{Enabled: true})
 	ctx := h.ctx()
 
-	req := h.mustAdmit(AdmitInput{ID: "r1", TraceID: "t1", KeyID: key.ID,
-		RequestedModel: "m1"})
+	req := h.mustAdmit(AdmitInput{ID: "r1", TraceID: "t1", KeyID: key.ID, RequestedModel: "m1"})
 	h.mustUsage(usageFor("u1", req, "m1", tokens(9, 0, 0, 0, 0)))
 	h.mustComplete(Completion{ID: req.ID, TraceID: req.TraceID, Outcome: OutcomeSucceeded})
 	if got := h.request(req.ID); got.State != stateSettled {
 		t.Fatalf("state = %q, want settled", got.State)
 	}
-	spent := h.key(key.ID).SpentMicroUSD
+	cost := h.report(key.ID).Summary.CostMicroUSD
 
 	late := usageFor("u2", req, "m1", Tokens{})
 	late.Quality = QualityUnknown
@@ -1232,58 +1181,25 @@ func TestLateUnaccountedExecutionReopensSettledRequest(t *testing.T) {
 	if got.State != statePending {
 		t.Fatalf("state = %q, want pending after a late unaccounted execution", got.State)
 	}
-	if k := h.key(key.ID); k.SpentMicroUSD != spent {
-		t.Fatalf("reopening moved money: %+v, want spent %d", k, spent)
+	if after := h.report(key.ID).Summary.CostMicroUSD; after != cost {
+		t.Fatalf("reopening changed cost: %d, want %d", after, cost)
 	}
-	// A second unknown event is idempotent and moves nothing.
+	// A second unknown event is idempotent and adds one more unpriced execution.
 	second := usageFor("u3", req, "m1", Tokens{})
 	second.Quality = QualityUnknown
 	h.mustUsage(second)
-	if k := h.key(key.ID); k.SpentMicroUSD != spent {
-		t.Fatalf("second unknown event moved money: %+v, want spent %d", k, spent)
+	sum := h.report(key.ID).Summary
+	if sum.CostMicroUSD != cost || sum.UnpricedExecutions != 2 {
+		t.Fatalf("summary after second unknown event = %+v, want cost %d and 2 unpriced", sum, cost)
 	}
-	// Only an administrator can close it again.
 	if has, err := h.store.HasActive(ctx); err != nil || has {
 		t.Fatalf("HasActive = %v/%v, want false for a pending request", has, err)
-	}
-	if err := h.store.Resolve(ctx, req.ID, Resolution{Action: ActionCharge, AmountMicroUSD: 30,
-		Reason: "unaccounted execution"}); err != nil {
-		t.Fatalf("resolve: %v", err)
-	}
-	if k := h.key(key.ID); k.SpentMicroUSD != spent+30 {
-		t.Fatalf("after resolution = %+v, want spent %d", k, spent+30)
-	}
-
-	// A late known execution is charged without reopening anything, and a
-	// manually resolved request is never reopened behind the administrator.
-	lateKnown := h.mustAdmit(AdmitInput{ID: "r2", TraceID: "t2", KeyID: key.ID,
-		RequestedModel: "m1"})
-	h.mustUsage(usageFor("u4", lateKnown, "m1", tokens(4, 0, 0, 0, 0)))
-	if k := h.key(key.ID); k.SpentMicroUSD != spent+30+4 {
-		t.Fatalf("late known execution was not charged: %+v", k)
-	}
-	manual := h.mustAdmit(AdmitInput{ID: "r3", TraceID: "t3", KeyID: key.ID,
-		RequestedModel: "m1"})
-	h.mustComplete(Completion{ID: manual.ID, TraceID: manual.TraceID, Outcome: OutcomeFailed, StatusCode: 502})
-	if err := h.store.Resolve(ctx, manual.ID, Resolution{Action: ActionCharge, AmountMicroUSD: 11, Reason: "manual"}); err != nil {
-		t.Fatalf("resolve manual: %v", err)
-	}
-	afterManual := h.key(key.ID).SpentMicroUSD
-	unknownForManual := usageFor("u5", manual, "m1", Tokens{})
-	unknownForManual.Quality = QualityUnknown
-	h.mustUsage(unknownForManual)
-	if got := h.request(manual.ID); got.State != stateSettled {
-		t.Fatalf("manual resolution was reopened: %+v", got)
-	}
-	// Only the manual request must not have come back to life.
-	if k := h.key(key.ID); k.SpentMicroUSD != afterManual {
-		t.Fatalf("manual resolution changed the ledger: %+v, want spent %d", k, afterManual)
 	}
 }
 
 // TestFailedExecutionDoesNotProveSuccess keeps the success outcome honest: a
 // reliable but failed lifecycle event never closes a successful request, while
-// a failed request with accounted cost still settles.
+// a failed request with accounted usage still settles.
 func TestFailedExecutionDoesNotProveSuccess(t *testing.T) {
 	h := newHarness(t)
 	h.mustPrice("m1", Rates{Input: million})
@@ -1346,53 +1262,7 @@ func TestUsageReplayWithoutTimestamp(t *testing.T) {
 		`SELECT COUNT(*) FROM usages WHERE request_id = ?`, req.ID); err != nil || n != 1 {
 		t.Fatalf("usages = %d (%v), want a single execution", n, err)
 	}
-	if k := h.key(key.ID); k.SpentMicroUSD != 10 {
-		t.Fatalf("spent = %d, want a single charge", k.SpentMicroUSD)
-	}
-}
-
-// TestCompletionAfterManualResolveKeepsRecordedOutcome covers a request that
-// completed normally and was then closed by an administrator: the recorded
-// outcome stays authoritative and is never rewritten by a later completion.
-func TestCompletionAfterManualResolveKeepsRecordedOutcome(t *testing.T) {
-	h := newHarness(t)
-	h.mustPrice("m1", Rates{Input: million})
-	key, _ := h.mustKey(KeySpec{Enabled: true})
-	ctx := h.ctx()
-	req := h.mustAdmit(AdmitInput{ID: "r1", TraceID: "t1", KeyID: key.ID,
-		RequestedModel: "m1"})
-
-	h.mustComplete(Completion{ID: req.ID, TraceID: req.TraceID, Outcome: OutcomeFailed, StatusCode: 502})
-	// An unresolved request repeats its outcome idempotently.
-	if err := h.store.Complete(ctx, Completion{ID: req.ID, TraceID: req.TraceID,
-		Outcome: OutcomeFailed, StatusCode: 502}); err != nil {
-		t.Fatalf("repeat before resolve: %v", err)
-	}
-	if got := h.request(req.ID); got.State != statePending || got.Outcome != OutcomeFailed {
-		t.Fatalf("before resolve = %+v, want a pending failure", got)
-	}
-	if err := h.store.Resolve(ctx, req.ID, Resolution{Action: ActionRelease, Reason: "operator"}); err != nil {
-		t.Fatalf("resolve: %v", err)
-	}
-	// The same completion is still a no-op once the request is closed.
-	if err := h.store.Complete(ctx, Completion{ID: req.ID, TraceID: req.TraceID,
-		Outcome: OutcomeFailed, StatusCode: 502}); err != nil {
-		t.Fatalf("repeat after resolve: %v", err)
-	}
-	// A different outcome must not be mistaken for a first late completion.
-	if err := h.store.Complete(ctx, Completion{ID: req.ID, TraceID: req.TraceID,
-		Outcome: OutcomeSucceeded, StatusCode: 200}); !errors.Is(err, ErrConflict) {
-		t.Fatalf("changed outcome err = %v, want ErrConflict", err)
-	}
-	if err := h.store.Complete(ctx, Completion{ID: req.ID, TraceID: req.TraceID,
-		Outcome: OutcomeFailed, StatusCode: 500}); !errors.Is(err, ErrConflict) {
-		t.Fatalf("changed status err = %v, want ErrConflict", err)
-	}
-	got := h.request(req.ID)
-	if got.State != stateSettled || got.Outcome != OutcomeFailed {
-		t.Fatalf("request = %+v, want the recorded failure kept", got)
-	}
-	if k := h.key(key.ID); k.SpentMicroUSD != 0 {
-		t.Fatalf("money changed: %+v", k)
+	if cost, _ := h.costOf(key.ID); cost != 10 {
+		t.Fatalf("cost = %d, want a single 10 microUSD charge", cost)
 	}
 }

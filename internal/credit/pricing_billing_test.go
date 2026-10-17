@@ -1,48 +1,47 @@
 package credit
 
 import (
-	"context"
 	"errors"
 	"math"
 	"testing"
 )
 
-// TestTierSelectionAdmitAndSettlement pins the tier contract: settlement applies
-// the matching service tier, else the highest context tier reached by the actual
-// canonical prompt size, which includes cache read and cache write. Admission
-// itself prices nothing.
-func TestTierSelectionAdmitAndSettlement(t *testing.T) {
+// TestTierSelectionPricesFromTheLog pins the tier contract at read time: the
+// matching service tier wins, else the highest context tier reached by the actual
+// canonical prompt size, which includes cache read and cache write.
+func TestTierSelectionPricesFromTheLog(t *testing.T) {
 	h, key := billingHarness(t)
 	h.mustRule(PricingRule{ID: "tiers", MatchKind: MatchExact, Pattern: "m1", Priority: 5, Enabled: true,
 		Price: Price{Rates: Rates{Input: million, Output: 2 * million}},
 		Tiers: []PriceTier{
 			{Kind: priceTierContext, Threshold: 100, Label: "100K", Rates: Rates{Input: 5 * million}},
 			{Kind: priceTierService, Service: "priority", Rates: Rates{Output: 9 * million}}}})
-	// The service tier wins over the reached context tier at settlement.
+	// The service tier wins over the reached context tier.
 	req := h.mustAdmit(AdmitInput{ID: "r1", TraceID: "t1", KeyID: key.ID, RequestedModel: "m1", ServiceTier: "PRIORITY"})
 	h.mustUsage(usageFor("u1", req, "m1", tokens(150, 0, 0, 10, 0)))
 	h.mustComplete(Completion{ID: req.ID, TraceID: req.TraceID, Outcome: OutcomeSucceeded})
-	if key = h.key(key.ID); key.SpentMicroUSD != 240 {
-		t.Fatalf("service-tier settlement spent = %d, want 240", key.SpentMicroUSD)
+	if cost, unpriced := h.costOf(key.ID); cost != 240 || unpriced != 0 {
+		t.Fatalf("service-tier cost = %d/%d, want 240", cost, unpriced)
 	}
-	// Without a service tier the context tier applies at settlement, and the
-	// context size counts uncached input plus cache read plus cache write.
+	// Without a service tier the context tier applies, and the context size counts
+	// uncached input plus cache read plus cache write.
 	req2 := h.mustAdmit(AdmitInput{ID: "r2", TraceID: "t2", KeyID: key.ID, RequestedModel: "m1"})
 	h.mustUsage(usageFor("u2", req2, "m1", tokens(50, 60, 0, 10, 0)))
 	h.mustComplete(Completion{ID: req2.ID, TraceID: req2.TraceID, Outcome: OutcomeSucceeded})
-	if key = h.key(key.ID); key.SpentMicroUSD != 240+270 {
-		t.Fatalf("context settlement spent = %d, want 510", key.SpentMicroUSD)
+	if cost, _ := h.costOf(key.ID); cost != 240+270 {
+		t.Fatalf("context-tier cost = %d, want 510", cost)
 	}
-	// An unrecognized service tier falls back to the base rates.
+	// An unrecognized service tier stays below the context threshold and falls
+	// back to the base rates.
 	req3 := h.mustAdmit(AdmitInput{ID: "r3", TraceID: "t3", KeyID: key.ID, RequestedModel: "m1", ServiceTier: "weird"})
 	h.mustUsage(usageFor("u3", req3, "m1", tokens(0, 0, 0, 10, 0)))
 	h.mustComplete(Completion{ID: req3.ID, TraceID: req3.TraceID, Outcome: OutcomeSucceeded})
-	if key = h.key(key.ID); key.SpentMicroUSD != 240+270+20 {
-		t.Fatalf("unknown tier spent = %d, want 530", key.SpentMicroUSD)
+	if cost, _ := h.costOf(key.ID); cost != 240+270+20 {
+		t.Fatalf("unknown-tier cost = %d, want 530", cost)
 	}
 }
 
-// TestServiceTierNormalization pins the canonical billing keys.
+// TestServiceTierNormalization pins the canonical tier keys.
 func TestServiceTierNormalization(t *testing.T) {
 	for input, want := range map[string]string{
 		"": "", " ": "", "auto": "", "default": "", "standard": "", "on-demand": "",
@@ -55,139 +54,89 @@ func TestServiceTierNormalization(t *testing.T) {
 }
 
 // TestTokenCostRoundsOnceOverTheSum pins the exact integer contract: buckets are
-// summed exactly and rounded up once, never per bucket, and a positive priced
-// usage is never free.
+// summed exactly and rounded up once, never per bucket, and an all-zero rate card
+// is an explicit free price.
 func TestTokenCostRoundsOnceOverTheSum(t *testing.T) {
-	one := Price{Rates: Rates{Input: 1, Output: 1}}
-	got, err := computeCost(one, Tokens{Input: 1, Output: 1})
+	one := Rates{Input: 1, Output: 1}
+	got, err := ratesCost(one, Tokens{Input: 1, Output: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if got != 1 {
 		t.Fatalf("two single-microUSD buckets = %d, want one rounded microUSD", got)
 	}
-	single, err := computeCost(one, Tokens{Input: 1})
+	single, err := ratesCost(one, Tokens{Input: 1})
 	if err != nil || single != 1 {
 		t.Fatalf("single bucket = %d %v, want 1", single, err)
 	}
-	if zero, err := computeCost(Price{}, Tokens{Input: 1, Output: 1}); err != nil || zero != 0 {
+	if zero, err := ratesCost(Rates{}, Tokens{Input: 1, Output: 1}); err != nil || zero != 0 {
 		t.Fatalf("free price = %d %v, want 0", zero, err)
 	}
 }
 
-// TestCostOverflowIsRejected protects the integer ledger from silent wraparound.
+// TestCostOverflowIsRejected protects the derived integer arithmetic from silent
+// wraparound.
 func TestCostOverflowIsRejected(t *testing.T) {
-	if _, err := computeCost(Price{Rates: Rates{Input: math.MaxInt64}}, Tokens{Input: math.MaxInt64}); !errors.Is(err, ErrInvalid) {
+	if _, err := ratesCost(Rates{Input: math.MaxInt64}, Tokens{Input: math.MaxInt64}); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("token cost overflow err = %v, want ErrInvalid", err)
 	}
 	if _, err := perImageCost(Price{BillingMode: billingPerImage, PerImageMicroUSD: math.MaxInt64}, 2); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("per-image overflow err = %v, want ErrInvalid", err)
 	}
-	// Admission never estimates a cost, so an overflowing price is caught when
-	// the actual usage is priced, not at admission.
-	h, key := billingHarness(t)
-	if err := h.store.PutPrice(context.Background(), Price{Model: "huge", Rates: Rates{Input: math.MaxInt64}}); err != nil {
-		t.Fatal(err)
+	// The step sum itself is overflow checked, so a selection whose priced
+	// executions exceed int64 fails loudly instead of wrapping.
+	tally := costTally{}
+	if err := tally.add(math.MaxInt64, true); err != nil {
+		t.Fatalf("first add: %v", err)
 	}
-	req := h.mustAdmit(AdmitInput{ID: "r1", TraceID: "t1", KeyID: key.ID,
-		RequestedModel: "huge"})
-	// Raw is left empty so the failure comes from pricing the tokens against
-	// the huge rate, not from an overflowing raw counter sum.
-	u := Usage{ID: "u1", RequestID: req.ID, TraceID: req.TraceID, KeyID: key.ID,
-		Model: "huge", Tokens: tokens(math.MaxInt64, 0, 0, 0, 0), Quality: QualityComplete}
-	if err := h.store.RecordUsage(h.ctx(), u); !errors.Is(err, ErrInvalid) {
-		t.Fatalf("overflowing usage err = %v, want ErrInvalid", err)
+	if err := tally.add(math.MaxInt64, true); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("sum overflow err = %v, want ErrInvalid", err)
 	}
 }
 
-// TestPerImageBillingOnceOnProvenSuccess pins the per-image financial contract:
-// the frozen requested count is billed exactly once, on a proven successful
-// lifecycle, never per attempt and never for a failed lifecycle.
-func TestPerImageBillingOnceOnProvenSuccess(t *testing.T) {
-	h, key := billingHarness(t)
+// TestPerImagePriceIsPreviewedButNeverLogged makes the image decision explicit:
+// the operator can still define and preview a per-image price, but recorded
+// executions of that model stay unpriced because the host reports no real image
+// count.
+func TestPerImagePriceIsPreviewedButNeverLogged(t *testing.T) {
+	h := newHarness(t)
 	if err := h.store.PutPrice(h.ctx(), Price{Model: "img", BillingMode: billingPerImage, PerImageMicroUSD: 50_000}); err != nil {
 		t.Fatal(err)
 	}
-	req := h.mustAdmit(AdmitInput{ID: "r1", TraceID: "t1", KeyID: key.ID, RequestedModel: "img", ImageCount: 3, ImageCountDeclared: true})
-	// A failed first attempt and a successful retry must still bill one count.
+	key, _ := h.mustKey(KeySpec{Enabled: true})
+	req := h.mustAdmit(AdmitInput{ID: "r1", TraceID: "t1", KeyID: key.ID, RequestedModel: "img"})
+	// A failed first attempt and a successful retry are both recorded, and both
+	// stay unpriced: no per-execution image count can be proven from the log.
 	attempt := usageFor("u-failed", req, "img", tokens(1, 0, 0, 1, 0))
 	attempt.Failed = true
 	h.mustUsage(attempt)
 	h.mustUsage(usageFor("u-ok", req, "img", tokens(1, 0, 0, 1, 0)))
 	h.mustComplete(Completion{ID: req.ID, TraceID: req.TraceID, Outcome: OutcomeSucceeded})
-	if key = h.key(key.ID); key.SpentMicroUSD != 150_000 {
-		t.Fatalf("per-image spent=%d, want 150000", key.SpentMicroUSD)
+	if got := h.request(req.ID); got.State != stateSettled {
+		t.Fatalf("state = %s, want settled", got.State)
 	}
-	// A replay of the successful attempt must not double charge.
-	h.mustUsage(usageFor("u-ok", req, "img", tokens(1, 0, 0, 1, 0)))
-	if key = h.key(key.ID); key.SpentMicroUSD != 150_000 {
-		t.Fatalf("replay double charged: spent=%d", key.SpentMicroUSD)
+	if cost, unpriced := h.costOf(key.ID); cost != 0 || unpriced != 2 {
+		t.Fatalf("per-image cost = %d/%d, want 0 cost and 2 unpriced executions", cost, unpriced)
 	}
-}
-
-// TestPerImageFailedLifecycleIsNotCharged pins that a failed lifecycle never
-// bills the requested images.
-func TestPerImageFailedLifecycleIsNotCharged(t *testing.T) {
-	h, key := billingHarness(t)
-	if err := h.store.PutPrice(h.ctx(), Price{Model: "img", BillingMode: billingPerImage, PerImageMicroUSD: 50_000}); err != nil {
-		t.Fatal(err)
+	for _, exec := range h.request(req.ID).Executions {
+		if exec.CostMicroUSD != nil {
+			t.Fatalf("per-image execution %s cost = %d, want null", exec.ID, *exec.CostMicroUSD)
+		}
 	}
-	req := h.mustAdmit(AdmitInput{ID: "r1", TraceID: "t1", KeyID: key.ID, RequestedModel: "img", ImageCount: 2, ImageCountDeclared: true})
-	h.mustUsage(usageFor("u1", req, "img", tokens(1, 0, 0, 1, 0)))
-	h.mustComplete(Completion{ID: req.ID, TraceID: req.TraceID, Outcome: OutcomeFailed})
-	if key = h.key(key.ID); key.SpentMicroUSD != 0 {
-		t.Fatalf("failed lifecycle spent=%d, want 0", key.SpentMicroUSD)
+	// The preview still describes the price exactly.
+	match, err := h.store.PreviewPrice(h.ctx(), "img", "", 0)
+	if err != nil {
+		t.Fatalf("preview: %v", err)
+	}
+	if match.BillingMode != billingPerImage || match.CostMicroUSD != 50_000 {
+		t.Fatalf("preview = %+v, want a per-image price of 50000", match)
 	}
 }
 
-// TestPerImageSucceededWithoutUsageStaysPending pins that a successful lifecycle
-// with no usage is not written off: the request stays pending until trustworthy
-// usage arrives, and only then is the frozen count billed once.
-func TestPerImageSucceededWithoutUsageStaysPending(t *testing.T) {
-	h, key := billingHarness(t)
-	if err := h.store.PutPrice(h.ctx(), Price{Model: "img", BillingMode: billingPerImage, PerImageMicroUSD: 50_000}); err != nil {
-		t.Fatal(err)
-	}
-	req := h.mustAdmit(AdmitInput{ID: "r1", TraceID: "t1", KeyID: key.ID, RequestedModel: "img", ImageCount: 2, ImageCountDeclared: true})
-	h.mustComplete(Completion{ID: req.ID, TraceID: req.TraceID, Outcome: OutcomeSucceeded})
-	if got := h.request(req.ID); got.State != statePending {
-		t.Fatalf("state = %s, want pending while no usage proves the images", got.State)
-	}
-	if key = h.key(key.ID); key.SpentMicroUSD != 0 {
-		t.Fatalf("pending per-image spent=%d, want 0", key.SpentMicroUSD)
-	}
-	// A late trustworthy usage books the frozen count once and settles.
-	h.mustUsage(usageFor("u-late", req, "img", tokens(1, 0, 0, 1, 0)))
-	if key = h.key(key.ID); key.SpentMicroUSD != 100_000 {
-		t.Fatalf("late usage spent=%d, want 100000", key.SpentMicroUSD)
-	}
-}
-
-// TestPerImageUnknownUsageStaysPending pins that untrustworthy accounting never
-// pays for images silently.
-func TestPerImageUnknownUsageStaysPending(t *testing.T) {
-	h, key := billingHarness(t)
-	if err := h.store.PutPrice(h.ctx(), Price{Model: "img", BillingMode: billingPerImage, PerImageMicroUSD: 50_000}); err != nil {
-		t.Fatal(err)
-	}
-	req := h.mustAdmit(AdmitInput{ID: "r1", TraceID: "t1", KeyID: key.ID, RequestedModel: "img", ImageCount: 1, ImageCountDeclared: true})
-	unknown := usageFor("u-unknown", req, "img", Tokens{})
-	unknown.Quality = QualityUnknown
-	h.mustUsage(unknown)
-	h.mustComplete(Completion{ID: req.ID, TraceID: req.TraceID, Outcome: OutcomeSucceeded})
-	if got := h.request(req.ID); got.State != statePending {
-		t.Fatalf("state = %s, want pending for unknown accounting", got.State)
-	}
-	if key = h.key(key.ID); key.SpentMicroUSD != 0 {
-		t.Fatalf("unknown accounting spent=%d, want 0", key.SpentMicroUSD)
-	}
-}
-
-// TestUsageServiceTierReplayAndFrozenFallback pins that the billed tier is
-// persisted and part of the replay identity, that an omitted tier falls back to
-// the tier frozen at admission, and that a mismatching tier conflicts instead of
-// silently repricing.
-func TestUsageServiceTierReplayAndFrozenFallback(t *testing.T) {
+// TestUsageServiceTierReplayAndFallback pins that the reported tier is persisted
+// and part of the replay identity, that an omitted tier falls back to the request
+// tier, and that a mismatching tier conflicts instead of silently repricing.
+func TestUsageServiceTierReplayAndFallback(t *testing.T) {
 	h, key := billingHarness(t)
 	h.mustRule(PricingRule{ID: "svc", MatchKind: MatchExact, Pattern: "m1", Priority: 5, Enabled: true,
 		Price: Price{Rates: Rates{Input: million, Output: 2 * million}},
@@ -198,23 +147,23 @@ func TestUsageServiceTierReplayAndFrozenFallback(t *testing.T) {
 	usage := usageFor("u1", req, "m1", tokens(0, 0, 0, 10, 0))
 	usage.ServiceTier = "priority"
 	h.mustUsage(usage)
-	if key = h.key(key.ID); key.SpentMicroUSD != 90 {
-		t.Fatalf("priority spent = %d, want 90", key.SpentMicroUSD)
+	if cost, _ := h.costOf(key.ID); cost != 90 {
+		t.Fatalf("priority cost = %d, want 90", cost)
 	}
 	h.mustUsage(usage) // identical replay
-	if key = h.key(key.ID); key.SpentMicroUSD != 90 {
-		t.Fatalf("replay changed spend: %d", key.SpentMicroUSD)
+	if cost, _ := h.costOf(key.ID); cost != 90 {
+		t.Fatalf("replay changed cost: %d", cost)
 	}
 	conflict := usage
 	conflict.ServiceTier = "flex"
 	if err := h.store.RecordUsage(h.ctx(), conflict); !errors.Is(err, ErrConflict) {
 		t.Fatalf("mismatching tier replay err = %v, want ErrConflict", err)
 	}
-	// An omitted tier uses the tier frozen at admission and persists it.
+	// An omitted tier uses the request tier and persists it.
 	req2 := h.mustAdmit(AdmitInput{ID: "r2", TraceID: "t2", KeyID: key.ID, RequestedModel: "m1", ServiceTier: "flex"})
 	h.mustUsage(usageFor("u2", req2, "m1", tokens(0, 0, 0, 10, 0)))
-	if key = h.key(key.ID); key.SpentMicroUSD != 130 {
-		t.Fatalf("frozen flex spent = %d, want 130", key.SpentMicroUSD)
+	if cost, _ := h.costOf(key.ID); cost != 130 {
+		t.Fatalf("inherited flex cost = %d, want 130", cost)
 	}
 	execs := h.request(req2.ID).Executions
 	if len(execs) != 1 || execs[0].ServiceTier != "flex" {
@@ -224,28 +173,26 @@ func TestUsageServiceTierReplayAndFrozenFallback(t *testing.T) {
 
 // TestUsageReportedDefaultTierStaysBase pins the presence semantics of the
 // reported service tier: an explicitly reported tier that means "no special
-// tier" must bill the base rate instead of inheriting the tier frozen at
-// admission. Inheriting the frozen priority tier would overcharge a request
-// whose upstream answered on the default tier, and it would also make the
-// persisted replay identity lie about what was billed.
+// tier" must price at the base rate instead of inheriting the request tier.
+// Inheriting it would overcharge a request whose upstream answered on the
+// default tier, and it would also make the persisted replay identity lie.
 func TestUsageReportedDefaultTierStaysBase(t *testing.T) {
 	h, key := billingHarness(t)
 	h.mustRule(PricingRule{ID: "svc", MatchKind: MatchExact, Pattern: "m1", Priority: 5, Enabled: true,
 		Price: Price{Rates: Rates{Input: million, Output: 2 * million}},
 		Tiers: []PriceTier{{Kind: priceTierService, Service: "priority", Rates: Rates{Output: 9 * million}}}})
 
-	// The request asks for priority, so priority is frozen on the snapshot.
+	// The request asks for priority, so priority is the request tier fact.
 	req := h.mustAdmit(AdmitInput{ID: "r1", TraceID: "t1", KeyID: key.ID,
 		RequestedModel: "m1", ServiceTier: "priority"})
 
-	// The upstream explicitly reports the default tier: ten output tokens bill
-	// at the base rate (20), not at the frozen priority rate (90).
+	// The upstream explicitly reports the default tier: ten output tokens price
+	// at the base rate (20), not at the request's priority rate (90).
 	usage := usageFor("u1", req, "m1", tokens(0, 0, 0, 10, 0))
 	usage.ServiceTier = "default"
 	h.mustUsage(usage)
-	if key = h.key(key.ID); key.SpentMicroUSD != 20 {
-		t.Fatalf("reported default tier spent = %d, want 20: a reported default must not inherit frozen priority",
-			key.SpentMicroUSD)
+	if cost, _ := h.costOf(key.ID); cost != 20 {
+		t.Fatalf("reported default tier cost = %d, want 20: a reported default must not inherit the request tier", cost)
 	}
 	if tier := h.request(req.ID).Executions[0].ServiceTier; tier != "" {
 		t.Fatalf("persisted tier = %q, want the normalized none", tier)
@@ -255,136 +202,33 @@ func TestUsageReportedDefaultTierStaysBase(t *testing.T) {
 	replay := usage
 	replay.ServiceTier = "auto"
 	h.mustUsage(replay)
-	if key = h.key(key.ID); key.SpentMicroUSD != 20 {
-		t.Fatalf("normalized alias replay charged again: %d", key.SpentMicroUSD)
+	if cost, _ := h.costOf(key.ID); cost != 20 {
+		t.Fatalf("normalized alias replay charged again: %d", cost)
 	}
-	// An omitted tier is a different statement: it falls back to the frozen one.
+	// An omitted tier is a different statement: it falls back to the request tier.
 	req2 := h.mustAdmit(AdmitInput{ID: "r2", TraceID: "t2", KeyID: key.ID,
 		RequestedModel: "m1", ServiceTier: "priority"})
 	h.mustUsage(usageFor("u2", req2, "m1", tokens(0, 0, 0, 10, 0)))
-	if key = h.key(key.ID); key.SpentMicroUSD != 110 {
-		t.Fatalf("omitted-tier spent = %d, want 110 (20 base + 90 frozen priority)", key.SpentMicroUSD)
+	if cost, _ := h.costOf(key.ID); cost != 110 {
+		t.Fatalf("omitted-tier cost = %d, want 110 (20 base + 90 inherited priority)", cost)
 	}
 	if tier := h.request(req2.ID).Executions[0].ServiceTier; tier != "priority" {
-		t.Fatalf("persisted frozen tier = %q, want priority", tier)
+		t.Fatalf("persisted inherited tier = %q, want priority", tier)
 	}
 }
 
-// TestPerImageChargeReconcilesReportAndLedger pins the accounting conservation
-// contract: every per-image attempt is recorded as a known cost (zero for an
-// attempt), exactly one successful execution carries the single lifecycle
-// charge, and the report cost plus manual adjustments reconciles with the key
-// ledger that was actually charged.
-func TestPerImageChargeReconcilesReportAndLedger(t *testing.T) {
+// TestDisabledRuleIsSkippedForPricing pins that a disabled rule simply stops
+// participating in pricing: the exact price book entry behind it wins instead of
+// the model becoming unpriced or denied.
+func TestDisabledRuleIsSkippedForPricing(t *testing.T) {
 	h, key := billingHarness(t)
-	if err := h.store.PutPrice(h.ctx(), Price{Model: "img", BillingMode: billingPerImage, PerImageMicroUSD: 50_000}); err != nil {
-		t.Fatal(err)
-	}
-	req := h.mustAdmit(AdmitInput{ID: "r1", TraceID: "t1", KeyID: key.ID, RequestedModel: "img",
-		ImageCount: 2, ImageCountDeclared: true})
-	failed := usageFor("u-failed", req, "img", tokens(1, 0, 0, 1, 0))
-	failed.Failed = true
-	h.mustUsage(failed)
-	h.mustUsage(usageFor("u-ok", req, "img", tokens(1, 0, 0, 1, 0)))
+	h.mustRule(PricingRule{ID: "off", MatchKind: MatchExact, Pattern: "m1", Priority: 5, Enabled: false,
+		Price: Price{Rates: Rates{Input: 500 * million}}})
+	req := h.mustAdmit(AdmitInput{ID: "r1", TraceID: "t1", KeyID: key.ID, RequestedModel: "m1"})
+	h.mustUsage(usageFor("u1", req, "m1", tokens(0, 0, 0, 100, 0)))
 	h.mustComplete(Completion{ID: req.ID, TraceID: req.TraceID, Outcome: OutcomeSucceeded})
-
-	execs := h.request(req.ID).Executions
-	if len(execs) != 2 {
-		t.Fatalf("executions = %d, want 2", len(execs))
-	}
-	costs := map[string]*int64{}
-	for i := range execs {
-		costs[execs[i].ID] = execs[i].CostMicroUSD
-	}
-	if got := costs["u-failed"]; got == nil || *got != 0 {
-		t.Fatalf("failed attempt cost = %v, want a known 0", got)
-	}
-	if got := costs["u-ok"]; got == nil || *got != 100_000 {
-		t.Fatalf("successful execution cost = %v, want the booked 100000", got)
-	}
-	report := h.report(key.ID)
-	if report.Summary.CostMicroUSD != 100_000 || report.Summary.AdjustmentMicroUSD != 0 {
-		t.Fatalf("report cost=%d adjustments=%d, want 100000/0",
-			report.Summary.CostMicroUSD, report.Summary.AdjustmentMicroUSD)
-	}
-	if got := h.key(key.ID).SpentMicroUSD; got != report.Summary.CostMicroUSD+report.Summary.AdjustmentMicroUSD {
-		t.Fatalf("ledger spend %d != report cost %d + adjustments %d", got,
-			report.Summary.CostMicroUSD, report.Summary.AdjustmentMicroUSD)
-	}
-	// A replay of the successful attempt must not move the charge again.
-	h.mustUsage(usageFor("u-ok", req, "img", tokens(1, 0, 0, 1, 0)))
-	if got := h.key(key.ID).SpentMicroUSD; got != 100_000 {
-		t.Fatalf("replay changed the booked charge: %d", got)
-	}
-	// A manual charge on a still-pending per-image request stays an adjustment:
-	// it is neither hidden inside the execution cost nor double counted.
-	req2 := h.mustAdmit(AdmitInput{ID: "r2", TraceID: "t2", KeyID: key.ID, RequestedModel: "img",
-		ImageCount: 1, ImageCountDeclared: true})
-	h.mustComplete(Completion{ID: req2.ID, TraceID: req2.TraceID, Outcome: OutcomeSucceeded})
-	if got := h.request(req2.ID).State; got != statePending {
-		t.Fatalf("succeeded-without-usage state = %s, want pending", got)
-	}
-	if err := h.store.Resolve(h.ctx(), req2.ID, Resolution{
-		Action: ActionCharge, AmountMicroUSD: 50_000, Reason: "manual adjustment"}); err != nil {
-		t.Fatalf("resolve: %v", err)
-	}
-	report = h.report(key.ID)
-	if report.Summary.CostMicroUSD != 100_000 || report.Summary.AdjustmentMicroUSD != 50_000 {
-		t.Fatalf("report after adjustment cost=%d adjustments=%d, want 100000/50000",
-			report.Summary.CostMicroUSD, report.Summary.AdjustmentMicroUSD)
-	}
-	if got := h.key(key.ID).SpentMicroUSD; got != report.Summary.CostMicroUSD+report.Summary.AdjustmentMicroUSD {
-		t.Fatalf("ledger spend after adjustment %d != report cost %d + adjustments %d", got,
-			report.Summary.CostMicroUSD, report.Summary.AdjustmentMicroUSD)
-	}
-}
-
-// TestImageCountFailClosedAtAdmission pins that an unsupported explicit image
-// count is refused for a per-image price instead of being clamped to a billable
-// number, that an omitted count means one image, and that the same hint on a
-// token price is irrelevant rather than a rejection.
-func TestImageCountFailClosedAtAdmission(t *testing.T) {
-	h, key := billingHarness(t)
-	if err := h.store.PutPrice(h.ctx(), Price{Model: "img", BillingMode: billingPerImage, PerImageMicroUSD: 50_000}); err != nil {
-		t.Fatal(err)
-	}
-	for i, count := range []int64{0, -1, 33, 100, math.MaxInt64} {
-		if _, err := h.store.Admit(h.ctx(), AdmitInput{ID: "bad" + string(rune('a'+i)), TraceID: "bt",
-			KeyID: key.ID, RequestedModel: "img", ImageCount: count, ImageCountDeclared: true}); !errors.Is(err, ErrInvalid) {
-			t.Fatalf("declared image count %d err = %v, want ErrInvalid", count, err)
-		}
-	}
-	if got := h.key(key.ID); got.SpentMicroUSD != 0 {
-		t.Fatalf("refused requests charged %d, want 0", got.SpentMicroUSD)
-	}
-	// The supported boundaries are accepted and billed exactly once proven.
-	boundaries := []struct {
-		id    string
-		count int64
-	}{{"one", 1}, {"max", 32}}
-	var want int64
-	for _, tc := range boundaries {
-		req := h.mustAdmit(AdmitInput{ID: tc.id, TraceID: "tr-" + tc.id, KeyID: key.ID,
-			RequestedModel: "img", ImageCount: tc.count, ImageCountDeclared: true})
-		h.mustUsage(usageFor("u-"+tc.id, req, "img", tokens(1, 0, 0, 1, 0)))
-		h.mustComplete(Completion{ID: req.ID, TraceID: req.TraceID, Outcome: OutcomeSucceeded})
-		want += tc.count * 50_000
-		if got := h.key(key.ID).SpentMicroUSD; got != want {
-			t.Fatalf("image count %d billed total = %d, want %d", tc.count, got, want)
-		}
-	}
-	// An omitted count is one image, not a rejection, and bills once proven.
-	req := h.mustAdmit(AdmitInput{ID: "r-omit", TraceID: "t-omit", KeyID: key.ID, RequestedModel: "img"})
-	h.mustUsage(usageFor("u-omit", req, "img", tokens(1, 0, 0, 1, 0)))
-	h.mustComplete(Completion{ID: req.ID, TraceID: req.TraceID, Outcome: OutcomeSucceeded})
-	want += 50_000
-	if got := h.key(key.ID).SpentMicroUSD; got != want {
-		t.Fatalf("omitted-count billed total = %d, want %d", got, want)
-	}
-	// A token price ignores the hint entirely: an image hint is not a billing
-	// input there, so it must never turn into a rejection.
-	if _, err := h.store.Admit(h.ctx(), AdmitInput{ID: "r-tok", TraceID: "t-tok", KeyID: key.ID,
-		RequestedModel: "m1", ImageCount: 100, ImageCountDeclared: true}); err != nil {
-		t.Fatalf("token reserve with an irrelevant image hint err = %v, want nil", err)
+	// The base price book entry (output 2 microUSD/1M) applies: 100 tokens = 200.
+	if cost, unpriced := h.costOf(key.ID); cost != 200 || unpriced != 0 {
+		t.Fatalf("cost = %d/%d, want 200 priced by the price book entry", cost, unpriced)
 	}
 }

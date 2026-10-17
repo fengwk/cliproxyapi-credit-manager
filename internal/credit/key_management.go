@@ -26,7 +26,6 @@ const (
 	ActionPriceUpdate = "price_update"
 	ActionRuleUpdate  = "rule_update"
 	ActionRuleDelete  = "rule_delete"
-	ActionResolve     = "resolve"
 )
 
 // materialKeyDomain separates the key-material encryption key from the key
@@ -52,14 +51,15 @@ type CallerSpec struct {
 	Enabled     bool   `json:"enabled"`
 }
 
-// ResetSpec describes a quota reset. Exactly one scope form (KeyID, IDs, All)
-// and at least one window must be selected, and a non-empty reason is required.
+// ResetSpec describes a token usage reset. Exactly one scope form (KeyID, IDs,
+// All) and at least one window must be selected, and a non-empty reason is
+// required.
 //
-// A reset never deletes history and never zeroes a durable counter. It stores a
-// baseline snapshot per window/period (money) and per model (tokens) so the
-// effective usage an operator sees and admission enforces becomes
-// max(0, durable - baseline). Unresolved requests are untouched, so late charges
-// still count and unknown obligations are never forgiven.
+// A reset only reclaims token headroom: it never deletes history, never zeroes a
+// durable token counter and never touches price, logs or derived cost. It stores
+// a baseline snapshot per model/window so the effective token usage an operator
+// sees and admission enforces becomes max(0, durable - baseline). Unresolved
+// requests are untouched, so late usage still counts.
 type ResetSpec struct {
 	KeyID   string   `json:"id,omitempty"`
 	IDs     []string `json:"ids,omitempty"`
@@ -249,11 +249,12 @@ func (s *Store) DeleteKey(ctx context.Context, id, reason string) error {
 	})
 }
 
-// ResetSpend snapshots reset baselines for the selected keys and windows. It
-// touches neither history nor unresolved requests: lifetime and period counters
-// keep their durable value and only the effective usage is reduced, so a later
-// charge counts again and repeated resets can never go negative or refund.
-func (s *Store) ResetSpend(ctx context.Context, spec ResetSpec) (ResetResult, error) {
+// ResetTokens snapshots token reset baselines for the selected keys and
+// windows. It touches neither history nor unresolved requests: the durable token
+// counters keep their value and only the effective usage is reduced, so later
+// usage counts again and repeated resets can never go negative or refund. No
+// amount, price or log row is read or written.
+func (s *Store) ResetTokens(ctx context.Context, spec ResetSpec) (ResetResult, error) {
 	reason := strings.TrimSpace(spec.Reason)
 	if reason == "" {
 		return ResetResult{}, fmt.Errorf("%w: reset reason is required", ErrInvalid)
@@ -280,11 +281,11 @@ func (s *Store) ResetSpend(ctx context.Context, spec ResetSpec) (ResetResult, er
 				return err
 			}
 			for _, win := range windows {
-				if err := snapshotResetBaseline(ctx, tx, key, win, now); err != nil {
+				if err := snapshotTokenBaseline(ctx, tx, key, win, now); err != nil {
 					return err
 				}
 			}
-			detail := "windows=" + strings.Join(windows, ",")
+			detail := "tokens windows=" + strings.Join(windows, ",")
 			if err := insertAudit(ctx, tx, now, ActionReset, key.id, key.callerID, reason, detail); err != nil {
 				return err
 			}
@@ -379,26 +380,12 @@ func (s *Store) allKeyIDs(ctx context.Context, q querier) ([]string, error) {
 	return ids, rows.Err()
 }
 
-// snapshotResetBaseline records the durable counters of one key and window as
-// the new reset baseline. Money baselines are keyed by window/period; token
-// baselines are stored per model so each model token budget resets
+// snapshotTokenBaseline records the durable token counters of one key and
+// window as the new reset baseline, per model, so each model token budget resets
 // independently. A snapshot never lowers an existing baseline, so a repeated
 // reset can only raise the floor and never refunds usage.
-func snapshotResetBaseline(ctx context.Context, q querier, key *keyRow, win string, at time.Time) error {
+func snapshotTokenBaseline(ctx context.Context, q querier, key *keyRow, win string, at time.Time) error {
 	period := periodOf(win, at)
-	durable := int64(0)
-	if win == windowTotal {
-		durable = key.spent
-	} else {
-		v, err := moneyCounter(ctx, q, key.id, win, period)
-		if err != nil {
-			return err
-		}
-		durable = v
-	}
-	if err := raiseMoneyBaseline(ctx, q, key.id, win, period, durable); err != nil {
-		return err
-	}
 	models, err := tokenModels(ctx, q, key.id)
 	if err != nil {
 		return err
@@ -434,22 +421,6 @@ func tokenModels(ctx context.Context, q querier, keyID string) ([]string, error)
 		models = append(models, model)
 	}
 	return models, rows.Err()
-}
-
-// raiseMoneyBaseline stores max(existing, value) as the money baseline.
-func raiseMoneyBaseline(ctx context.Context, q querier, keyID, win, period string, value int64) error {
-	cur, err := baselineMoney(ctx, q, keyID, win, period)
-	if err != nil {
-		return err
-	}
-	next := max(cur, value)
-	if _, err := q.ExecContext(ctx, `INSERT INTO key_money_baselines(key_id, win, period, micro_usd)
-		VALUES(?,?,?,?)
-		ON CONFLICT(key_id, win, period) DO UPDATE SET micro_usd = excluded.micro_usd`,
-		keyID, win, period, next); err != nil {
-		return fmt.Errorf("update money baseline: %w", err)
-	}
-	return nil
 }
 
 // raiseTokenBaseline stores max(existing, value) as the token baseline.

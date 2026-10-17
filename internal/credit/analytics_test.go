@@ -20,7 +20,7 @@ func addSummary(total *Summary, s Summary) {
 	total.Failed += s.Failed
 	total.Pending += s.Pending
 	total.CostMicroUSD += s.CostMicroUSD
-	total.AdjustmentMicroUSD += s.AdjustmentMicroUSD
+	total.UnpricedExecutions += s.UnpricedExecutions
 	total.CompleteExecutions += s.CompleteExecutions
 	total.Tokens.Input += s.Tokens.Input
 	total.Tokens.CacheRead += s.Tokens.CacheRead
@@ -64,7 +64,7 @@ func sameAdditive(a, b Summary) bool {
 		a.Failed == b.Failed &&
 		a.Pending == b.Pending &&
 		a.CostMicroUSD == b.CostMicroUSD &&
-		a.AdjustmentMicroUSD == b.AdjustmentMicroUSD &&
+		a.UnpricedExecutions == b.UnpricedExecutions &&
 		a.CompleteExecutions == b.CompleteExecutions &&
 		a.Tokens == b.Tokens
 }
@@ -79,9 +79,9 @@ func findModel(models []ModelMetrics, name string) *ModelMetrics {
 }
 
 // buildOverviewDataset is a mixed history that exercises every grouping rule:
-// a request whose executions carry a provider alias, a multi-attempt request,
-// a rejection without execution, an unresolved request, and an administrator
-// charge booked against a later request.
+// a request whose executions carry a provider alias (priced by its own actual
+// model, hence unpriced here), a multi-attempt request, a rejection without
+// execution, and two unresolved requests with no trustworthy usage.
 func buildOverviewDataset(t *testing.T, h *harness) (k1, k2 Key) {
 	t.Helper()
 	h.mustPrice("m1", Rates{Input: million, Output: 2 * million})
@@ -118,22 +118,20 @@ func buildOverviewDataset(t *testing.T, h *harness) (k1, k2 Key) {
 	r4 := h.mustAdmit(AdmitInput{ID: "r4", TraceID: "t4", KeyID: k1.ID, RequestedModel: "m1"})
 	h.mustComplete(Completion{ID: r4.ID, TraceID: r4.TraceID, Outcome: OutcomeSucceeded})
 
-	// r5: an administrator charges a request whose usage never arrived.
+	// r5: a failed lifecycle whose usage never arrived stays pending. There is
+	// no manual amount to book: only recorded usage can be priced.
 	h.clock.set(testEpoch.Add(4 * time.Hour))
 	r5 := h.mustAdmit(AdmitInput{ID: "r5", TraceID: "t5", KeyID: k1.ID, RequestedModel: "m1"})
 	h.mustComplete(Completion{ID: r5.ID, TraceID: r5.TraceID, Outcome: OutcomeFailed, StatusCode: 502})
-	if err := h.store.Resolve(h.ctx(), r5.ID, Resolution{Action: ActionCharge, AmountMicroUSD: 777, Reason: "provider billed out of band"}); err != nil {
-		t.Fatalf("resolve charge: %v", err)
-	}
 	h.clock.set(testEpoch)
 	return k1, k2
 }
 
 // TestAnalyticsSummaryTrendModelsConserve pins the core contract: models are
 // grouped by the client requested model (never an execution alias), the
-// per-model rows and the trend rebuild the summary exactly, cost excludes the
-// manual adjustment while cost + adjustment reconstitutes the key ledger, and
-// the overview is independent of the requested page.
+// per-model rows and the trend rebuild the summary exactly, group cost is the
+// sum of each execution priced by its own actual model, and the overview is
+// independent of the requested page.
 func TestAnalyticsSummaryTrendModelsConserve(t *testing.T) {
 	h := newHarness(t)
 	k1, _ := buildOverviewDataset(t, h)
@@ -166,20 +164,18 @@ func TestAnalyticsSummaryTrendModelsConserve(t *testing.T) {
 	}
 
 	m1 := findModel(overview.Models, "m1")
-	// Two failures: the rejection r3 and the later-charged r5 (settled, still a
-	// failed outcome). The pending r4 has no usage yet.
-	if m1.Requests != 4 || m1.Failed != 2 || m1.Pending != 1 {
-		t.Fatalf("m1 counters = %+v, want 4 requests / 2 failed / 1 pending", m1.Summary)
+	// Two failures: the rejection r3 and the failed r5. Both r4 and r5 stay
+	// pending because neither reported trustworthy usage.
+	if m1.Requests != 4 || m1.Failed != 2 || m1.Pending != 2 {
+		t.Fatalf("m1 counters = %+v, want 4 requests / 2 failed / 2 pending", m1.Summary)
 	}
 	if m1.Executions != 2 || m1.CompleteExecutions != 2 {
 		t.Fatalf("m1 executions = %+v, want 2 complete executions", m1.Summary)
 	}
-	// Both executions bill the client model price: 10 + 5*2 and 20 + 10*2.
-	if m1.CostMicroUSD != 60 {
-		t.Fatalf("m1 cost = %d, want 60", m1.CostMicroUSD)
-	}
-	if m1.AdjustmentMicroUSD != 777 {
-		t.Fatalf("m1 adjustment = %d, want 777", m1.AdjustmentMicroUSD)
+	// The alias execution is priced by its actual model id, which has no price:
+	// it is unpriced. The retry bills the requested model's rates: 20 + 10*2.
+	if m1.CostMicroUSD != 40 || m1.UnpricedExecutions != 1 {
+		t.Fatalf("m1 cost = %d/%d, want 40 with the alias execution unpriced", m1.CostMicroUSD, m1.UnpricedExecutions)
 	}
 	if want := (Tokens{Input: 30, Output: 15, Total: 45}); m1.Tokens != want {
 		t.Fatalf("m1 tokens = %+v, want %+v", m1.Tokens, want)
@@ -210,18 +206,22 @@ func TestAnalyticsSummaryTrendModelsConserve(t *testing.T) {
 		t.Fatalf("m2 output tokens = %d, want 20 output + 5 reasoning", m2.OutputTokens)
 	}
 
-	// The manual charge is never part of the execution cost, but the two
-	// together reconcile with the key ledger spend for the same selection.
+	// A key-scoped selection derives the same amounts from the same log: the
+	// summary is the report summary for that key and there is no durable
+	// currency ledger to reconcile against.
 	keyReport, err := h.store.Analytics(h.ctx(), Filter{From: from, To: to, KeyID: k1.ID})
 	if err != nil {
 		t.Fatalf("key analytics: %v", err)
 	}
-	ledger := h.key(k1.ID)
-	if got := keyReport.Summary.CostMicroUSD + keyReport.Summary.AdjustmentMicroUSD; got != ledger.SpentMicroUSD {
-		t.Fatalf("cost+adjustment = %d, ledger spend = %d", got, ledger.SpentMicroUSD)
+	if keyReport.Summary.CostMicroUSD != 40 || keyReport.Summary.UnpricedExecutions != 1 {
+		t.Fatalf("key summary = %+v, want 40 cost and one unpriced execution", keyReport.Summary)
 	}
-	if keyReport.Summary.AdjustmentMicroUSD == 0 || keyReport.Summary.CostMicroUSD == 0 {
-		t.Fatalf("key split = %+v, want both cost and adjustment present", keyReport.Summary)
+	keyPlain, err := h.store.Report(h.ctx(), Filter{From: from, To: to, KeyID: k1.ID})
+	if err != nil {
+		t.Fatalf("key report: %v", err)
+	}
+	if !sameAdditive(keyReport.Summary, keyPlain.Summary) {
+		t.Fatalf("key analytics %+v != key report %+v", keyReport.Summary, keyPlain.Summary)
 	}
 
 	// A page number and a tiny page size must not shrink the aggregates.
@@ -251,7 +251,7 @@ func TestAnalyticsFilterParity(t *testing.T) {
 		{"by provider", Filter{Provider: "anthropic"}, 1, "m2"},
 		{"by auth", Filter{AuthID: "auth-2"}, 1, "m2"},
 		{"by model", Filter{Model: "m2"}, 1, "m2"},
-		{"by pending", Filter{Result: statePending}, 1, "m1"},
+		{"by pending", Filter{Result: statePending}, 2, "m1"},
 		{"by failed", Filter{Result: OutcomeFailed}, 2, "m1"},
 		{"by rejected", Filter{Result: OutcomeRejected}, 1, "m1"},
 		{"by search", Filter{Search: "beta"}, 1, "m2"}}
@@ -510,7 +510,7 @@ func TestAnalyticsJSONShape(t *testing.T) {
 		t.Fatalf("models = %s", raw)
 	}
 	wantSummaryKeys := []string{"requests", "executions", "failed", "pending", "cost_micro_usd",
-		"adjustment_micro_usd", "tokens", "complete_executions"}
+		"unpriced_executions", "tokens", "complete_executions"}
 	for _, k := range wantSummaryKeys {
 		if _, ok := decoded.Summary[k]; !ok {
 			t.Fatalf("summary is missing %q in %s", k, raw)

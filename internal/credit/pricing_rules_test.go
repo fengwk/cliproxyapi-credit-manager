@@ -5,12 +5,24 @@ import (
 	"testing"
 )
 
-// mustRule stores one enabled rule unless the test overrides Enabled itself.
+// mustRule stores one rule unless the test overrides Enabled itself.
 func (h *harness) mustRule(r PricingRule) {
 	h.t.Helper()
 	if err := h.store.PutPricingRule(h.ctx(), r); err != nil {
 		h.t.Fatalf("put pricing rule %s: %v", r.ID, err)
 	}
+}
+
+// effectiveRate reports the input rate a model currently resolves to. The price
+// book is the only source of that decision, so the preview is also the operator
+// facing view of what would price history today.
+func (h *harness) effectiveRate(model string) int64 {
+	h.t.Helper()
+	match, err := h.store.PreviewPrice(h.ctx(), model, "", 0)
+	if err != nil {
+		h.t.Fatalf("preview %s: %v", model, err)
+	}
+	return match.Rates.Input
 }
 
 // TestPricingRuleScanKeepsCanonicalModel pins that a stored rule read back keeps
@@ -29,27 +41,20 @@ func TestPricingRuleScanKeepsCanonicalModel(t *testing.T) {
 	}
 }
 
-// reserveRate reserves one model and returns the effective input rate frozen on
-// the request, which is what the operator sees as the price that will be used.
-func (h *harness) reserveRate(id, trace, model, keyID string) int64 {
-	h.t.Helper()
-	return h.mustAdmit(AdmitInput{ID: id, TraceID: trace, KeyID: keyID, RequestedModel: model}).Price.Rates.Input
-}
-
 // TestPricingRuleSelectionOrder pins the documented deterministic order: the
 // exact price book is a priority zero exact candidate, a higher priority rule
 // shadows it, an exact match beats a pattern match at the same priority and a
 // lower id breaks a remaining tie.
 func TestPricingRuleSelectionOrder(t *testing.T) {
-	h, key := billingHarness(t)
+	h, _ := billingHarness(t)
 	// The exact price book entry is used when nothing shadows it.
-	if got := h.reserveRate("r1", "t1", "m1", key.ID); got != million {
+	if got := h.effectiveRate("m1"); got != million {
 		t.Fatalf("exact price rate = %d, want %d", got, million)
 	}
 	// A higher priority glob rule shadows the exact price.
 	h.mustRule(PricingRule{ID: "shadow", MatchKind: MatchGlob, Pattern: "m*", Priority: 10, Enabled: true,
 		Price: Price{Rates: Rates{Input: 9 * million}}})
-	if got := h.reserveRate("r2", "t2", "m1", key.ID); got != 9*million {
+	if got := h.effectiveRate("m1"); got != 9*million {
 		t.Fatalf("shadowing rule rate = %d, want %d", got, 9*million)
 	}
 	// Two equally prioritized glob rules: the lower id wins.
@@ -57,14 +62,14 @@ func TestPricingRuleSelectionOrder(t *testing.T) {
 		Price: Price{Rates: Rates{Input: 5 * million}}})
 	h.mustRule(PricingRule{ID: "a-first", MatchKind: MatchGlob, Pattern: "m*", Priority: 10, Enabled: true,
 		Price: Price{Rates: Rates{Input: 3 * million}}})
-	if got := h.reserveRate("r3", "t3", "m1", key.ID); got != 3*million {
+	if got := h.effectiveRate("m1"); got != 3*million {
 		t.Fatalf("id tie break rate = %d, want %d", got, 3*million)
 	}
 	// An exact match beats a pattern match at the same priority, even with a
 	// higher id.
 	h.mustRule(PricingRule{ID: "zz-exact", MatchKind: MatchExact, Pattern: "m1", Priority: 10, Enabled: true,
 		Price: Price{Rates: Rates{Input: 7 * million}}})
-	if got := h.reserveRate("r4", "t4", "m1", key.ID); got != 7*million {
+	if got := h.effectiveRate("m1"); got != 7*million {
 		t.Fatalf("exact-above-glob rate = %d, want %d", got, 7*million)
 	}
 }
@@ -73,32 +78,38 @@ func TestPricingRuleSelectionOrder(t *testing.T) {
 // tie-break against the price book: at priority zero the exact price wins over
 // a pattern rule.
 func TestPricingRuleExactPriceBeatsSamePriorityPattern(t *testing.T) {
-	h, key := billingHarness(t)
+	h, _ := billingHarness(t)
 	h.mustRule(PricingRule{ID: "glob0", MatchKind: MatchGlob, Pattern: "m*", Priority: 0, Enabled: true,
 		Price: Price{Rates: Rates{Input: 9 * million}}})
-	if got := h.reserveRate("r1", "t1", "m1", key.ID); got != million {
+	if got := h.effectiveRate("m1"); got != million {
 		t.Fatalf("same-priority glob shadowed the exact price: rate=%d", got)
 	}
 }
 
-// TestPricingRuleDisabledWinningRuleDenies pins the fail-closed rule: a
-// matching disabled rule that wins denies the model instead of falling through.
-func TestPricingRuleDisabledWinningRuleDenies(t *testing.T) {
+// TestPricingRuleDisabledRuleIsSkipped pins the disabled-rule decision: a
+// disabled rule takes no part in pricing. It neither denies the model nor acts
+// as a permission filter; the next candidate (here the exact price book entry)
+// wins, and a model that only a disabled rule would price is simply unpriced.
+func TestPricingRuleDisabledRuleIsSkipped(t *testing.T) {
 	h, key := billingHarness(t)
-	h.mustRule(PricingRule{ID: "off", MatchKind: MatchGlob, Pattern: "m*", Priority: 10, Enabled: false})
-	_, err := h.store.Admit(h.ctx(), AdmitInput{ID: "r1", TraceID: "t1", KeyID: key.ID, RequestedModel: "m1"})
-	if !errors.Is(err, ErrUnpriced) {
-		t.Fatalf("disabled winning rule err = %v, want ErrUnpriced", err)
+	h.mustRule(PricingRule{ID: "off", MatchKind: MatchGlob, Pattern: "m*", Priority: 10, Enabled: false,
+		Price: Price{Rates: Rates{Input: 900 * million}}})
+	if got := h.effectiveRate("m1"); got != million {
+		t.Fatalf("disabled winning rule changed the price: rate=%d, want the exact price %d", got, million)
 	}
-	// A losing disabled rule must not deny a price that legitimately wins: with
-	// the winning rule gone, the exact price book beats a same-priority pattern
-	// rule whether or not that rule is enabled.
-	if err := h.store.DeletePricingRule(h.ctx(), "off"); err != nil {
-		t.Fatalf("delete winning rule: %v", err)
+	// A model that only the disabled rule matches is admitted and stays
+	// unpriced; it is never rejected because a disabled rule would have matched.
+	req := h.mustAdmit(AdmitInput{ID: "r1", TraceID: "t1", KeyID: key.ID, RequestedModel: "m-only"})
+	h.mustUsage(usageFor("u1", req, "m-only", tokens(10, 0, 0, 5, 0)))
+	h.mustComplete(Completion{ID: req.ID, TraceID: req.TraceID, Outcome: OutcomeSucceeded})
+	if got := h.request(req.ID); got.State != stateSettled {
+		t.Fatalf("state = %q, want settled", got.State)
 	}
-	h.mustRule(PricingRule{ID: "off-glob", MatchKind: MatchGlob, Pattern: "m*", Priority: 0, Enabled: false})
-	if got := h.reserveRate("r2", "t2", "m1", key.ID); got != million {
-		t.Fatalf("disabled losing rule denied the exact price: rate=%d", got)
+	if cost, unpriced := h.costOf(key.ID); cost != 0 || unpriced != 1 {
+		t.Fatalf("cost = %d/%d, want the disabled-rule model unpriced", cost, unpriced)
+	}
+	if _, err := h.store.PreviewPrice(h.ctx(), "m-only", "", 0); !errors.Is(err, ErrUnpriced) {
+		t.Fatalf("preview err = %v, want ErrUnpriced", err)
 	}
 }
 
@@ -189,31 +200,34 @@ func TestPricingRuleCRUD(t *testing.T) {
 	}
 }
 
-// TestPricingRuleSnapshotSurvivesEditAndDelete pins that an admitted request is
-// never repriced by a later rule edit or deletion.
-func TestPricingRuleSnapshotSurvivesEditAndDelete(t *testing.T) {
+// TestPricingRuleEditAndDeleteRepriceHistory is the rule-side counterpart of the
+// price book regression: because nothing is frozen on a request, editing and
+// deleting a rule immediately changes the reported cost of the same history.
+func TestPricingRuleEditAndDeleteRepriceHistory(t *testing.T) {
 	h, key := billingHarness(t)
 	h.mustRule(PricingRule{ID: "rule", MatchKind: MatchGlob, Pattern: "m*", Priority: 5, Enabled: true,
 		Price: Price{Rates: Rates{Input: million, Output: 2 * million}}})
 	req := h.mustAdmit(AdmitInput{ID: "r1", TraceID: "t1", KeyID: key.ID, RequestedModel: "m1"})
-	if req.Price.Rates.Input != million || req.Price.Rates.Output != 2*million {
-		t.Fatalf("reserved price = %+v", req.Price.Rates)
+	h.mustUsage(usageFor("u1", req, "m1", tokens(10, 0, 0, 5, 0)))
+	h.mustComplete(Completion{ID: req.ID, TraceID: req.TraceID, Outcome: OutcomeSucceeded})
+	// 10 input at 1 + 5 output at 2 = 20.
+	if cost, _ := h.costOf(key.ID); cost != 20 {
+		t.Fatalf("rule cost = %d, want 20", cost)
 	}
-	// Edit the rule to a wildly different price and add a matcher, then delete it.
+	// Editing the rule recomputes the same history.
 	h.mustRule(PricingRule{ID: "rule", MatchKind: MatchGlob, Pattern: "m*", Priority: 5, Enabled: true,
 		Price: Price{Rates: Rates{Input: 900 * million, Output: 900 * million}}})
+	if cost, _ := h.costOf(key.ID); cost != 900*15 {
+		t.Fatalf("edited-rule cost = %d, want %d", cost, 900*15)
+	}
+	// Deleting the rule falls back to the exact price book entry.
 	if err := h.store.DeletePricingRule(h.ctx(), "rule"); err != nil {
 		t.Fatalf("delete rule: %v", err)
 	}
-	// Settlement uses the frozen price: 10 input + 5 output.
-	h.mustUsage(usageFor("u1", req, "m1", tokens(10, 0, 0, 5, 0)))
-	h.mustComplete(Completion{ID: req.ID, TraceID: req.TraceID, Outcome: OutcomeSucceeded})
-	key = h.key(key.ID)
-	if key.SpentMicroUSD != 20 {
-		t.Fatalf("spent=%d, want the frozen 20 charge", key.SpentMicroUSD)
+	if cost, _ := h.costOf(key.ID); cost != 20 {
+		t.Fatalf("post-delete cost = %d, want the exact price 20", cost)
 	}
-	// A new request now falls back to the exact price book.
-	if got := h.reserveRate("r2", "t2", "m1", key.ID); got != million {
+	if got := h.effectiveRate("m1"); got != million {
 		t.Fatalf("post-delete rate = %d, want the exact price %d", got, million)
 	}
 }
@@ -261,18 +275,21 @@ func TestPricePreviewSelectsTiersAndResolves(t *testing.T) {
 }
 
 // TestPricingRuleFreeModelIsNotMissing pins that an explicit all-zero price is
-// free, never "missing", and that a genuinely unknown model still denies.
+// free, never "missing": the execution is priced zero while a genuinely unknown
+// model is admitted but reported as unpriced.
 func TestPricingRuleFreeModelIsNotMissing(t *testing.T) {
 	h, key := billingHarness(t)
 	h.mustRule(PricingRule{ID: "free", MatchKind: MatchExact, Pattern: "free-model", Priority: 5, Enabled: true})
 	req := h.mustAdmit(AdmitInput{ID: "r1", TraceID: "t1", KeyID: key.ID, RequestedModel: "free-model"})
 	h.mustUsage(usageFor("u1", req, "free-model", tokens(10, 0, 0, 5, 0)))
 	h.mustComplete(Completion{ID: req.ID, TraceID: req.TraceID, Outcome: OutcomeSucceeded})
-	if key = h.key(key.ID); key.SpentMicroUSD != 0 {
-		t.Fatalf("free model spent=%d, want 0", key.SpentMicroUSD)
+	if cost, unpriced := h.costOf(key.ID); cost != 0 || unpriced != 0 {
+		t.Fatalf("free model cost = %d/%d, want a priced zero", cost, unpriced)
 	}
-	if _, err := h.store.Admit(h.ctx(), AdmitInput{ID: "r2", TraceID: "t2", KeyID: key.ID,
-		RequestedModel: "no-such-model"}); !errors.Is(err, ErrUnpriced) {
-		t.Fatalf("missing price err = %v, want ErrUnpriced", err)
+	unknown := h.mustAdmit(AdmitInput{ID: "r2", TraceID: "t2", KeyID: key.ID, RequestedModel: "no-such-model"})
+	h.mustUsage(usageFor("u2", unknown, "no-such-model", tokens(10, 0, 0, 5, 0)))
+	h.mustComplete(Completion{ID: unknown.ID, TraceID: unknown.TraceID, Outcome: OutcomeSucceeded})
+	if cost, unpriced := h.costOf(key.ID); cost != 0 || unpriced != 1 {
+		t.Fatalf("unknown model cost = %d/%d, want one unpriced execution", cost, unpriced)
 	}
 }

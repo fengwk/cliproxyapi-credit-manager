@@ -1,175 +1,224 @@
 package credit
 
 import (
+	"database/sql"
 	"encoding/json"
 	"errors"
-	"reflect"
 	"testing"
-	"time"
 )
 
-// The initial admission and its idempotent replay must expose the same frozen
-// pricing metadata as later reads, including rule tiers and image counts.
-func TestAdmitReturnsCompleteFrozenSnapshot(t *testing.T) {
-	for _, mode := range []string{"token", billingPerImage} {
-		t.Run(mode, func(t *testing.T) {
-			h, key := billingHarness(t)
-			rule := PricingRule{
-				ID: "r", MatchKind: MatchExact, Pattern: "m1", Priority: 5, Enabled: true,
-				Price: Price{Rates: Rates{Input: million}},
-				Tiers: []PriceTier{{Kind: priceTierService, Service: "priority", Rates: Rates{Output: 9 * million}}},
-			}
-			if mode == billingPerImage {
-				rule.Price = Price{BillingMode: billingPerImage, PerImageMicroUSD: 50_000}
-				rule.Tiers = nil
-			}
-			h.mustRule(rule)
-			in := AdmitInput{
-				ID: "r1", TraceID: "t1", KeyID: key.ID, RequestedModel: "m1",
-				ServiceTier: "PRIORITY", ImageCount: 3, ImageCountDeclared: true,
-			}
-			first := h.mustAdmit(in)
-			replay := h.mustAdmit(in)
-			stored := h.request(first.ID)
-			if !reflect.DeepEqual(first, replay) || !reflect.DeepEqual(first, stored) {
-				t.Fatalf("snapshot metadata changed between admission and reads:\nfirst=%+v\nreplay=%+v\nstored=%+v",
-					first, replay, stored)
-			}
-			if first.PricingRuleID != rule.ID || first.ServiceTier != "priority" ||
-				len(first.PriceTiers) != len(rule.Tiers) || (mode == billingPerImage && first.ImageCount != 3) {
-				t.Fatalf("incomplete admission snapshot: %+v", first)
-			}
-		})
-	}
-}
-
-// mutateSnapshot rewrites the stored price snapshot of one request, modelling a
-// damaged or tampered ledger row that bypassed the validating writer.
-func mutateSnapshot(t *testing.T, h *harness, requestID string, mutate func(*priceSnapshot)) {
-	t.Helper()
-	var raw string
-	if err := h.store.db.QueryRow(
-		`SELECT price_snapshot FROM requests WHERE id = ?`, requestID).Scan(&raw); err != nil {
-		t.Fatal(err)
-	}
-	var snapshot priceSnapshot
-	if err := json.Unmarshal([]byte(raw), &snapshot); err != nil {
-		t.Fatal(err)
-	}
-	mutate(&snapshot)
-	updated, err := json.Marshal(snapshot)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := h.store.db.Exec(
-		`UPDATE requests SET price_snapshot = ? WHERE id = ?`, string(updated), requestID); err != nil {
-		t.Fatal(err)
-	}
-}
-
-// TestDamagedRequestSnapshotIsRefused pins that the frozen snapshot is the only
-// price source and must fail closed: an empty, corrupt, incomplete or
-// inconsistent snapshot is an error, never a zero priced or default priced
-// request.
-func TestDamagedRequestSnapshotIsRefused(t *testing.T) {
-	cases := []struct {
-		name    string
-		payload string
-	}{
-		{"empty", ""},
-		{"null snapshot", "null"},
-		{"corrupt json", "{not json"},
-		{"missing price", `{"tiers":[],"service_tier":"priority"}`},
-		{"null price", `{"price":null}`},
-		{"missing model", `{"price":{"rates":{"input":1000000}}}`},
-		{"missing rates", `{"price":{"model":"m1"}}`},
-		{"null rates", `{"price":{"model":"m1","rates":null}}`},
-		{"empty rates", `{"price":{"model":"m1","rates":{}}}`},
-		{"missing input", `{"price":{"model":"m1","rates":{"output":0,"cache_read":0,"cache_write":0}}}`},
-		{"null input", `{"price":{"model":"m1","rates":{"input":null,"output":0,"cache_read":0,"cache_write":0}}}`},
-		{"missing output", `{"price":{"model":"m1","rates":{"input":1000000,"cache_read":0,"cache_write":0}}}`},
-		{"null output", `{"price":{"model":"m1","rates":{"input":1000000,"output":null,"cache_read":0,"cache_write":0}}}`},
-		{"missing cache read", `{"price":{"model":"m1","rates":{"input":1000000,"output":0,"cache_write":0}}}`},
-		{"null cache read", `{"price":{"model":"m1","rates":{"input":1000000,"output":0,"cache_read":null,"cache_write":0}}}`},
-		{"missing cache write", `{"price":{"model":"m1","rates":{"input":1000000,"output":0,"cache_read":0}}}`},
-		{"null cache write", `{"price":{"model":"m1","rates":{"input":1000000,"output":0,"cache_read":0,"cache_write":null}}}`},
-		{"missing tier rates", `{"price":{"model":"m1","rates":{"input":1000000,"output":0,"cache_read":0,"cache_write":0}},"tiers":[{"kind":"service","service":"priority"}]}`},
-		{"null tier rates", `{"price":{"model":"m1","rates":{"input":1000000,"output":0,"cache_read":0,"cache_write":0}},"tiers":[{"kind":"service","service":"priority","rates":null}]}`},
-		{"incomplete tier rates", `{"price":{"model":"m1","rates":{"input":1000000,"output":0,"cache_read":0,"cache_write":0}},"tiers":[{"kind":"service","service":"priority","rates":{"input":0}}]}`},
-		{"model mismatch", `{"price":{"model":"other","rates":{"input":1000000,"output":0,"cache_read":0,"cache_write":0}}}`},
-		{"negative rate", `{"price":{"model":"m1","rates":{"input":-1,"output":0,"cache_read":0,"cache_write":0}}}`},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			h := newHarness(t)
-			h.mustPrice("m1", Rates{Input: million})
-			key, _ := h.mustKey(KeySpec{Enabled: true})
-			req := h.mustAdmit(AdmitInput{ID: "r1", TraceID: "t1", KeyID: key.ID, RequestedModel: "m1"})
-			if _, err := h.store.db.Exec(
-				`UPDATE requests SET price_snapshot = ? WHERE id = ?`, tc.payload, req.ID); err != nil {
-				t.Fatal(err)
-			}
-			// Settlement must refuse the damaged row instead of booking money.
-			if err := h.store.RecordUsage(h.ctx(),
-				usageFor("u1", req, "m1", tokens(10, 0, 0, 5, 0))); !errors.Is(err, ErrInvalid) && !errors.Is(err, ErrConflict) {
-				t.Fatalf("record usage err = %v, want a snapshot validation error", err)
-			}
-			// Every read path that needs the frozen price fails the same way.
-			if _, err := h.store.Report(h.ctx(), Filter{
-				From: testEpoch.Add(-24 * time.Hour), To: testEpoch.Add(24 * time.Hour),
-				Page: 1, PageSize: 10}); err == nil {
-				t.Fatal("report accepted a damaged price snapshot")
-			}
-			if key = h.key(key.ID); key.SpentMicroUSD != 0 {
-				t.Fatalf("damaged snapshot booked %d microUSD", key.SpentMicroUSD)
-			}
-			var usages int
-			if err := h.store.db.QueryRow(`SELECT COUNT(*) FROM usages`).Scan(&usages); err != nil || usages != 0 {
-				t.Fatalf("damaged snapshot persisted %d usages, err=%v", usages, err)
-			}
-		})
-	}
-}
-
-// TestExplicitZeroPriceSnapshotIsAccepted pins the other side of the same rule:
-// an explicit all-zero rate card is a real (free) price, not a missing one, so
-// the snapshot validator accepts it and every read path returns it unchanged.
-// (The end-to-end free settlement is already pinned by the existing zero rate
-// test; this asserts the snapshot itself survives validation.)
-func TestExplicitZeroPriceSnapshotIsAccepted(t *testing.T) {
+// TestSchemaStoresNoMoneyOrPrice is the storage half of the pricing contract:
+// no table may keep an amount, a price snapshot or an adjustment, so a price
+// change is guaranteed to reach the reported history of every past execution.
+func TestSchemaStoresNoMoneyOrPrice(t *testing.T) {
 	h := newHarness(t)
-	h.mustPrice("free", Rates{})
-	key, _ := h.mustKey(KeySpec{Enabled: true})
-	req := h.mustAdmit(AdmitInput{ID: "r0", TraceID: "t0", KeyID: key.ID, RequestedModel: "free"})
-	frozen := h.request(req.ID)
-	if frozen.Price.Model != "free" || frozen.Price.Rates != (Rates{}) {
-		t.Fatalf("frozen free price = %+v, want an explicit all-zero card", frozen.Price)
+	forbiddenColumns := map[string][]string{
+		"keys":     {"spent_micro_usd"},
+		"requests": {"price_snapshot", "charge_micro_usd", "resolved"},
+		"usages":   {"cost_micro_usd", "charged"},
+	}
+	for table, banned := range forbiddenColumns {
+		present := tableColumns(t, h, table)
+		for _, column := range banned {
+			if _, ok := present[column]; ok {
+				t.Fatalf("%s.%s still exists: an amount or price is persisted", table, column)
+			}
+		}
+	}
+	for _, table := range []string{"key_money_counters", "key_money_baselines", "adjustments"} {
+		if tableExists(t, h, table) {
+			t.Fatalf("table %s still exists", table)
+		}
+	}
+	// The four display budgets are the only monetary columns left.
+	for _, column := range []string{"quota_micro_usd", "daily_micro_usd", "weekly_micro_usd", "monthly_micro_usd"} {
+		if _, ok := tableColumns(t, h, "keys")[column]; !ok {
+			t.Fatalf("display budget column keys.%s is missing", column)
+		}
 	}
 }
 
-// TestPerImageSnapshotCountIsNotDefaulted pins that a per-image request never
-// falls back to one image: a corrupted frozen count fails settlement instead of
-// being billed as a different number.
-func TestPerImageSnapshotCountIsNotDefaulted(t *testing.T) {
+func tableColumns(t *testing.T, h *harness, table string) map[string]struct{} {
+	t.Helper()
+	rows, err := h.store.db.Query(`SELECT name FROM pragma_table_info(?)`, table)
+	if err != nil {
+		t.Fatalf("read columns of %s: %v", table, err)
+	}
+	defer rows.Close()
+	out := map[string]struct{}{}
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			t.Fatalf("scan column: %v", err)
+		}
+		out[name] = struct{}{}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate columns: %v", err)
+	}
+	return out
+}
+
+func tableExists(t *testing.T, h *harness, table string) bool {
+	t.Helper()
+	var name string
+	err := h.store.db.QueryRow(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?`, table).Scan(&name)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return false
+		}
+		t.Fatalf("inspect table %s: %v", table, err)
+	}
+	return true
+}
+
+// TestDerivedCostFollowsTheStoredLog proves the amount is a projection of the
+// recorded executions rather than a stored number: rewriting the token counters
+// of a stored execution changes the reported cost without touching any price.
+func TestDerivedCostFollowsTheStoredLog(t *testing.T) {
+	h, key := billingHarness(t)
+	req := h.mustAdmit(AdmitInput{ID: "r1", TraceID: "t1", KeyID: key.ID, RequestedModel: "m1"})
+	h.mustUsage(usageFor("u1", req, "m1", tokens(100, 0, 0, 100, 0)))
+	h.mustComplete(Completion{ID: req.ID, TraceID: req.TraceID, Outcome: OutcomeSucceeded})
+	if cost, _ := h.costOf(key.ID); cost != 300 {
+		t.Fatalf("cost = %d, want 300", cost)
+	}
+	// A direct rewrite of the log (bypassing the validating writer) is visible
+	// in the derived amount: there is no shadow copy to disagree with it.
+	if _, err := h.store.db.Exec(`UPDATE usages SET tokens_output = ? WHERE id = ?`, 500, "u1"); err != nil {
+		t.Fatalf("rewrite log: %v", err)
+	}
+	if cost, _ := h.costOf(key.ID); cost != 100+1000 {
+		t.Fatalf("cost after rewriting the log = %d, want 1100", cost)
+	}
+}
+
+// TestPerImagePriceIsUnpricedFromTheLog pins the image-count decision: the host
+// records tokens, not real image counts, so a per-image price can never price a
+// logged execution. The request carries no image count either.
+func TestPerImagePriceIsUnpricedFromTheLog(t *testing.T) {
 	h := newHarness(t)
 	if err := h.store.PutPrice(h.ctx(), Price{
 		Model: "img", BillingMode: billingPerImage, PerImageMicroUSD: 50_000}); err != nil {
 		t.Fatal(err)
 	}
 	key, _ := h.mustKey(KeySpec{Enabled: true})
-	req := h.mustAdmit(AdmitInput{
-		ID: "r1", TraceID: "t1", KeyID: key.ID, RequestedModel: "img",
-		ImageCount: 3, ImageCountDeclared: true})
-	mutateSnapshot(t, h, req.ID, func(s *priceSnapshot) { s.ImageCount = 0 })
-	if err := h.store.RecordUsage(h.ctx(),
-		usageFor("u1", req, "img", tokens(1, 0, 0, 1, 0))); err == nil {
-		t.Fatal("a per-image snapshot without a count was accepted")
+	req := h.mustAdmit(AdmitInput{ID: "r1", TraceID: "t1", KeyID: key.ID, RequestedModel: "img"})
+	h.mustUsage(usageFor("u1", req, "img", tokens(10, 0, 0, 10, 0)))
+	h.mustComplete(Completion{ID: req.ID, TraceID: req.TraceID, Outcome: OutcomeSucceeded})
+	if got := h.request(req.ID); got.State != stateSettled {
+		t.Fatalf("state = %q, want settled: an unpriced execution is not pending", got.State)
 	}
-	if err := h.store.Complete(h.ctx(), Completion{
-		ID: req.ID, TraceID: req.TraceID, Outcome: OutcomeSucceeded}); err == nil {
-		t.Fatal("completion accepted a per-image snapshot without a count")
+	if cost, unpriced := h.costOf(key.ID); cost != 0 || unpriced != 1 {
+		t.Fatalf("per-image cost = %d/%d, want 0 cost and 1 unpriced", cost, unpriced)
 	}
-	if key = h.key(key.ID); key.SpentMicroUSD != 0 {
-		t.Fatalf("corrupted per-image count booked %d microUSD", key.SpentMicroUSD)
+	if exec := h.request(req.ID).Executions[0]; exec.CostMicroUSD != nil {
+		t.Fatalf("per-image execution cost = %d, want null", *exec.CostMicroUSD)
+	}
+}
+
+// TestRecordedRequestHasNoPriceFields pins the JSON contract of a request: the
+// frozen pricing metadata and the manual adjustment are gone, while the request
+// facts remain.
+func TestRecordedRequestHasNoPriceFields(t *testing.T) {
+	h, key := billingHarness(t)
+	req := h.mustAdmit(AdmitInput{ID: "r1", TraceID: "t1", KeyID: key.ID, RequestedModel: "m1",
+		ServiceTier: "priority"})
+	h.mustUsage(usageFor("u1", req, "m1", tokens(10, 0, 0, 10, 0)))
+	raw, err := json.Marshal(h.request(req.ID))
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
+	}
+	var decoded map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatalf("decode request: %v", err)
+	}
+	for _, banned := range []string{"price", "pricing_rule_id", "price_tiers", "image_count", "adjustment_micro_usd"} {
+		if _, ok := decoded[banned]; ok {
+			t.Fatalf("request JSON still exposes %q: %s", banned, raw)
+		}
+	}
+	for _, want := range []string{"id", "trace_id", "key_id", "model", "state", "executions", "service_tier"} {
+		if _, ok := decoded[want]; !ok {
+			t.Fatalf("request JSON is missing %q: %s", want, raw)
+		}
+	}
+	executions, ok := decoded["executions"]
+	if !ok {
+		t.Fatal("request JSON carries no executions")
+	}
+	var list []map[string]json.RawMessage
+	if err := json.Unmarshal(executions, &list); err != nil {
+		t.Fatalf("decode executions: %v", err)
+	}
+	if len(list) != 1 {
+		t.Fatalf("executions = %d, want 1", len(list))
+	}
+	// The derived amount is always present as a key, explicitly null-able.
+	if _, ok := list[0]["cost_micro_usd"]; !ok {
+		t.Fatalf("execution JSON omits cost_micro_usd: %s", executions)
+	}
+	// The key no longer publishes a currency ledger.
+	keyRaw, err := json.Marshal(h.key(key.ID))
+	if err != nil {
+		t.Fatalf("marshal key: %v", err)
+	}
+	var keyDecoded map[string]json.RawMessage
+	if err := json.Unmarshal(keyRaw, &keyDecoded); err != nil {
+		t.Fatalf("decode key: %v", err)
+	}
+	for _, banned := range []string{
+		"spent_micro_usd", "quota_used_micro_usd", "daily_used_micro_usd",
+		"weekly_used_micro_usd", "monthly_used_micro_usd"} {
+		if _, ok := keyDecoded[banned]; ok {
+			t.Fatalf("key JSON still exposes %q: %s", banned, keyRaw)
+		}
+	}
+	spec, ok := keyDecoded["spec"]
+	if !ok {
+		t.Fatalf("key JSON has no spec: %s", keyRaw)
+	}
+	var specDecoded map[string]json.RawMessage
+	if err := json.Unmarshal(spec, &specDecoded); err != nil {
+		t.Fatalf("decode spec: %v", err)
+	}
+	for _, want := range []string{"quota_micro_usd", "daily_micro_usd", "weekly_micro_usd", "monthly_micro_usd"} {
+		if _, ok := specDecoded[want]; !ok {
+			t.Fatalf("key spec is missing the display budget %q: %s", want, spec)
+		}
+	}
+}
+
+// TestExplicitZeroPriceIsDistinctFromUnpriced keeps the two null-ish cases
+// apart: an explicit all-zero rate card is a priced zero, a missing price is
+// null with an unpriced count.
+func TestExplicitZeroPriceIsDistinctFromUnpriced(t *testing.T) {
+	h := newHarness(t)
+	h.mustPrice("free", Rates{})
+	key, _ := h.mustKey(KeySpec{Enabled: true})
+
+	free := h.mustAdmit(AdmitInput{ID: "r1", TraceID: "t1", KeyID: key.ID, RequestedModel: "free"})
+	h.mustUsage(usageFor("u1", free, "free", tokens(10, 0, 0, 10, 0)))
+	h.mustComplete(Completion{ID: free.ID, TraceID: free.TraceID, Outcome: OutcomeSucceeded})
+	missing := h.mustAdmit(AdmitInput{ID: "r2", TraceID: "t2", KeyID: key.ID, RequestedModel: "nope"})
+	h.mustUsage(usageFor("u2", missing, "nope", tokens(10, 0, 0, 10, 0)))
+	h.mustComplete(Completion{ID: missing.ID, TraceID: missing.TraceID, Outcome: OutcomeSucceeded})
+
+	sum := h.report(key.ID).Summary
+	if sum.CostMicroUSD != 0 || sum.UnpricedExecutions != 1 {
+		t.Fatalf("summary = %+v, want a priced zero plus exactly one unpriced execution", sum)
+	}
+	if sum.Executions != 2 || sum.CompleteExecutions != 2 {
+		t.Fatalf("summary = %+v, want both complete executions counted", sum)
+	}
+	byID := map[string]*int64{}
+	for _, item := range h.report(key.ID).Items {
+		byID[item.Executions[0].ID] = item.Executions[0].CostMicroUSD
+	}
+	if c, ok := byID["u1"]; !ok || c == nil || *c != 0 {
+		t.Fatalf("free execution cost = %v, want an explicit 0", c)
+	}
+	if c, ok := byID["u2"]; !ok || c != nil {
+		t.Fatalf("unpriced execution cost = %v, want null", c)
 	}
 }

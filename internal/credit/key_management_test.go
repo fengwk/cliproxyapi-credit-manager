@@ -192,7 +192,8 @@ func TestRotateKeepsIdentityAndScope(t *testing.T) {
 }
 
 // Soft delete permanently disables authentication, re-enable and rotation while
-// preserving the records, the ledger and the ability to settle in flight work.
+// preserving the records, durable token counters and the ability to account for
+// in flight work.
 func TestSoftDeleteRejectsAndSettles(t *testing.T) {
 	h := newHarness(t)
 	h.mustPrice(testModel, Rates{Input: 1_000_000})
@@ -236,14 +237,16 @@ func TestSoftDeleteRejectsAndSettles(t *testing.T) {
 	if err != nil || byScope.DeletedAt == nil {
 		t.Fatalf("scope lookup of deleted key = %+v %v", byScope, err)
 	}
-	// Settle the in flight request after deletion: the actual charge counts.
+	// Settle the in flight request after deletion: the actual tokens count.
 	h.mustUsage(Usage{ID: "u-inflight", TraceID: req.TraceID, KeyID: key.ID, Model: testModel,
 		Raw:    pluginapi.UsageDetail{InputTokens: 100, TotalTokens: 100},
 		Tokens: tokens(100, 0, 0, 0, 0), Quality: QualityComplete})
 	h.mustComplete(Completion{ID: req.ID, TraceID: req.TraceID, Outcome: OutcomeSucceeded})
-	settled := h.key(key.ID)
-	if settled.SpentMicroUSD != 100 {
-		t.Fatalf("deleted key ledger not settled: %+v", settled)
+	if used, err := tokenCounter(h.ctx(), h.store.db, key.ID, testModel, windowTotal, ""); err != nil || used != 100 {
+		t.Fatalf("deleted key token counter = %d (%v), want 100", used, err)
+	}
+	if cost, unpriced := h.costOf(key.ID); cost != 100 || unpriced != 0 {
+		t.Fatalf("derived cost after deletion = %d/%d, want 100", cost, unpriced)
 	}
 	keys, err := h.store.ListKeys(h.ctx())
 	if err != nil || len(keys) != 1 || keys[0].DeletedAt == nil {
@@ -252,25 +255,52 @@ func TestSoftDeleteRejectsAndSettles(t *testing.T) {
 }
 
 // Resetting a window stores a baseline and never rewrites durable counters, so
-// a late charge still counts and the true lifetime total is preserved.
+// late tokens still count and the true lifetime total is preserved.
 func TestResetBaselinePeriodRolloverLateUsageCleanup(t *testing.T) {
 	h := newHarness(t)
 	h.mustPrice(testModel, Rates{Input: 1_000_000})
 	key, material := h.mustKey(KeySpec{Enabled: true})
 	day1 := h.clock.now()
 	chargeKey(h, key, testModel, "a", 100, day1)
-	if got := h.key(key.ID).SpentMicroUSD; got != 100 {
-		t.Fatalf("spent after first charge = %d", got)
+	readCounter := func(win, period string) int64 {
+		t.Helper()
+		got, err := tokenCounter(h.ctx(), h.store.db, key.ID, testModel, win, period)
+		if err != nil {
+			t.Fatalf("token counter %s/%s: %v", win, period, err)
+		}
+		return got
 	}
-	if _, err := h.store.ResetSpend(h.ctx(), ResetSpec{KeyID: key.ID, Total: true, Daily: true, Reason: "goodwill"}); err != nil {
+	readBaseline := func(win, period string) int64 {
+		t.Helper()
+		got, err := baselineToken(h.ctx(), h.store.db, key.ID, testModel, win, period)
+		if err != nil {
+			t.Fatalf("token baseline %s/%s: %v", win, period, err)
+		}
+		return got
+	}
+	if got := readCounter(windowTotal, ""); got != 100 {
+		t.Fatalf("tokens after first charge = %d", got)
+	}
+	reset, err := h.store.ResetTokens(h.ctx(), ResetSpec{KeyID: key.ID, Total: true, Daily: true, Reason: "goodwill"})
+	if err != nil {
 		t.Fatal(err)
 	}
-	// The durable total is untouched; only the effective view is cleared.
-	effective := h.key(key.ID)
-	if effective.SpentMicroUSD != 100 || effective.QuotaUsedMicroUSD != 0 || effective.DailyUsedMicroUSD != 0 {
-		t.Fatalf("after reset = %+v", effective)
+	if len(reset.Windows) != 2 {
+		t.Fatalf("reset windows = %v, want total and day", reset.Windows)
 	}
-	// A late charge for work admitted on day1 arrives after day1 rolled over.
+	// The durable counters are untouched; only the effective view is cleared.
+	if got := readCounter(windowTotal, ""); got != 100 {
+		t.Fatalf("durable total after reset = %d, want 100", got)
+	}
+	if got := readBaseline(windowTotal, ""); got != 100 {
+		t.Fatalf("total baseline = %d, want 100", got)
+	}
+	if got := readBaseline(windowDay, dayPeriod(day1)); got != 100 {
+		t.Fatalf("day baseline = %d, want 100", got)
+	}
+	// A late execution for work admitted on day1 arrives after day1 rolled
+	// over. It is counted in the admission period, and the day1 baseline makes
+	// only the excess effective.
 	late := h.mustAdmit(AdmitInput{ID: "req-late", TraceID: "trace-late",
 		KeyID: key.ID, RequestedModel: testModel, At: day1})
 	h.clock.advance(24 * time.Hour)
@@ -278,32 +308,36 @@ func TestResetBaselinePeriodRolloverLateUsageCleanup(t *testing.T) {
 		Raw:    pluginapi.UsageDetail{InputTokens: 50, TotalTokens: 50},
 		Tokens: tokens(50, 0, 0, 0, 0), Quality: QualityComplete, At: h.clock.now()})
 	h.mustComplete(Completion{ID: late.ID, TraceID: late.TraceID, Outcome: OutcomeSucceeded, At: h.clock.now()})
-	// It is booked into the day1 counter but the day1 baseline still applies to
-	// the lifetime view, so the effective total grows by exactly the late charge.
-	if got := h.key(key.ID); got.SpentMicroUSD != 150 || got.QuotaUsedMicroUSD != 50 {
-		t.Fatalf("late charge not counted: %+v", got)
+	if got := readCounter(windowDay, dayPeriod(day1)); got != 150 {
+		t.Fatalf("day1 durable counter = %d, want 150", got)
 	}
-	var day1Counter int64
-	if err := h.store.db.QueryRow(`SELECT micro_usd FROM key_money_counters WHERE key_id = ? AND win = 'day' AND period = ?`,
-		key.ID, dayPeriod(day1)).Scan(&day1Counter); err != nil {
-		t.Fatal(err)
+	if got := readCounter(windowTotal, ""); got != 150 {
+		t.Fatalf("lifetime counter = %d, want 150", got)
 	}
-	if day1Counter != 150 {
-		t.Fatalf("day1 durable counter = %d, want 150", day1Counter)
+	if effective, err := effectiveToken(h.ctx(), h.store.db, key.ID, testModel, windowTotal, "", 150); err != nil || effective != 50 {
+		t.Fatalf("effective lifetime = %d (%v), want the 50 late tokens", effective, err)
 	}
-	// A new period starts with no baseline: today's usage counts from zero.
+	// A new period starts with no day baseline: today's usage counts from zero.
 	chargeKey(h, key, testModel, "c", 30, h.clock.now())
-	got := h.key(key.ID)
-	if got.SpentMicroUSD != 180 || got.QuotaUsedMicroUSD != 80 || got.DailyUsedMicroUSD != 30 {
-		t.Fatalf("after rollover = %+v", got)
+	if got := readCounter(windowDay, dayPeriod(h.clock.now())); got != 30 {
+		t.Fatalf("day2 durable counter = %d, want 30 (the late usage belongs to day1)", got)
+	}
+	if got := readCounter(windowTotal, ""); got != 180 {
+		t.Fatalf("lifetime counter = %d, want 180", got)
+	}
+	if effective, err := effectiveToken(h.ctx(), h.store.db, key.ID, testModel, windowDay, dayPeriod(h.clock.now()), 30); err != nil || effective != 30 {
+		t.Fatalf("effective day2 = %d (%v), want the unbaselined 30", effective, err)
 	}
 	// A repeated reset only raises the baseline and can never go negative.
 	for range 2 {
-		if _, err := h.store.ResetSpend(h.ctx(), ResetSpec{KeyID: key.ID, Total: true, Reason: "repeat"}); err != nil {
+		if _, err := h.store.ResetTokens(h.ctx(), ResetSpec{KeyID: key.ID, Total: true, Reason: "repeat"}); err != nil {
 			t.Fatal(err)
 		}
-		if got := h.key(key.ID); got.QuotaUsedMicroUSD != 0 || got.SpentMicroUSD != 180 {
-			t.Fatalf("repeated reset = %+v", got)
+		if got := readBaseline(windowTotal, ""); got != 180 {
+			t.Fatalf("repeated reset baseline = %d, want 180", got)
+		}
+		if effective, err := effectiveToken(h.ctx(), h.store.db, key.ID, testModel, windowTotal, "", 180); err != nil || effective != 0 {
+			t.Fatalf("repeated reset effective = %d (%v), want 0", effective, err)
 		}
 	}
 	// Rotation keeps the baseline keyed by key id and the identity stable.
@@ -311,65 +345,52 @@ func TestResetBaselinePeriodRolloverLateUsageCleanup(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if rotated.Scope != key.Scope || rotated.QuotaUsedMicroUSD != 0 || rotated.SpentMicroUSD != 180 {
-		t.Fatalf("rotate changed reset view: %+v", rotated)
+	if rotated.Scope != key.Scope {
+		t.Fatalf("rotate changed identity: %+v", rotated)
+	}
+	if got := readBaseline(windowTotal, ""); got != 180 {
+		t.Fatalf("baseline after rotate = %d, want 180", got)
 	}
 	if _, err := h.store.Authenticate(h.ctx(), material); !errors.Is(err, ErrUnauthorized) {
 		t.Fatalf("old material still valid after rotate: %v", err)
 	}
 	// Cleanup deletes disposable history but never the lifetime counter or its
-	// baseline, so the effective total survives.
+	// baseline, so the effective view is preserved.
 	h.clock.advance(120 * 24 * time.Hour)
 	if _, err := h.store.Cleanup(h.ctx()); err != nil {
 		t.Fatal(err)
 	}
-	after := h.key(key.ID)
-	if after.SpentMicroUSD != 180 || after.QuotaUsedMicroUSD != 0 {
-		t.Fatalf("after cleanup = %+v", after)
+	if got := readCounter(windowTotal, ""); got != 180 {
+		t.Fatalf("lifetime counter after cleanup = %d, want 180", got)
 	}
-	var totalCounter int64
-	if err := h.store.db.QueryRow(`SELECT micro_usd FROM key_money_counters WHERE key_id = ? AND win = 'total'`,
-		key.ID).Scan(&totalCounter); err != nil {
-		t.Fatal(err)
-	}
-	if totalCounter != 180 {
-		t.Fatalf("lifetime counter = %d, want 180", totalCounter)
+	if effective, err := effectiveToken(h.ctx(), h.store.db, key.ID, testModel, windowTotal, "", 180); err != nil || effective != 0 {
+		t.Fatalf("effective after cleanup = %d (%v), want 0", effective, err)
 	}
 }
 
-// A reset reopens quota headroom on actual usage without erasing the durable
-// counters, so the following admissions gate on real usage again.
-func TestResetBaselineReopensQuotaOnActualUsage(t *testing.T) {
+// A dollar budget never gates admission; only token limits and token resets
+// do. The four budget fields are display metadata retained on the spec.
+func TestMoneyBudgetsNeverGateAdmission(t *testing.T) {
 	h := newHarness(t)
 	h.mustPrice(testModel, Rates{Input: 1_000_000})
-	key, _ := h.mustKey(KeySpec{Enabled: true, QuotaMicroUSD: 100})
+	key, _ := h.mustKey(KeySpec{Enabled: true, QuotaMicroUSD: 1,
+		DailyMicroUSD: 1, WeeklyMicroUSD: 1, MonthlyMicroUSD: 1})
 	at := h.clock.now()
-	chargeKey(h, key, testModel, "a", 100, at)
-	if _, err := h.store.Admit(h.ctx(), AdmitInput{ID: "blocked", TraceID: "blocked",
-		KeyID: key.ID, RequestedModel: testModel, At: at}); !errors.Is(err, ErrQuota) {
-		t.Fatalf("quota not enforced: %v", err)
+	chargeKey(h, key, testModel, "a", 1_000_000, at)
+	for i, id := range []string{"second", "third"} {
+		if _, err := h.store.Admit(h.ctx(), AdmitInput{ID: id, TraceID: id,
+			KeyID: key.ID, RequestedModel: testModel, At: at}); err != nil {
+			t.Fatalf("request %d denied by a display budget: %v", i+1, err)
+		}
 	}
-	if _, err := h.store.ResetSpend(h.ctx(), ResetSpec{KeyID: key.ID, Total: true, Reason: "reset"}); err != nil {
-		t.Fatal(err)
-	}
-	// Effective usage is now zero, so the next admission is admitted.
-	if _, err := h.store.Admit(h.ctx(), AdmitInput{ID: "first", TraceID: "first",
-		KeyID: key.ID, RequestedModel: testModel, At: at}); err != nil {
-		t.Fatalf("reset did not reopen quota: %v", err)
-	}
-	// Charging the reopened window back to the limit denies the next one.
-	chargeKey(h, key, testModel, "b", 100, at)
-	if _, err := h.store.Admit(h.ctx(), AdmitInput{ID: "second", TraceID: "second",
-		KeyID: key.ID, RequestedModel: testModel, At: at}); !errors.Is(err, ErrQuota) {
-		t.Fatalf("re-accumulated usage not enforced after reset: %v", err)
-	}
-	// The durable lifetime total still reflects every real charge.
-	if got := h.key(key.ID).SpentMicroUSD; got != 200 {
-		t.Fatalf("lifetime spend = %d, want the durable 200", got)
+	// Derived cost exceeds every configured budget, and that is report-only.
+	if cost, unpriced := h.costOf(key.ID); cost != 1_000_000 || unpriced != 0 {
+		t.Fatalf("derived cost = %d/%d, want the priced million tokens", cost, unpriced)
 	}
 }
 
-// Token budgets honour the same reset baselines as money budgets.
+// Token budgets gate admission and token resets reopen their headroom without
+// erasing the durable counters.
 func TestResetTokenBudget(t *testing.T) {
 	h := newHarness(t)
 	h.mustPrice(testModel, Rates{Input: 1_000_000})
@@ -381,12 +402,22 @@ func TestResetTokenBudget(t *testing.T) {
 		KeyID: key.ID, RequestedModel: testModel, At: at}); !errors.Is(err, ErrQuota) {
 		t.Fatalf("token limit not enforced: %v", err)
 	}
-	if _, err := h.store.ResetSpend(h.ctx(), ResetSpec{KeyID: key.ID, Total: true, Reason: "reset"}); err != nil {
+	if _, err := h.store.ResetTokens(h.ctx(), ResetSpec{KeyID: key.ID, Total: true, Reason: "reset"}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := h.store.Admit(h.ctx(), AdmitInput{ID: "allowed", TraceID: "allowed",
 		KeyID: key.ID, RequestedModel: testModel, At: at}); err != nil {
 		t.Fatalf("token reset did not reopen budget: %v", err)
+	}
+	// Charging the reopened budget back to the limit denies the next request.
+	chargeKey(h, key, testModel, "b", 100, at)
+	if _, err := h.store.Admit(h.ctx(), AdmitInput{ID: "blocked-again", TraceID: "blocked-again",
+		KeyID: key.ID, RequestedModel: testModel, At: at}); !errors.Is(err, ErrQuota) {
+		t.Fatalf("re-accumulated tokens not enforced after reset: %v", err)
+	}
+	// The durable lifetime counter still reflects every real token.
+	if got, err := tokenCounter(h.ctx(), h.store.db, key.ID, testModel, windowTotal, ""); err != nil || got != 200 {
+		t.Fatalf("lifetime tokens = %d (%v), want the durable 200", got, err)
 	}
 }
 
@@ -454,7 +485,7 @@ func TestAuditTrailFiltersAndPaging(t *testing.T) {
 	if _, err := h.store.RevealKey(h.ctx(), key.ID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := h.store.ResetSpend(h.ctx(), ResetSpec{KeyID: key.ID, Total: true, Reason: "audit"}); err != nil {
+	if _, err := h.store.ResetTokens(h.ctx(), ResetSpec{KeyID: key.ID, Total: true, Reason: "audit"}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := h.store.UpdateCaller(h.ctx(), CallerSpec{ID: caller.ID, DisplayName: "Acme 2", Enabled: true}); err != nil {
@@ -520,7 +551,7 @@ func TestResetAndDeleteAreAuditTransactional(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := h.store.ResetSpend(h.ctx(), ResetSpec{IDs: []string{key.ID, "missing"},
+	if _, err := h.store.ResetTokens(h.ctx(), ResetSpec{IDs: []string{key.ID, "missing"},
 		Total: true, Reason: "partial"}); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("partial reset err = %v, want not found", err)
 	}
@@ -531,8 +562,11 @@ func TestResetAndDeleteAreAuditTransactional(t *testing.T) {
 	if after.Total != before.Total {
 		t.Fatalf("failed reset wrote audit: %d -> %d", before.Total, after.Total)
 	}
-	if got := h.key(key.ID); got.QuotaUsedMicroUSD != 100 {
-		t.Fatalf("failed reset changed use: %+v", got)
+	if got, err := tokenCounter(h.ctx(), h.store.db, key.ID, testModel, windowTotal, ""); err != nil || got != 100 {
+		t.Fatalf("failed reset changed tokens = %d (%v), want 100", got, err)
+	}
+	if got, err := baselineToken(h.ctx(), h.store.db, key.ID, testModel, windowTotal, ""); err != nil || got != 0 {
+		t.Fatalf("failed reset wrote a baseline = %d (%v), want none", got, err)
 	}
 	if err := h.store.DeleteKey(h.ctx(), "missing", "x"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("delete missing err = %v", err)

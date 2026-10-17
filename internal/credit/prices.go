@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"math"
 	"math/big"
+	"sort"
 	"strings"
 )
 
@@ -45,22 +46,22 @@ func (p Price) IsPerImage() bool { return resolveBillingMode(p.BillingMode) == b
 // An omitted count means one image. An explicitly declared count must be one of
 // the supported 1..32 values: it is refused rather than silently billed as a
 // different number, so an unsupported request can never be under- or
-// over-charged. Token prices never call this, so an irrelevant image hint on a
-// token request is not rejected.
-func imageCountFor(in AdmitInput) (int64, error) {
-	if !in.ImageCountDeclared {
+// over-charged. Only the price preview uses this; a logged execution is never
+// priced per image, because the host reports tokens and not real image counts.
+func imageCountFor(declared bool, count int64) (int64, error) {
+	if !declared {
 		return 1, nil
 	}
-	if in.ImageCount < 1 || in.ImageCount > maxImageCount {
+	if count < 1 || count > maxImageCount {
 		return 0, fmt.Errorf("%w: requested image count %d is outside the supported 1..%d range",
-			ErrInvalid, in.ImageCount, maxImageCount)
+			ErrInvalid, count, maxImageCount)
 	}
-	return in.ImageCount, nil
+	return count, nil
 }
 
-// normalizeServiceTier maps upstream service_tier spellings onto the billing
-// key used by service price tiers. The common default spellings collapse to the
-// empty key, which means "no special service card"; "prio" is an alias of
+// normalizeServiceTier maps upstream service_tier spellings onto the canonical
+// tier key used by service price tiers. The common default spellings collapse
+// to the empty key, which means "no special service card"; "prio" is an alias of
 // "priority"; every other value keeps its identity so an explicit tier can
 // still match it.
 func normalizeServiceTier(value string) string {
@@ -190,13 +191,6 @@ func unmarshalTiers(raw string) ([]PriceTier, error) {
 		return nil, fmt.Errorf("%w: decode price tiers", ErrInvalid)
 	}
 	return normalizeTiers(tiers)
-}
-
-// computeCost converts canonical token buckets into an integer microUSD cost
-// using the base rates. The product is summed exactly and rounded up once,
-// never per bucket.
-func computeCost(price Price, tokens Tokens) (int64, error) {
-	return ratesCost(price.Rates, tokens)
 }
 
 // ratesCost is the exact, round-once bucket sum. It is shared by the base price
@@ -349,13 +343,7 @@ func perImageCost(price Price, imageCount int64) (int64, error) {
 	return price.PerImageMicroUSD * imageCount, nil
 }
 
-// requestCost prices the canonical tokens of one execution with the frozen
-// request price and its frozen tiers. Per-image prices are priced from the
-// frozen image count elsewhere, so this helper always bills token buckets.
-func requestCost(price Price, tiers []PriceTier, tokens Tokens, serviceTier string) (int64, error) {
-	return tokenCost(price, tiers, tokens, serviceTier)
-}
-
+// normalizePrice is the write-path validation of one price book entry.
 func normalizePrice(p Price) (Price, error) {
 	p.Model = strings.TrimSpace(p.Model)
 	if p.Model == "" {
@@ -468,4 +456,132 @@ func lookupPrice(ctx context.Context, q querier, model string) (Price, error) {
 		return Price{}, err
 	}
 	return p, nil
+}
+
+// priceBook is the pricing view of one query: the exact price table and the
+// operator rules, read once from a single snapshot and then consulted per
+// actual model. Matching is cached per model, so a query never issues one price
+// lookup per execution, and resolution never consults a durable snapshot.
+//
+// A disabled rule is skipped: it simply does not participate in pricing, which
+// is why a disabled rule can never deny a model or gate a request.
+type priceBook struct {
+	exact   map[string]Price
+	rules   []PricingRule
+	matches map[string]priceResolution
+}
+
+// priceResolution is the effective price of one actual model: the winning rate
+// card, its tiers and whether any candidate matched at all. An unmatched model
+// is unpriced, never free.
+type priceResolution struct {
+	price  Price
+	tiers  []PriceTier
+	ruleID string
+	priced bool
+}
+
+// loadPriceBook reads every price and rule in one pass, without one query per
+// model. Both halves come from the caller's snapshot, so a query that prices
+// history sees one consistent price book.
+func loadPriceBook(ctx context.Context, q querier) (*priceBook, error) {
+	book := &priceBook{exact: map[string]Price{}, matches: map[string]priceResolution{}}
+	rows, err := q.QueryContext(ctx, `SELECT `+priceColumns+` FROM prices`)
+	if err != nil {
+		return nil, fmt.Errorf("load price book: %w", err)
+	}
+	for rows.Next() {
+		p, err := scanPrice(rows.Scan)
+		if err != nil {
+			rows.Close()
+			return nil, err
+		}
+		book.exact[p.Model] = p
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, fmt.Errorf("iterate price book: %w", err)
+	}
+	rows.Close()
+	rules, err := listPricingRules(ctx, q)
+	if err != nil {
+		return nil, err
+	}
+	book.rules = rules
+	return book, nil
+}
+
+// resolve returns the effective price of one actual model id, caching the
+// outcome so repeated executions of the same model share one match. The model
+// is compared verbatim: an execution model is the price key, and a request
+// alias never stands in for it.
+func (b *priceBook) resolve(model string) (priceResolution, error) {
+	if hit, ok := b.matches[model]; ok {
+		return hit, nil
+	}
+	candidates := make([]pricingCandidate, 0, len(b.rules)+1)
+	if exact, ok := b.exact[model]; ok {
+		candidates = append(candidates, pricingCandidate{
+			priority: 0, kindRank: matchKindRankExact, sourceRank: sourceRankPrice, price: exact,
+		})
+	}
+	for i := range b.rules {
+		rule := b.rules[i]
+		// A disabled rule takes no part in pricing: skipping it lets the next
+		// candidate win instead of turning the rule into a permission gate.
+		if !rule.Enabled {
+			continue
+		}
+		matched, err := ruleMatches(rule, model)
+		if err != nil {
+			return priceResolution{}, err
+		}
+		if !matched {
+			continue
+		}
+		price := rule.Price
+		price.Model = model
+		candidates = append(candidates, pricingCandidate{
+			priority: rule.Priority, kindRank: matchKindRank(rule.MatchKind), sourceRank: sourceRankRule,
+			id: rule.ID, price: price, tiers: rule.Tiers,
+		})
+	}
+	var out priceResolution
+	if len(candidates) > 0 {
+		sort.SliceStable(candidates, func(i, j int) bool { return candidateLess(candidates[i], candidates[j]) })
+		winner := candidates[0]
+		out = priceResolution{price: winner.price, tiers: winner.tiers, ruleID: winner.id, priced: true}
+	}
+	b.matches[model] = out
+	return out, nil
+}
+
+// executionCost prices one recorded execution with the current book.
+//
+// It returns the cost and whether the execution is priced at all. An execution
+// is unpriced when its usage is not trustworthy, when its actual model has no
+// price, when the winning price bills per image (the host reports no real image
+// count, so a per-image amount cannot be proven from the log), or when the
+// product cannot be represented as an exact int64. Unpriced is reported as
+// "not priced" rather than as an error or as a fabricated zero: a wild price
+// must never fail a whole report, and it must never become a silent amount.
+func (b *priceBook) executionCost(model string, tokens Tokens, serviceTier string, reliable bool) (int64, bool, error) {
+	if !reliable {
+		return 0, false, nil
+	}
+	res, err := b.resolve(model)
+	if err != nil {
+		return 0, false, err
+	}
+	if !res.priced || res.price.IsPerImage() {
+		return 0, false, nil
+	}
+	cost, err := tokenCost(res.price, res.tiers, tokens, serviceTier)
+	if err != nil {
+		if errors.Is(err, ErrInvalid) {
+			return 0, false, nil
+		}
+		return 0, false, err
+	}
+	return cost, true, nil
 }

@@ -10,19 +10,21 @@ import (
 )
 
 // Admit admits one execution. It is idempotent by lifecycle ID and persists the
-// trace/key binding and frozen price snapshot before any execution starts.
+// trace/key binding and the request-time service tier fact before any execution
+// starts.
 //
-// Admission is a post-usage gate: it only checks key permissions, the
-// requested-model price and the effective usage already consumed. It never
-// estimates what the request will cost, so a positive remaining quota admits a
-// very large declared output limit or input payload, and concurrent in-flight
-// requests may legitimately exceed a quota.
+// Admission is a post-usage gate: it checks only the key's permissions and the
+// effective usage already consumed. It reads no price and computes no amount, so
+// a missing price, a disabled pricing rule, an exhausted budget figure or an
+// unrepresentable rate can never block a request. Concurrent in-flight requests
+// may legitimately exceed any limit.
 func (s *Store) Admit(ctx context.Context, in AdmitInput) (Request, error) {
 	if strings.TrimSpace(in.ID) == "" || strings.TrimSpace(in.TraceID) == "" ||
 		strings.TrimSpace(in.KeyID) == "" || strings.TrimSpace(in.RequestedModel) == "" {
 		return Request{}, fmt.Errorf("%w: id, trace id, key id and requested model are required", ErrInvalid)
 	}
 	at := s.resolveAt(in.At)
+	serviceTier := normalizeServiceTier(in.ServiceTier)
 	var out Request
 	err := s.inTx(ctx, func(tx *sql.Tx) error {
 		existing, err := loadRequestByID(ctx, tx, in.ID)
@@ -31,11 +33,7 @@ func (s *Store) Admit(ctx context.Context, in AdmitInput) (Request, error) {
 			if existing.traceID != in.TraceID || existing.keyID != in.KeyID || existing.model != in.RequestedModel {
 				return fmt.Errorf("%w: lifecycle id already bound to another request", ErrConflict)
 			}
-			adjustments, err := adjustmentTotals(ctx, tx, "r.id = ?", []any{existing.id})
-			if err != nil {
-				return err
-			}
-			out = existing.toRequest(nil, adjustments)
+			out = existing.toRequest(nil)
 			return nil
 		case errors.Is(err, ErrNotFound):
 		default:
@@ -59,24 +57,12 @@ func (s *Store) Admit(ctx context.Context, in AdmitInput) (Request, error) {
 		if key.spec.ExpiresAt != nil && !at.Before(*key.spec.ExpiresAt) {
 			return ErrUnauthorized
 		}
+		// A soft deleted key must never admit new work.
+		if key.deletedAt != nil {
+			return ErrUnauthorized
+		}
 		if !modelAllowed(key.spec.AllowedModels, in.RequestedModel) {
 			return fmt.Errorf("%w: model %s is not allowed for this key", ErrDenied, in.RequestedModel)
-		}
-		price, tiers, ruleID, err := resolvePricing(ctx, tx, in.RequestedModel)
-		if err != nil {
-			return err
-		}
-		// Only a per-image price cares about the requested image count, and only
-		// then is an unsupported explicit count refused: a token request may
-		// legitimately carry an image hint that is irrelevant to its billing.
-		images := int64(0)
-		if price.IsPerImage() {
-			if images, err = imageCountFor(in); err != nil {
-				return err
-			}
-		}
-		if err := s.checkMoneyLimits(ctx, tx, key, at); err != nil {
-			return err
 		}
 		if err := s.checkConcurrency(ctx, tx, key); err != nil {
 			return err
@@ -84,89 +70,28 @@ func (s *Store) Admit(ctx context.Context, in AdmitInput) (Request, error) {
 		if err := s.checkTokenLimits(ctx, tx, key, in.RequestedModel, at); err != nil {
 			return err
 		}
-		frozen := priceSnapshot{
-			Price:       price,
-			Tiers:       tiers,
-			RuleID:      ruleID,
-			ServiceTier: normalizeServiceTier(in.ServiceTier),
-			ImageCount:  images,
-		}
-		snapshot, err := encodePriceSnapshot(frozen)
-		if err != nil {
-			return err
-		}
 		if _, err := tx.ExecContext(ctx, `INSERT INTO requests
-			(id, trace_id, key_id, model, state, outcome, status_code, started_at, completed_at,
-			 charge_micro_usd, resolved, price_snapshot)
-			VALUES(?,?,?,?,?,'',0,?,NULL,0,'',?)`,
+			(id, trace_id, key_id, model, state, outcome, status_code, started_at, completed_at, service_tier)
+			VALUES(?,?,?,?,?,'',0,?,NULL,?)`,
 			in.ID, in.TraceID, in.KeyID, in.RequestedModel, stateActive, unixNano(at),
-			snapshot); err != nil {
+			serviceTier); err != nil {
 			return fmt.Errorf("insert request: %w", err)
 		}
 		out = (&reqRow{
-			id:        in.ID,
-			traceID:   in.TraceID,
-			keyID:     in.KeyID,
-			model:     in.RequestedModel,
-			state:     stateActive,
-			startedAt: at,
-			snapshot:  frozen,
-		}).toRequest(nil, 0)
+			id:          in.ID,
+			traceID:     in.TraceID,
+			keyID:       in.KeyID,
+			model:       in.RequestedModel,
+			state:       stateActive,
+			startedAt:   at,
+			serviceTier: serviceTier,
+		}).toRequest(nil)
 		return nil
 	})
 	if err != nil {
 		return Request{}, err
 	}
 	return out, nil
-}
-
-// checkMoneyLimits enforces the soft monetary admission limits of a key.
-//
-// Every configured limit > 0 rejects the next request once the actual effective
-// usage has reached it. Effective usage is the durable counter minus the
-// operator reset baseline; no in-flight prediction is added. A key with a
-// positive remaining quota therefore always admits, however large the payload.
-func (s *Store) checkMoneyLimits(ctx context.Context, tx *sql.Tx, key *keyRow, at time.Time) error {
-	// A soft deleted key must never admit new work. This is the single
-	// admission gate for deleted keys: money limits are always evaluated, even
-	// when no monetary limit is configured, before any execution is admitted.
-	if key.deletedAt != nil {
-		return ErrUnauthorized
-	}
-	if quota := key.spec.QuotaMicroUSD; quota > 0 {
-		effective, err := effectiveMoney(ctx, tx, key.id, windowTotal, periodOf(windowTotal, at), key.spent)
-		if err != nil {
-			return err
-		}
-		if effective >= quota {
-			return fmt.Errorf("%w: lifetime monetary limit reached", ErrQuota)
-		}
-	}
-	limits := []struct {
-		win   string
-		limit int64
-	}{
-		{windowDay, key.spec.DailyMicroUSD},
-		{windowWeek, key.spec.WeeklyMicroUSD},
-		{windowMonth, key.spec.MonthlyMicroUSD},
-	}
-	for _, l := range limits {
-		if l.limit <= 0 {
-			continue
-		}
-		raw, err := moneyCounter(ctx, tx, key.id, l.win, periodOf(l.win, at))
-		if err != nil {
-			return err
-		}
-		effective, err := effectiveMoney(ctx, tx, key.id, l.win, periodOf(l.win, at), raw)
-		if err != nil {
-			return err
-		}
-		if effective >= l.limit {
-			return fmt.Errorf("%w: %s monetary limit reached", ErrQuota, l.win)
-		}
-	}
-	return nil
 }
 
 func (s *Store) checkConcurrency(ctx context.Context, tx *sql.Tx, key *keyRow) error {
