@@ -6,7 +6,8 @@ C ABI (``cliproxy_plugin_init`` + ``cliproxyPluginCall``) with ctypes. The
 credit-manager makes no host callbacks -- it is passive, with no executor,
 router, scheduler or model-execution bridge -- so a host API with ABI 1 and no
 function pointers is sufficient. This verifies ABI 1 / schema 6 negotiation,
-that no executor/router/scheduler capability is declared, and that registering
+that an undefined or older schema is refused, that no
+executor/router/scheduler capability is declared, and that registering
 issues no host model-execution callback.
 """
 
@@ -100,7 +101,7 @@ class NativePlugin:
             pass
 
 
-@case("native.abi_probe", "real .so negotiates ABI1/schema6 and declares only passive capabilities")
+@case("native.abi_probe", "real .so negotiates ABI1/schema6, refuses an undefined/older schema and declares only passive capabilities")
 def abi_probe(ctx):
     plugin = NativePlugin(ctx.plugin)
     rc = plugin.init()
@@ -131,11 +132,34 @@ def abi_probe(ctx):
     ident = json.loads(raw)["result"]["identifier"]
     check_eq(ident, "credit-manager", "frontend auth provider identifier")
 
-    # A host whose RPC schema predates the minimum contract must be refused.
-    rc, raw = plugin.call("plugin.register", {"config_yaml": "", "schema_version": 1})
+    # A host whose RPC schema is missing, zero, or predates the current contract
+    # must be refused: the plugin implements exactly one schema and never
+    # negotiates down to an older or undefined one.
+    for label, body in (
+        ("missing", {"config_yaml": ""}),
+        ("zero", {"config_yaml": "", "schema_version": 0}),
+        ("one", {"config_yaml": "", "schema_version": 1}),
+        ("five", {"config_yaml": "", "schema_version": 5}),
+    ):
+        rc, raw = plugin.call("plugin.register", body)
+        refused = json.loads(raw)
+        check(not refused.get("ok") and refused.get("error", {}).get("code") == "unsupported_host",
+              f"{label} host schema must be refused with unsupported_host: {refused}")
+
+    # A filename-derived identity outside the one published id must stop
+    # admissions, not merely ignore its accounting notifications.
+    rc, raw = plugin.call("management.register", {
+        "resource_base_path": "/v0/resource/plugins/credit-manager",
+    })
     refused = json.loads(raw)
-    check(not refused.get("ok") and refused.get("error", {}).get("code") == "unsupported_host",
-          f"schema<6 host must be refused: {refused}")
+    check(not refused.get("ok") and refused.get("error", {}).get("code") == "unsupported_plugin_id",
+          f"a renamed library must be refused: {refused}")
+    rc, raw = plugin.call("request.intercept_before", {})
+    stopped = json.loads(raw)
+    check(stopped.get("ok"), f"interceptor must return a termination envelope: {stopped}")
+    termination = stopped["result"]
+    check(termination.get("terminate") is True and termination.get("status_code") == 503,
+          f"a renamed library must not execute unbillable requests: {stopped}")
 
     plugin.shutdown()
     # No host model-execution bridge: the plugin never invokes a host callback at

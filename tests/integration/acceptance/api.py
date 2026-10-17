@@ -38,16 +38,16 @@ class Manager:
       ``/v0/management/plugins/credit-manager`` and which serves the financial
       ``/api/*`` routes.
     * The host's plugin *instance* id (the loaded library id, i.e. the
-      acceptance ``--plugin-id``), which names the instance in the host config
-      and therefore names the host's generic ``/v0/management/plugins/<id>/config``
-      route.
+      acceptance ``--plugin-id``, default ``cliproxyapi-credit-manager``), which
+      names the instance in the host config and therefore names the host's
+      generic ``/v0/management/plugins/<id>/config`` route.
 
-    With the default ``--plugin-id credit-manager`` they coincide, which hides
-    the distinction; with any other library name they diverge, so the config
-    route must use the instance id.
+    The default instance id is the released library id, which the host derives
+    from the plugin library filename, so the config route uses that id while the
+    financial routes stay on the plugin's fixed prefix.
     """
 
-    def __init__(self, base_url, secret, plugin_id="credit-manager", base=MANAGER_BASE):
+    def __init__(self, base_url, secret, plugin_id="cliproxyapi-credit-manager", base=MANAGER_BASE):
         self.base_url = base_url
         self.secret = secret
         self.plugin_id = plugin_id          # host plugin instance id (library id)

@@ -18,7 +18,7 @@ COMMIT_RE = re.compile(r"[0-9a-f]{40}")
 
 
 class Context:
-    def __init__(self, artifacts: Path, cpa: Path, plugin: Path, plugin_id="credit-manager",
+    def __init__(self, artifacts: Path, cpa: Path, plugin: Path, plugin_id="cliproxyapi-credit-manager",
                  expected_version="0.1.0", expected_commit=""):
         self.artifacts = Path(artifacts)
         self.cpa = Path(cpa)

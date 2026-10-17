@@ -39,7 +39,9 @@ def parse_args(argv):
     parser.add_argument("--cpa", required=True)
     parser.add_argument("--plugin", required=True)
     parser.add_argument("--artifacts", required=True)
-    parser.add_argument("--plugin-id", default="credit-manager")
+    parser.add_argument("--plugin-id", default="cliproxyapi-credit-manager",
+                        help="plugin library/instance id; the host derives it from the plugin "
+                             "library filename. Defaults to the released library id.")
     parser.add_argument("--only", default="", help="run only cases whose name contains this substring")
     parser.add_argument("--modules", default="", help="comma separated case module names (default: all present)")
     parser.add_argument("--expected-version", default="0.1.0",

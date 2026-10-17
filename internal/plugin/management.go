@@ -73,7 +73,15 @@ func (m *Manager) handleManagementRegister(request []byte) ([]byte, error) {
 	}
 	resourceBase := strings.TrimRight(strings.TrimSpace(req.ResourceBasePath), "/")
 	if resourceBase == "" {
-		resourceBase = "/v0/resource/plugins/" + PluginID
+		resourceBase = "/v0/resource/plugins/" + libraryID
+	}
+	if resourceBase != "/v0/resource/plugins/"+libraryID {
+		// A renamed library would emit a different AccessProvider. Stop new
+		// admissions rather than execute requests whose usage we cannot own.
+		m.quiesce()
+		return errorEnvelope(&PluginError{
+			Code: "unsupported_plugin_id", Message: "keep the published plugin library filename",
+		})
 	}
 
 	routes := make([]pluginapi.ManagementRoute, 0, 10)
@@ -134,7 +142,7 @@ func managementRouteDescription(method, suffix string) string {
 	case "/api/delete-key":
 		return "Soft delete a credit key, preserving its ledger."
 	case "/api/reset-spend":
-		return "Reset selected quota baselines without clearing history or holds."
+		return "Reset selected quota baselines without clearing history."
 	case "/api/callers":
 		return "Manage caller attribution metadata."
 	case "/api/audit":
@@ -214,8 +222,8 @@ func (m *Manager) handleManagement(request []byte) (resp []byte, err error) {
 }
 
 // resourceMarker anchors a public resource path to its plugin directory. The
-// segment after the marker is the host-derived plugin id and must be one of this
-// plugin's own library ids; the remainder is then matched against the exact
+// segment after the marker is the host-derived plugin id and must be this
+// plugin's own library id; the remainder is then matched against the exact
 // allow list.
 const resourceMarker = "/resource/plugins/"
 
@@ -236,10 +244,10 @@ func resourceRelativePath(requestPath string) (string, bool) {
 		return "", false
 	}
 	// The plugin id segment must be this plugin's own resource directory: the
-	// segment is the host-derived library id, which is either the released name
-	// or the short legacy name. Any other plugin id is not this plugin's traffic.
+	// segment is the host-derived library id. Any other plugin id, including the
+	// short plugin route name, is not this plugin's traffic.
 	pluginID := rest[:slash]
-	if pluginID != PluginID && pluginID != releasedPluginID {
+	if pluginID != libraryID {
 		return "", false
 	}
 	relative := rest[slash+1:]

@@ -40,10 +40,6 @@ var (
 	SDKVersion = "v8.0.30"
 )
 
-// minHostSchema is the lowest RPC schema this plugin supports. Schema 6 is the
-// CPA v8.0.30 contract and is required to preserve raw management JSON.
-const minHostSchema = pluginabi.SchemaVersionRawManagementResponse
-
 // Metadata returns the registration metadata reported to the host.
 func Metadata() pluginapi.Metadata {
 	return pluginapi.Metadata{
@@ -102,23 +98,18 @@ type registrationCapability struct {
 	ManagementAPI                 bool `json:"management_api"`
 }
 
-// registrationResponse negotiates the schema conservatively: it never claims a
-// newer contract than this plugin implements, and it refuses a host whose RPC
-// schema predates the minimum supported CPA contract.
+// registrationResponse requires the current SDK contract and reports exactly
+// that schema; it never negotiates down to an older or undefined contract.
 func registrationResponse(hostSchema uint32) (registration, error) {
-	if hostSchema != 0 && hostSchema < minHostSchema {
+	if hostSchema < pluginabi.SchemaVersion {
 		return registration{}, &PluginError{
 			Code:       "unsupported_host",
-			Message:    "host RPC schema is older than the minimum supported contract",
+			Message:    "host RPC schema does not meet the current SDK contract",
 			HTTPStatus: 0,
 		}
 	}
-	schema := pluginabi.SchemaVersion
-	if hostSchema != 0 && hostSchema < schema {
-		schema = hostSchema
-	}
 	return registration{
-		SchemaVersion: schema,
+		SchemaVersion: pluginabi.SchemaVersion,
 		Metadata:      Metadata(),
 		Capabilities: registrationCapability{
 			FrontendAuthProvider:          true,

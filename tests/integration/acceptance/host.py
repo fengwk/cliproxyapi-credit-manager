@@ -53,7 +53,7 @@ class HostConfig:
         client_keys,
         openai_models,
         gemini_models,
-        plugin_id: str = "credit-manager",
+        plugin_id: str = "cliproxyapi-credit-manager",
         plugin_config: dict | None = None,
         plugins_dir=None,
         extra_plugin_yaml: str = "",

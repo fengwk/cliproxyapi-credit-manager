@@ -19,13 +19,11 @@ const authProviderID = "credit-manager"
 // accessProviderPrefix marks a frontend auth provider owned by a native plugin.
 const accessProviderPrefix = "plugin:"
 
-// releasedPluginID is the host-local library id derived from the released
-// shared library name (cliproxyapi-credit-manager.so).
-const releasedPluginID = "cliproxyapi-credit-manager"
-
-// legacyPluginID is the short library id used when the library is loaded under
-// the bare plugin name (credit-manager.so).
-const legacyPluginID = "credit-manager"
+// libraryID is the host-local plugin library id. The host derives it from the
+// released shared library name (cliproxyapi-credit-manager.so) and passes it in
+// the "plugin:<library-id>:<provider-id>" access provider string, so it is the
+// only spelling of this plugin's library identity.
+const libraryID = "cliproxyapi-credit-manager"
 
 // handleFrontendAuth resolves one inbound frontend authentication request. An
 // unauthenticated result is returned as an empty response so the exclusive
@@ -160,11 +158,11 @@ func isOwnAccessProvider(provider string) bool {
 	if !ok {
 		return false
 	}
-	libraryID, providerID, ok := strings.Cut(rest, ":")
+	owner, providerID, ok := strings.Cut(rest, ":")
 	if !ok {
 		return false
 	}
-	if libraryID != releasedPluginID && libraryID != legacyPluginID {
+	if owner != libraryID {
 		return false
 	}
 	return providerID == authProviderID

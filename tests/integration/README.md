@@ -81,7 +81,9 @@ Options:
 
 - `--only <substr>` run only cases whose name contains the substring.
 - `--modules core,retry` restrict to specific case modules (default: all).
-- `--plugin-id credit-manager` override the plugin library/instance id.
+- `--plugin-id cliproxyapi-credit-manager` override the plugin library/instance
+  id. The default is the released library id, which is what the host derives
+  from the installed library filename.
 - `--expected-version <v>` the exact bare release version the registration
   metadata must report (default `0.1.0`); must be non-empty.
 - `--expected-commit <40hex>` an explicit build commit the health diagnostic
@@ -103,8 +105,10 @@ The plugin involves two distinct ids: the plugin's *declared* management route
 prefix (fixed at `/v0/management/plugins/credit-manager`, serving `/api/*`) and
 the host plugin *instance* id (the loaded library id, e.g.
 `--plugin-id cliproxyapi-credit-manager`, naming the host's generic
-`/v0/management/plugins/<id>/config` route and the public resource base). With
-the default `--plugin-id credit-manager` they coincide.
+`/v0/management/plugins/<id>/config` route and the public resource base). The
+default instance id is the released library id the host derives from the library
+filename; the public resource base follows that id, so the short declared route
+prefix never names the resource directory.
 
 ## Output
 
@@ -121,7 +125,7 @@ Each case's host lives at `<artifacts>/host-<n>-<case>/` with `config.yaml`,
 
 | Module | Coverage |
 | --- | --- |
-| `abi` | Direct `.so` probe via ctypes: ABI 1 / RPC schema 6 negotiation, passive-only capabilities (no executor/router/scheduler), no host model-execution callback bridge at any lifecycle point, older-schema host rejected. |
+| `abi` | Direct `.so` probe via ctypes: ABI 1 / RPC schema 6 negotiation, an undefined (missing/0) or older host schema refused with `unsupported_host`, passive-only capabilities (no executor/router/scheduler), no host model-execution callback bridge at any lifecycle point. |
 | `core` | Host lists the plugin (enabled, bare numeric metadata version, published menu); health (build-identity diagnostic version carrying the commit); management auth gate (401 without/with wrong key). |
 | `accounting` | Exact cost (input 10 / output 4 / total 14 = 14 microUSD), canonical buckets, complete quality, distinct execution id, same-key ledger, all-zero price is free, unpriced model denied with no upstream call and no poisoning of other keys, a real usage whose upstream account label is the literal `warmup` is still billed in full. No settled request or key row exposes a hold/estimate field. |
 | `admission` | Soft post-usage limits: with 1 microUSD of quota left a large declared `max_tokens`/body is admitted and billed by actual usage; actual charges overrun a quota in full and only the next request is denied; four simultaneous same-key requests are all admitted with no estimated hold; 20 unresolved unknown-usage requests stay pending without blocking the same or another key; every admitted request keeps one unique execution and the ledger equals the exact sum of actual usage. |

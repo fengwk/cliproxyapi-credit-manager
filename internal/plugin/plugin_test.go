@@ -2,12 +2,14 @@ package plugin
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"sync"
@@ -22,6 +24,10 @@ import (
 )
 
 const testModel = "test-model"
+
+// testResourceBase is the canonical public resource base for this plugin's
+// released library id, which is the only resource directory the plugin serves.
+const testResourceBase = "/v0/resource/plugins/" + libraryID
 
 // harness is one configured plugin backed by real credit and capture stores in a
 // temporary directory.
@@ -265,23 +271,131 @@ func TestRegistrationDeclaresOnlyPassiveCapabilities(t *testing.T) {
 	}
 }
 
-// TestRegisterRejectsOldHostSchema enforces the minimum supported host contract.
+// TestRegisterRejectsOldHostSchema enforces the minimum supported host contract:
+// a missing, zero or older RPC schema is refused, no ledger is created, and the
+// refusal leaves a live manager and its data directory untouched.
 func TestRegisterRejectsOldHostSchema(t *testing.T) {
-	m := NewManager()
-	payload, err := json.Marshal(lifecycleRequest{ConfigYAML: captureYAML(t.TempDir()), SchemaVersion: 5})
-	if err != nil {
-		t.Fatalf("marshal: %v", err)
+	for _, tc := range []struct {
+		name     string
+		payload  map[string]any
+		wantCode string
+	}{
+		{name: "missing", payload: map[string]any{}, wantCode: "unsupported_host"},
+		{name: "zero", payload: map[string]any{"schema_version": 0}, wantCode: "unsupported_host"},
+		{name: "five", payload: map[string]any{"schema_version": 5}, wantCode: "unsupported_host"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			dataDir := filepath.Join(dir, "data")
+			// config_yaml is a []byte on the wire, so the payload is built as raw
+			// JSON with the base64 spelling the host uses, which also lets the
+			// "missing" case omit schema_version entirely.
+			payload := map[string]any{
+				"config_yaml": base64.StdEncoding.EncodeToString(captureYAML(dataDir)),
+			}
+			for key, value := range tc.payload {
+				payload[key] = value
+			}
+			raw, err := json.Marshal(payload)
+			if err != nil {
+				t.Fatalf("marshal: %v", err)
+			}
+			m := NewManager()
+			t.Cleanup(func() { _, _ = m.HandleCall(pluginabi.MethodPluginShutdown, nil) })
+			out, err := m.HandleCall(pluginabi.MethodPluginRegister, raw)
+			if err != nil {
+				t.Fatalf("register: %v", err)
+			}
+			var envelope pluginabi.Envelope
+			if err := json.Unmarshal(out, &envelope); err != nil {
+				t.Fatalf("decode envelope: %v", err)
+			}
+			if envelope.OK || envelope.Error == nil || envelope.Error.Code != tc.wantCode {
+				t.Fatalf("unsupported host schema must be rejected, got %s", out)
+			}
+			// A refused registration must not create the accounting store.
+			if _, statErr := os.Stat(dataDir); !errors.Is(statErr, os.ErrNotExist) {
+				t.Fatalf("refused registration created the data directory %s (err=%v)", dataDir, statErr)
+			}
+			if live, ok := m.begin(false); ok {
+				m.end()
+				t.Fatalf("refused registration left a live store: %+v", live)
+			}
+		})
 	}
-	raw, err := m.HandleCall(pluginabi.MethodPluginRegister, payload)
+}
+
+// TestUnsupportedHostSchemaLeavesLiveManagerServing verifies that refusing a
+// host whose RPC schema predates this plugin's contract neither quiesces the
+// live manager nor disturbs its ledger: the existing configuration keeps serving
+// and its accounting rows survive verbatim.
+func TestUnsupportedHostSchemaLeavesLiveManagerServing(t *testing.T) {
+	h := newHarness(t)
+	store := h.store()
+	ctx := context.Background()
+	before, err := store.ListKeys(ctx)
+	if err != nil {
+		t.Fatalf("ListKeys: %v", err)
+	}
+
+	out, err := h.m.HandleCall(pluginabi.MethodPluginRegister, []byte(`{"schema_version":5}`))
 	if err != nil {
 		t.Fatalf("register: %v", err)
 	}
 	var envelope pluginabi.Envelope
-	if err := json.Unmarshal(raw, &envelope); err != nil {
+	if err := json.Unmarshal(out, &envelope); err != nil {
 		t.Fatalf("decode envelope: %v", err)
 	}
 	if envelope.OK || envelope.Error == nil || envelope.Error.Code != "unsupported_host" {
-		t.Fatalf("old host schema must be rejected, got %s", raw)
+		t.Fatalf("unsupported host schema must be rejected, got %s", out)
+	}
+
+	if response := h.intercept(h.request("after-schema-reject", "trace-after-schema-reject")); response.Terminate {
+		t.Fatalf("a refused host schema must not stop the live manager: %+v", response)
+	}
+	after, err := h.store().ListKeys(ctx)
+	if err != nil {
+		t.Fatalf("ListKeys after rejection: %v", err)
+	}
+	if h.store() != store || !reflect.DeepEqual(after, before) {
+		t.Fatalf("refused host schema changed the ledger: before=%v after=%v", before, after)
+	}
+}
+
+// TestRegisterAcceptsCurrentHostSchemaAndReportsExactSchema pins the other half
+// of the contract: a current or newer host is served, and the negotiated schema
+// is exactly this plugin's implemented contract instead of the newer host's
+// unverified version.
+func TestRegisterAcceptsCurrentHostSchemaAndReportsExactSchema(t *testing.T) {
+	for _, hostSchema := range []uint32{pluginabi.SchemaVersion, pluginabi.SchemaVersion + 1} {
+		t.Run(fmt.Sprintf("host-%d", hostSchema), func(t *testing.T) {
+			m := NewManager()
+			t.Cleanup(func() { _, _ = m.HandleCall(pluginabi.MethodPluginShutdown, nil) })
+			payload, err := json.Marshal(lifecycleRequest{ConfigYAML: captureYAML(t.TempDir()), SchemaVersion: hostSchema})
+			if err != nil {
+				t.Fatalf("marshal: %v", err)
+			}
+			raw, err := m.HandleCall(pluginabi.MethodPluginRegister, payload)
+			if err != nil {
+				t.Fatalf("register: %v", err)
+			}
+			var envelope pluginabi.Envelope
+			if err := json.Unmarshal(raw, &envelope); err != nil {
+				t.Fatalf("decode envelope: %v", err)
+			}
+			if !envelope.OK {
+				t.Fatalf("register failed: %s", raw)
+			}
+			var registration struct {
+				SchemaVersion uint32 `json:"schema_version"`
+			}
+			if err := json.Unmarshal(envelope.Result, &registration); err != nil {
+				t.Fatalf("decode registration: %v", err)
+			}
+			if registration.SchemaVersion != pluginabi.SchemaVersion {
+				t.Fatalf("negotiated schema = %d, want %d", registration.SchemaVersion, pluginabi.SchemaVersion)
+			}
+		})
 	}
 }
 
@@ -339,12 +453,13 @@ func TestAuthRejectsUnknownCredential(t *testing.T) {
 	}
 }
 
-// TestOwnAccessProviderRequiresExactPluginID verifies a different plugin that
-// exposes a same-named provider is never treated as this plugin's traffic.
+// TestOwnAccessProviderRequiresExactPluginID verifies only this plugin's own
+// released library id and provider id are accepted, so a different plugin that
+// exposes a same-named provider -- including the library loaded under the short
+// plugin route name -- is never treated as this plugin's traffic.
 func TestOwnAccessProviderRequiresExactPluginID(t *testing.T) {
 	accepted := []string{
-		"plugin:cliproxyapi-credit-manager:" + authProviderID,
-		"plugin:credit-manager:" + authProviderID,
+		"plugin:" + libraryID + ":" + authProviderID,
 	}
 	for _, provider := range accepted {
 		if !isOwnAccessProvider(provider) {
@@ -354,15 +469,83 @@ func TestOwnAccessProviderRequiresExactPluginID(t *testing.T) {
 	rejected := []string{
 		"config-inline",
 		"plugin:other-plugin:" + authProviderID,
-		"plugin:cliproxyapi-credit-manager:credit-manager-key",
-		"plugin:cliproxyapi-credit-manager",
-		"plugin:cliproxyapi-credit-manager:credit-manager:extra",
+		// The short management route segment is not a library id.
+		"plugin:" + PluginID + ":" + authProviderID,
+		"plugin:" + libraryID + ":credit-manager-key",
+		"plugin:" + libraryID,
+		"plugin:" + libraryID + ":" + authProviderID + ":extra",
 		"plugin:credit-manager-admin:" + authProviderID,
 	}
 	for _, provider := range rejected {
 		if isOwnAccessProvider(provider) {
 			t.Fatalf("provider %q must not be recognised as this plugin's", provider)
 		}
+	}
+}
+
+// TestInterceptRequiresRequestedModel verifies the current-CPA input contract:
+// the requested model is the only id this plugin prices and freezes, so a
+// request that omits it is refused -- even when the host resolved a concrete
+// upstream model -- without creating any accounting row and without guessing an
+// id from the resolved model.
+func TestInterceptRequiresRequestedModel(t *testing.T) {
+	h := newHarness(t)
+	for _, tc := range []struct {
+		name    string
+		request pluginapi.RequestInterceptRequest
+	}{
+		{name: "missing", request: pluginapi.RequestInterceptRequest{
+			RequestID: "req-nomodel", TraceID: "trace-nomodel",
+			Model: testModel, Body: []byte(`{"model":"test-model"}`),
+		}},
+		{name: "blank", request: pluginapi.RequestInterceptRequest{
+			RequestID: "req-blankmodel", TraceID: "trace-blankmodel",
+			Model: testModel, RequestedModel: "   ",
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tc.request.Metadata = map[string]any{"caller_scope": h.key.Scope}
+			response := h.intercept(tc.request)
+			if !response.Terminate || response.StatusCode != http.StatusBadRequest {
+				t.Fatalf("a request without a requested model must terminate with 400, got %+v", response)
+			}
+			// No request may have been admitted for billing.
+			report, err := h.store().Report(context.Background(), credit.Filter{KeyID: h.key.ID})
+			if err != nil {
+				t.Fatalf("Report: %v", err)
+			}
+			if report.Total != 0 || len(report.Items) != 0 {
+				t.Fatalf("a refused request created accounting rows: %+v", report.Items)
+			}
+		})
+	}
+}
+
+// TestInterceptBillsAliasRequestByRequestedModel verifies that an alias request
+// is priced and frozen by the client-requested id only: the alias, not the
+// resolved upstream model the host reports alongside it.
+func TestInterceptBillsAliasRequestByRequestedModel(t *testing.T) {
+	h := newHarness(t)
+	store := h.store()
+	ctx := context.Background()
+	if err := store.PutPrice(ctx, credit.Price{Model: "alias-model", Rates: credit.Rates{Input: 1_000_000}}); err != nil {
+		t.Fatalf("PutPrice: %v", err)
+	}
+	req := h.request("req-alias", "trace-alias")
+	// The host resolves the alias to a different upstream id; billing must stay
+	// on the requested alias.
+	req.RequestedModel, req.Model = "alias-model", "resolved-upstream-model"
+	if response := h.intercept(req); response.Terminate {
+		t.Fatalf("alias admission failed: %+v", response)
+	}
+	h.usage(ownUsage("exec-alias", "trace-alias", h.key.Principal, pluginapi.UsageDetail{InputTokens: 1, TotalTokens: 1}))
+	h.complete("req-alias", "trace-alias", pluginapi.RequestCompletionSucceeded)
+	key, err := store.GetKey(ctx, h.key.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if key.SpentMicroUSD != 1 {
+		t.Fatalf("alias spend = %d, want the alias price 1 (never the resolved id)", key.SpentMicroUSD)
 	}
 }
 
@@ -671,7 +854,7 @@ func TestShutdownIsIdempotentAndTerminal(t *testing.T) {
 func TestManagementRoutesAndResourceWhitelist(t *testing.T) {
 	h := newHarness(t)
 	envelope := h.call(pluginabi.MethodManagementRegister, pluginapi.ManagementRegistrationRequest{
-		BasePath: "/v0/management", ResourceBasePath: "/v0/resource/plugins/credit-manager",
+		BasePath: "/v0/management", ResourceBasePath: testResourceBase,
 	})
 	registration := decodeInto[managementRegistrationResponse](t, envelope)
 	found := map[string]bool{}
@@ -703,14 +886,14 @@ func TestManagementRoutesAndResourceWhitelist(t *testing.T) {
 		t.Fatalf("resources = %d, want %d", len(registration.Resources), want)
 	}
 	for _, resource := range registration.Resources {
-		if !strings.HasPrefix(resource.Path, "/v0/resource/plugins/credit-manager/") {
+		if !strings.HasPrefix(resource.Path, testResourceBase+"/") {
 			t.Fatalf("resource %s escapes the public base", resource.Path)
 		}
 	}
 
 	// Static assets are served without management authorization.
 	shell := h.call(pluginabi.MethodManagementHandle, pluginapi.ManagementRequest{
-		Method: "GET", Path: "/v0/resource/plugins/credit-manager/index.html",
+		Method: "GET", Path: testResourceBase + "/index.html",
 	})
 	response := decodeInto[pluginapi.ManagementResponse](t, shell)
 	if response.StatusCode != http.StatusOK || len(response.Body) == 0 {
@@ -732,11 +915,43 @@ func TestManagementRoutesAndResourceWhitelist(t *testing.T) {
 
 	// Unknown resource paths never resolve.
 	missing := h.call(pluginabi.MethodManagementHandle, pluginapi.ManagementRequest{
-		Method: "GET", Path: "/v0/resource/plugins/credit-manager/secret.txt",
+		Method: "GET", Path: testResourceBase + "/secret.txt",
 	})
 	missingResponse := decodeInto[pluginapi.ManagementResponse](t, missing)
 	if missingResponse.StatusCode != http.StatusNotFound {
 		t.Fatalf("unknown resource must be 404, got %d", missingResponse.StatusCode)
+	}
+
+	// The short management route segment is not a library id: it never names
+	// this plugin's resource directory, so no asset is served under it.
+	shortID := pluginapi.ManagementRequest{
+		Method: "GET", Path: "/v0/resource/plugins/" + PluginID + "/index.html",
+	}
+	shortResponse := decodeInto[pluginapi.ManagementResponse](
+		t, h.call(pluginabi.MethodManagementHandle, shortID))
+	if shortResponse.StatusCode != http.StatusNotFound {
+		t.Fatalf("the short plugin route name must not serve resources, got %d: %s",
+			shortResponse.StatusCode, shortResponse.Body)
+	}
+}
+
+// Rejecting a renamed library must also stop admissions: rejecting only its
+// usage notifications would allow inference without charging those requests.
+func TestRenamedLibraryStopsAdmission(t *testing.T) {
+	for _, id := range []string{PluginID, "other-plugin"} {
+		t.Run(id, func(t *testing.T) {
+			h := newHarness(t)
+			envelope := h.call(pluginabi.MethodManagementRegister, pluginapi.ManagementRegistrationRequest{
+				ResourceBasePath: "/v0/resource/plugins/" + id,
+			})
+			if envelope.OK || envelope.Error == nil || envelope.Error.Code != "unsupported_plugin_id" {
+				t.Fatalf("renamed library was registered: %+v", envelope)
+			}
+			response := h.intercept(h.request("refused-library", "trace-refused-library"))
+			if !response.Terminate || response.StatusCode != http.StatusServiceUnavailable {
+				t.Fatalf("renamed library admitted an unbillable request: %+v", response)
+			}
+		})
 	}
 }
 

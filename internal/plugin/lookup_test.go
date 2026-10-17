@@ -15,7 +15,7 @@ import (
 	"github.com/fengwk/cliproxyapi-credit-manager/internal/web"
 )
 
-const lookupResourceBase = "/v0/resource/plugins/credit-manager"
+const lookupResourceBase = testResourceBase
 
 // lookupCall drives one public resource request through the plugin dispatcher
 // and decodes the host-facing management response.
@@ -224,12 +224,13 @@ func TestLookupDispatchRejectsForgedPaths(t *testing.T) {
 		path string
 	}{
 		{"management-api-under-resource", lookupResourceBase + "/api/keys"},
-		{"traversal-to-api", lookupResourceBase + "/../plugins/credit-manager/api/keys"},
+		{"traversal-to-api", lookupResourceBase + "/../plugins/" + libraryID + "/api/keys"},
 		{"lookup-data-suffix", lookupResourceBase + "/lookup/data/extra"},
 		{"lookup-directory", lookupResourceBase + "/lookup"},
 		{"nested-traversal", lookupResourceBase + "/vendor/../../app.js"},
 		{"unknown-asset", lookupResourceBase + "/does-not-exist"},
 		{"other-plugin-id", "/v0/resource/plugins/other-plugin/app.js"},
+		{"short-plugin-route-name", "/v0/resource/plugins/" + PluginID + "/app.js"},
 		{"empty-relative", lookupResourceBase + "/"},
 		{"dot-segment", lookupResourceBase + "/./app.js"},
 	} {

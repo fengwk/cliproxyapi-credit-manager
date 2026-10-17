@@ -48,7 +48,8 @@ def cannot_reach_api(ctx):
     base = _base(ctx)
     attempts = {
         "api-keys-under-resource": f"{base}/api/keys",
-        "traversal": f"{base}/../plugins/credit-manager/api/keys",
+        "traversal": f"{base}/../plugins/{ctx.plugin_id}/api/keys",
+        "short-plugin-route-name": f"/v0/resource/plugins/credit-manager/index.html",
         "unknown": f"{base}/does-not-exist",
     }
     statuses = {}

@@ -86,7 +86,15 @@ func (m *Manager) interceptBefore(req pluginapi.RequestInterceptRequest) plugina
 		return terminate(http.StatusUnauthorized, "unknown caller identity")
 	}
 
-	model := requestedModel(req)
+	// The current CPA contract always populates RequestedModel with the
+	// client-requested id, which is the only id this plugin may price, match
+	// against model allow lists and freeze for billing. Falling back to the
+	// resolved upstream Model would silently bill a different id, so a request
+	// without a requested model is refused before any accounting row is created.
+	model := strings.TrimSpace(req.RequestedModel)
+	if model == "" {
+		return terminate(http.StatusBadRequest, "requested model is required")
+	}
 	if isCountTokens(req) {
 		// Native token counting is not billed and creates no accounting row,
 		// but it must not bypass key permissions.
@@ -179,15 +187,6 @@ func isCountTokens(req pluginapi.RequestInterceptRequest) bool {
 		return false
 	}
 	return strings.HasSuffix(path, countTokensSuffix) || strings.HasSuffix(path, countTokensMarker)
-}
-
-// requestedModel prefers the client-requested model, which is the id used for
-// pricing, model allow lists and token limits.
-func requestedModel(req pluginapi.RequestInterceptRequest) string {
-	if model := strings.TrimSpace(req.RequestedModel); model != "" {
-		return model
-	}
-	return strings.TrimSpace(req.Model)
 }
 
 // metadataString reads a string value from the read-only metadata snapshot.
