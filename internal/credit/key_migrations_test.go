@@ -1,10 +1,12 @@
 package credit
 
 import (
+	"bytes"
 	"database/sql"
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -364,4 +366,346 @@ func TestMigrationSettlesLateUsageOnLegacyRequest(t *testing.T) {
 	if req.state != stateSettled || req.charge != 10 {
 		t.Fatalf("legacy request after late settlement = %+v", req)
 	}
+}
+
+// openLegacyRaw opens the ledger file of dir directly, bypassing Store so a test
+// can inspect or mutate the on-disk state without triggering the migration.
+func openLegacyRaw(t *testing.T, dir string) *sql.DB {
+	t.Helper()
+	raw, err := sql.Open(driverName, dsnFor(filepath.Join(dir, dbFileName)))
+	if err != nil {
+		t.Fatalf("open raw ledger: %v", err)
+	}
+	raw.SetMaxOpenConns(1)
+	t.Cleanup(func() { _ = raw.Close() })
+	return raw
+}
+
+// readMetaVersion reads the recorded schema marker through any querier.
+func readMetaVersion(t *testing.T, q querier) string {
+	t.Helper()
+	var v string
+	if err := q.QueryRowContext(t.Context(), `SELECT v FROM meta WHERE k = 'schema_version'`).Scan(&v); err != nil {
+		t.Fatalf("read schema version: %v", err)
+	}
+	return v
+}
+
+// A ledger written by a newer or corrupt schema version must be refused before
+// any destructive step, so its marker is never silently downgraded and its
+// estimate/hold columns and real spend stay untouched.
+func TestMigrationRejectsUnsupportedSchemaVersion(t *testing.T) {
+	cases := []struct {
+		name  string
+		value string
+	}{
+		{"future", "3"},
+		{"far future", "99"},
+		{"zero", "0"},
+		{"corrupt", "not-a-version"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			seedV1Ledger(t, dir)
+			raw := openLegacyRaw(t, dir)
+			if _, err := raw.Exec(`INSERT INTO meta(k, v) VALUES('schema_version', ?)`, tc.value); err != nil {
+				t.Fatalf("stamp version: %v", err)
+			}
+			if err := raw.Close(); err != nil {
+				t.Fatal(err)
+			}
+
+			s, err := Open(Options{DataDir: dir, Now: newClock(testEpoch).now})
+			if s != nil {
+				_ = s.Close()
+			}
+			if !errors.Is(err, ErrSchemaVersion) {
+				t.Fatalf("open err = %v, want ErrSchemaVersion", err)
+			}
+
+			// The refused open must not have altered the ledger at all.
+			raw = openLegacyRaw(t, dir)
+			if v := readMetaVersion(t, raw); v != tc.value {
+				t.Fatalf("schema_version = %q, want it left at %q", v, tc.value)
+			}
+			columns, err := tableColumns(t.Context(), raw, "keys")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, ok := columns["held_micro_usd"]; !ok {
+				t.Fatal("keys.held_micro_usd was dropped despite the version refusal")
+			}
+			var spent int64
+			if err := raw.QueryRow(`SELECT spent_micro_usd FROM keys WHERE id = 'legacy'`).Scan(&spent); err != nil || spent != 500 {
+				t.Fatalf("spent = %d (%v), want 500 preserved", spent, err)
+			}
+		})
+	}
+}
+
+// Missing (original v1) and the supported 1/2 markers all migrate in place and
+// end up stamped as the current version.
+func TestMigrationAcceptsSupportedSchemaVersions(t *testing.T) {
+	for _, version := range []string{"", "1", "2"} {
+		name := version
+		if name == "" {
+			name = "missing"
+		}
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			seedV1Ledger(t, dir)
+			if version != "" {
+				raw := openLegacyRaw(t, dir)
+				if _, err := raw.Exec(`INSERT INTO meta(k, v) VALUES('schema_version', ?)`, version); err != nil {
+					t.Fatalf("stamp version: %v", err)
+				}
+				if err := raw.Close(); err != nil {
+					t.Fatal(err)
+				}
+			}
+			s, err := Open(Options{DataDir: dir, Now: newClock(testEpoch).now})
+			if err != nil {
+				t.Fatalf("open supported version %q: %v", version, err)
+			}
+			defer s.Close()
+			assertHoldColumnsDropped(t, s)
+			if v := readMetaVersion(t, s.db); v != "2" {
+				t.Fatalf("schema_version = %q, want 2 after migration", v)
+			}
+			if k, err := s.GetKey(t.Context(), "legacy"); err != nil || k.SpentMicroUSD != 500 {
+				t.Fatalf("spent after migration = %+v %v", k, err)
+			}
+		})
+	}
+}
+
+// A store created by the current build already carries real usage charges, a
+// frozen price snapshot, encrypted key material, reset baselines and audit
+// history. Forcing it back to version 1 with the legacy estimate/hold columns
+// proves the migration preserves those capabilities, which the original v1
+// fixture (holding none of them) cannot cover.
+func TestMigrationPreservesPopulatedAlignedV1Store(t *testing.T) {
+	h := newHarness(t)
+	ctx := h.ctx()
+	h.mustPrice("m1", Rates{Input: million, Output: 2 * million})
+	const material = "sk-aligned-material-0123456789"
+	key, _ := h.mustKey(KeySpec{Label: "aligned", Enabled: true, Material: material})
+	h.mustRule(PricingRule{ID: "rule-aligned", MatchKind: MatchExact, Pattern: "m1", Priority: 5,
+		Enabled: true, Price: Price{Rates: Rates{Input: million, Output: 2 * million}}})
+	req := h.mustAdmit(AdmitInput{ID: "req-aligned", TraceID: "trace-aligned",
+		KeyID: key.ID, RequestedModel: "m1"})
+	h.mustUsage(usageFor("u-aligned", req, "m1", tokens(100, 0, 0, 100, 0)))
+	h.mustComplete(Completion{ID: req.ID, TraceID: req.TraceID, Outcome: OutcomeSucceeded})
+	if _, err := h.store.ResetSpend(ctx, ResetSpec{KeyID: key.ID, Total: true, Daily: true,
+		Reason: "aligned baseline"}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Capture the real accounting before the migration.
+	keyBefore := mustLoadKeyRow(t, h.store.db, key.ID)
+	reqBefore := mustLoadRequestRow(t, h.store.db, req.ID)
+	blobBefore := keyMaterialBlob(t, h.store.db, key.ID)
+	baselinesBefore := countRows(t, h.store.db, `SELECT COUNT(*) FROM key_money_baselines WHERE key_id = ?`, key.ID)
+	auditBefore := countRows(t, h.store.db, `SELECT COUNT(*) FROM audit_events`)
+	usageBefore := countRows(t, h.store.db, `SELECT COUNT(*) FROM usages WHERE request_id = ? AND charged = 1`, req.ID)
+	if keyBefore.spent == 0 || reqBefore.snapshot == nil || len(blobBefore) == 0 || baselinesBefore == 0 || auditBefore == 0 {
+		t.Fatalf("fixture is not populated: spent=%d snapshot=%v blob=%d baselines=%d audit=%d",
+			keyBefore.spent, reqBefore.snapshot, len(blobBefore), baselinesBefore, auditBefore)
+	}
+	if err := h.store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Add the legacy columns back and stamp the store as version 1 so Open has
+	// to run the destructive migration over populated data.
+	raw := openLegacyRaw(t, h.dir)
+	for _, stmt := range []string{
+		`ALTER TABLE keys ADD COLUMN held_micro_usd INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE requests ADD COLUMN held_micro_usd INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE requests ADD COLUMN token_estimate INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE requests ADD COLUMN initial_hold_micro_usd INTEGER NOT NULL DEFAULT 0`,
+		`INSERT INTO meta(k, v) VALUES('schema_version', '1')
+		 ON CONFLICT(k) DO UPDATE SET v = excluded.v`,
+	} {
+		if _, err := raw.Exec(stmt); err != nil {
+			t.Fatalf("recreate legacy column: %v", err)
+		}
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := Open(Options{DataDir: h.dir, Now: h.clock.now})
+	if err != nil {
+		t.Fatalf("reopen aligned store: %v", err)
+	}
+	defer reopened.Close()
+	assertHoldColumnsDropped(t, reopened)
+	if v := readMetaVersion(t, reopened.db); v != "2" {
+		t.Fatalf("schema_version = %q, want 2", v)
+	}
+
+	// Real money, the execution and its frozen snapshot survive untouched.
+	if got := mustLoadKeyRow(t, reopened.db, key.ID); got.spent != keyBefore.spent {
+		t.Fatalf("spent = %d, want %d", got.spent, keyBefore.spent)
+	}
+	if got := mustLoadRequestRow(t, reopened.db, req.ID); got.charge != reqBefore.charge ||
+		got.state != stateSettled || got.snapshot == nil || got.snapshot.RuleID != "rule-aligned" {
+		t.Fatalf("request after migration = %+v", got)
+	}
+	if got := countRows(t, reopened.db, `SELECT COUNT(*) FROM usages WHERE request_id = ? AND charged = 1`, req.ID); got != usageBefore {
+		t.Fatalf("charged executions = %d, want %d", got, usageBefore)
+	}
+	// Reset baselines and audit history survive, and the reset still hides the
+	// charge from the effective quota view.
+	if got := countRows(t, reopened.db, `SELECT COUNT(*) FROM key_money_baselines WHERE key_id = ?`, key.ID); got != baselinesBefore {
+		t.Fatalf("money baselines = %d, want %d", got, baselinesBefore)
+	}
+	if got := countRows(t, reopened.db, `SELECT COUNT(*) FROM audit_events`); got != auditBefore {
+		t.Fatalf("audit events = %d, want %d", got, auditBefore)
+	}
+	if k, err := reopened.GetKey(ctx, key.ID); err != nil || k.QuotaUsedMicroUSD != 0 {
+		t.Fatalf("effective usage after migration = %+v %v, want the baseline honoured", k, err)
+	}
+	// The sealed key material is byte-identical and still decrypts across the
+	// migration, so the pepper/ciphertext pair was not disturbed.
+	if got := keyMaterialBlob(t, reopened.db, key.ID); !bytes.Equal(got, blobBefore) {
+		t.Fatalf("key ciphertext changed: %d bytes -> %d bytes", len(blobBefore), len(got))
+	}
+	revealed, err := reopened.RevealKey(ctx, key.ID)
+	if err != nil || revealed != material {
+		t.Fatalf("reveal after migration = %q %v, want the original material", revealed, err)
+	}
+	if _, err := reopened.Authenticate(ctx, material); err != nil {
+		t.Fatalf("authenticate after migration: %v", err)
+	}
+}
+
+// A DROP COLUMN cannot run while an index depends on the column. That failure
+// must roll the whole migration transaction back: the drops that already ran
+// are undone, the additive columns are not left behind, and the real spend,
+// the schema marker and the legacy columns all survive.
+func TestMigrationDropFailureRollsBackWholeMigration(t *testing.T) {
+	dir := t.TempDir()
+	seedV1Ledger(t, dir)
+	raw := openLegacyRaw(t, dir)
+	for _, stmt := range []string{
+		`CREATE INDEX legacy_token_estimate ON requests(token_estimate)`,
+		`INSERT INTO meta(k, v) VALUES('schema_version', '1')`,
+	} {
+		if _, err := raw.Exec(stmt); err != nil {
+			t.Fatalf("prepare failing migration: %v", err)
+		}
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err := Open(Options{DataDir: dir, Now: newClock(testEpoch).now})
+	if s != nil {
+		_ = s.Close()
+	}
+	if err == nil {
+		t.Fatal("open succeeded although a dependent index blocks a DROP COLUMN")
+	}
+	if !strings.Contains(err.Error(), "drop requests.token_estimate") {
+		t.Fatalf("open err = %v, want the blocked drop failure", err)
+	}
+
+	// Everything must be exactly as before the failed migration.
+	raw = openLegacyRaw(t, dir)
+	keyColumns, err := tableColumns(t.Context(), raw, "keys")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := keyColumns["held_micro_usd"]; !ok {
+		t.Fatal("keys.held_micro_usd drop was not rolled back")
+	}
+	if _, ok := keyColumns["key_material_enc"]; ok {
+		t.Fatal("additive key feature column survived the failed migration")
+	}
+	reqColumns, err := tableColumns(t.Context(), raw, "requests")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, col := range []string{"held_micro_usd", "token_estimate", "initial_hold_micro_usd"} {
+		if _, ok := reqColumns[col]; !ok {
+			t.Fatalf("requests.%s missing after rollback", col)
+		}
+	}
+	if _, ok := reqColumns["price_snapshot"]; ok {
+		t.Fatal("additive pricing column survived the failed migration")
+	}
+	if v := readMetaVersion(t, raw); v != "1" {
+		t.Fatalf("schema_version = %q, want the original 1", v)
+	}
+	var spent int64
+	if err := raw.QueryRow(`SELECT spent_micro_usd FROM keys WHERE id = 'legacy'`).Scan(&spent); err != nil || spent != 500 {
+		t.Fatalf("spent = %d (%v), want 500 preserved", spent, err)
+	}
+	var indexes int
+	if err := raw.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'legacy_token_estimate'`).Scan(&indexes); err != nil || indexes != 1 {
+		t.Fatalf("blocking index = %d (%v), want it kept", indexes, err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Removing the blocker lets the very same store migrate cleanly.
+	raw = openLegacyRaw(t, dir)
+	if _, err := raw.Exec(`DROP INDEX legacy_token_estimate`); err != nil {
+		t.Fatal(err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(Options{DataDir: dir, Now: newClock(testEpoch).now})
+	if err != nil {
+		t.Fatalf("open after removing the blocker: %v", err)
+	}
+	defer reopened.Close()
+	assertHoldColumnsDropped(t, reopened)
+	if k, err := reopened.GetKey(t.Context(), "legacy"); err != nil || k.SpentMicroUSD != 500 {
+		t.Fatalf("spent after successful migration = %+v %v", k, err)
+	}
+}
+
+// mustLoadKeyRow loads a key row through the store's own reader, kept as a helper
+// so the aligned migration test can compare rows across a reopen.
+func mustLoadKeyRow(t *testing.T, q querier, id string) *keyRow {
+	t.Helper()
+	k, err := loadKey(t.Context(), q, "id = ?", id)
+	if err != nil {
+		t.Fatalf("load key %s: %v", id, err)
+	}
+	return k
+}
+
+// mustLoadRequestRow loads a request row through the store's own reader.
+func mustLoadRequestRow(t *testing.T, q querier, id string) *reqRow {
+	t.Helper()
+	r, err := loadRequestByID(t.Context(), q, id)
+	if err != nil {
+		t.Fatalf("load request %s: %v", id, err)
+	}
+	return r
+}
+
+func keyMaterialBlob(t *testing.T, q querier, id string) []byte {
+	t.Helper()
+	var blob []byte
+	if err := q.QueryRowContext(t.Context(), `SELECT key_material_enc FROM keys WHERE id = ?`, id).Scan(&blob); err != nil {
+		t.Fatalf("read key material blob: %v", err)
+	}
+	return blob
+}
+
+func countRows(t *testing.T, q querier, query string, args ...any) int64 {
+	t.Helper()
+	n, err := counterValue(t.Context(), q, query, args...)
+	if err != nil {
+		t.Fatalf("count rows: %v", err)
+	}
+	return n
 }

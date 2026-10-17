@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -49,6 +50,11 @@ const (
 
 // ErrLocked reports that another process already owns the data directory.
 var ErrLocked = errors.New("data directory is locked")
+
+// ErrSchemaVersion reports that an existing ledger is stamped with a schema
+// version this build does not understand. Opening it would run destructive
+// migrations against a format it cannot reason about, so it is refused instead.
+var ErrSchemaVersion = errors.New("unsupported ledger schema version")
 
 const (
 	driverName             = "sqlite"
@@ -397,6 +403,12 @@ func (s *Store) migrate(ctx context.Context) error {
 		if _, err := tx.ExecContext(ctx, schemaDDL); err != nil {
 			return fmt.Errorf("apply schema: %w", err)
 		}
+		// The recorded version is read before any destructive step: a ledger
+		// written by a newer or corrupt version must be refused instead of
+		// having its columns dropped and its marker overwritten.
+		if err := checkSchemaVersion(ctx, tx); err != nil {
+			return err
+		}
 		if err := migrateKeyFeatures(ctx, tx); err != nil {
 			return err
 		}
@@ -415,6 +427,27 @@ func (s *Store) migrate(ctx context.Context) error {
 			fmt.Sprint(schemaVersion))
 		return err
 	})
+}
+
+// checkSchemaVersion validates the recorded schema marker of an existing
+// ledger. A missing marker is the original v1 store, which the migration
+// upgrades in place; versions 1 through schemaVersion are accepted. Any other
+// value (a future version, zero, or a corrupt string) is refused so the
+// destructive steps never run against a format this build cannot understand.
+func checkSchemaVersion(ctx context.Context, tx *sql.Tx) error {
+	var raw string
+	err := tx.QueryRowContext(ctx, `SELECT v FROM meta WHERE k = 'schema_version'`).Scan(&raw)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("read schema version: %w", err)
+	}
+	version, convErr := strconv.Atoi(strings.TrimSpace(raw))
+	if convErr != nil || version < 1 || version > schemaVersion {
+		return fmt.Errorf("%w: %q", ErrSchemaVersion, raw)
+	}
+	return nil
 }
 
 // recoverExecutions converts executions interrupted by a restart into pending
