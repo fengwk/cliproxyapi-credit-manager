@@ -305,4 +305,6 @@ test('lookup.js 模型分析与额度基线：无未定义函数，退出清理�
   const quotasFn = code.slice(code.indexOf('function renderQuotas('), code.indexOf('function renderTokenLimits('));
   assert.ok(quotasFn.includes('quota_used_micro_usd'), 'renderQuotas 必须支持周期生效配额字段');
   assert.ok(quotasFn.includes('累计消费') || quotasFn.includes('累计支出'), 'renderQuotas 必须明确标注累计消费');
+  assert.equal(quotasFn.includes('在途预占'), false, 'renderQuotas 不得包含在途预占卡片');
+  assert.equal(quotasFn.includes('held_micro_usd'), false, 'renderQuotas 不得引用 held_micro_usd');
 });

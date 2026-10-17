@@ -116,7 +116,7 @@ func failure(err error) pluginapi.ManagementResponse {
 		code, message = 409, "conflicting operation"
 	case errors.Is(err, credit.ErrDenied):
 		code, message = 403, "permission denied"
-	case errors.Is(err, credit.ErrQuota), errors.Is(err, credit.ErrConcurrency), errors.Is(err, credit.ErrPending):
+	case errors.Is(err, credit.ErrQuota), errors.Is(err, credit.ErrConcurrency):
 		code, message = 429, "credit or concurrency limit reached"
 	case errors.Is(err, credit.ErrUnpriced):
 		code, message = 400, "model has no price"

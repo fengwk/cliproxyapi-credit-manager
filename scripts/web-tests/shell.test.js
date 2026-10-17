@@ -87,3 +87,11 @@ test('安全渲染辅助函数存在且服务端数据只走 textContent', () =>
   assert.ok(js.includes('function prettyJSONLossless'));
   assert.ok(js.includes('function parseJSON'));
 });
+
+test('脚本与页面不包含预授权与持有金额等陈旧概念与字段', () => {
+  assert.equal(js.includes('held_micro_usd'), false, 'app.js 不得引用 held_micro_usd');
+  assert.equal(js.includes('持有金额'), false, 'app.js 不得渲染持有金额');
+  assert.equal(js.includes('归还持有金额'), false, 'app.js 不得包含归还持有金额');
+  assert.equal(js.includes('预扣款'), false, 'app.js 不得包含预扣款文案');
+  assert.equal(html.includes('held_micro_usd'), false, 'index.html 不得包含 held_micro_usd');
+});

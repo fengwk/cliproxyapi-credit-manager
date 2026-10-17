@@ -656,7 +656,6 @@
     clear(quotas);
     var effectiveSpent = key.quota_used_micro_usd !== undefined ? key.quota_used_micro_usd : key.spent_micro_usd;
     quotas.appendChild(card('已用额度', formatMoney(effectiveSpent, state.currency, state.rate)));
-    quotas.appendChild(card('在途预占', formatMoney(key.held_micro_usd, state.currency, state.rate)));
     quotas.appendChild(card('总额度', key.quota_micro_usd ? formatMoney(key.quota_micro_usd, state.currency, state.rate) : '不限'));
     quotas.appendChild(card('日额度', key.daily_micro_usd ? formatMoney(key.daily_micro_usd, state.currency, state.rate) : '不限'));
     quotas.appendChild(card('周额度', key.weekly_micro_usd ? formatMoney(key.weekly_micro_usd, state.currency, state.rate) : '不限'));

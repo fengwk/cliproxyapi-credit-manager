@@ -41,11 +41,11 @@ func seedOverview(t *testing.T, db credit.Backend) {
 		t.Fatalf("create key: %v", err)
 	}
 	record := func(id, trace, model, provider, auth string, tokens int64) {
-		req, err := db.Reserve(ctx, credit.ReserveInput{
-			ID: id, TraceID: trace, KeyID: key.ID, RequestedModel: model, InputEstimate: 1,
+		req, err := db.Admit(ctx, credit.AdmitInput{
+			ID: id, TraceID: trace, KeyID: key.ID, RequestedModel: model,
 		})
 		if err != nil {
-			t.Fatalf("reserve %s: %v", id, err)
+			t.Fatalf("admit %s: %v", id, err)
 		}
 		usage := credit.Usage{
 			ID: "u-" + id, RequestID: req.ID, TraceID: req.TraceID, KeyID: key.ID,

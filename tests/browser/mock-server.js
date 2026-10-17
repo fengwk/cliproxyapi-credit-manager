@@ -75,7 +75,6 @@ const KEYS = [
       future_policy: 'keep-me',
     },
     spent_micro_usd: 12345678,
-    held_micro_usd: 6000000,
     created_at: '2026-01-01T00:00:00Z',
   },
   {
@@ -94,7 +93,6 @@ const KEYS = [
       allowed_models: [],
     },
     spent_micro_usd: 0,
-    held_micro_usd: 0,
     created_at: '2026-02-02T00:00:00Z',
   },
 ];
@@ -246,7 +244,6 @@ const REQUESTS_PAGE_1 = [
     state: 'settled',
     started_at: '2026-10-15T10:00:00Z',
     completed_at: '2026-10-15T10:00:06Z',
-    held_micro_usd: 6000000,
     price: PRICES[1],
     executions: [
       {
@@ -287,7 +284,6 @@ const REQUESTS_PAGE_1 = [
     state: 'settled',
     started_at: '2026-10-15T11:00:00Z',
     completed_at: '2026-10-15T11:00:02Z',
-    held_micro_usd: 0,
     price: PRICES[2],
     executions: [
       {
@@ -318,7 +314,6 @@ const REQUESTS_PAGE_1 = [
     model: 'gpt-5',
     state: 'pending',
     started_at: '2026-10-15T12:00:00Z',
-    held_micro_usd: 6000000,
     price: PRICES[0],
     executions: [],
   },
@@ -331,7 +326,6 @@ const REQUESTS_PAGE_1 = [
     state: 'settled',
     started_at: '2026-10-13T08:00:00Z',
     completed_at: '2026-10-13T08:00:02Z',
-    held_micro_usd: 0,
     // 管理员 Resolve 的人工记账必须与执行成本分开显示（契约字段：adjustment_micro_usd）。
     adjustment_micro_usd: 2500000,
     price: PRICES[0],
@@ -367,19 +361,17 @@ const REQUESTS_PAGE_1 = [
     state: 'settled',
     started_at: '2026-10-15T13:00:00Z',
     completed_at: '2026-10-15T13:00:00Z',
-    held_micro_usd: 0,
     price: PRICES[0],
     executions: [],
   },
   {
-    // 进行中的请求：仍占用并发与持有金额，后端 Resolve 只接受 pending，因此不得给出人工处理入口。
+    // 进行中的请求：仍占用并发槽位，后端 Resolve 只接受 pending，因此不得给出人工处理入口。
     id: 'req-007',
     trace_id: 'trace007',
     key_id: 'key-1',
     model: 'gpt-5',
     state: 'active',
     started_at: '2026-10-15T14:00:00Z',
-    held_micro_usd: 1500000,
     adjustment_micro_usd: 0,
     price: PRICES[0],
     executions: [],
@@ -396,7 +388,6 @@ const REQUESTS_PAGE_2 = [
     state: 'settled',
     started_at: '2026-10-14T09:00:00Z',
     completed_at: '2026-10-14T09:00:03Z',
-    held_micro_usd: 0,
     price: PRICES[0],
     executions: [
       {
@@ -811,7 +802,7 @@ async function handle(req, res) {
         json(res, 400, { error: materialError });
         return;
       }
-      json(res, 201, { item: { id: 'key-new', spec: parsed, spent_micro_usd: 0, held_micro_usd: 0 }, key: 'sk-mock-onetime-5f3a9c' });
+      json(res, 201, { item: { id: 'key-new', spec: parsed, spent_micro_usd: 0 }, key: 'sk-mock-onetime-5f3a9c' });
       return;
     }
     if (endpoint === '/api/keys' && req.method === 'PUT') {

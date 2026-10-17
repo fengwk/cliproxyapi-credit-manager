@@ -678,7 +678,7 @@
     return { label: key || '未知', tone: '' };
   }
 
-  // 只有服务端标记为 pending 的请求才可人工 Resolve：active 仍在执行并占用并发与持有金额，
+  // 只有服务端标记为 pending 的请求才可人工 Resolve：active 仍在执行并占用并发槽位，
   // 后端会拒绝（ErrConflict），因此界面不得为 active 提供入口。
   function isPendingRequest(request) {
     if (!request || typeof request !== 'object') return false;
@@ -3006,7 +3006,6 @@
         text: knownCosts.length ? '执行成本 ' + formatMicroUSD(executionCost) +
           (knownCosts.length < executions.length ? '（已知部分）' : '') : '执行成本 未结算',
       }),
-      el('span', { text: '持有 ' + formatMicroUSD(request.held_micro_usd) }),
       el('span', {
         class: adjustmentNonZero ? 'is-warn' : '',
         text: '人工补记 ' + formatMicroUSD(adjustmentMicro),
@@ -3082,7 +3081,7 @@
         class: 'note',
         text: isPendingRequest(request)
           ? '该请求尚无执行记录，状态为待定：已知用量照常入账，未知部分需要管理员在「处理待定」中释放或扣费。'
-          : '该请求尚无执行记录；进行中的请求只持有金额，等执行事件到达后才会计费。',
+          : '该请求尚无执行记录；进行中的请求按实际用量入账，等执行事件到达后按有效价格扣费。',
       }),
     ]);
     return el('div', { class: 'card request-card' }, [
@@ -3325,7 +3324,7 @@
 
   function openResolveDialog(request) {
     var actionSelect = el('select', { id: 'resolve-action' }, [
-      el('option', { value: 'release', text: '释放（release）：不扣费，归还持有金额' }),
+      el('option', { value: 'release', text: '释放（release）：不补记扣费，结案该请求' }),
       el('option', { value: 'charge', text: '扣费（charge）：按填写的金额入账' }),
     ]);
     var amount = moneyPairInput({ label: '金额', micro: '0' });
@@ -3337,7 +3336,6 @@
         el('div', { class: 'grid-2' }, [
           kvRow('请求 ID', request.id || '—'),
           kvRow('请求模型', request.model || '—'),
-          kvRow('持有金额', formatMicroUSDPair(request.held_micro_usd)),
           kvRow('状态', stateLabel(request.state) + ' / ' + outcomeLabel(request.outcome)),
         ]),
         el('p', {
@@ -3573,9 +3571,6 @@
         el('td', { class: 'num' }, [
           el('div', { text: formatMicroUSD(effectiveSpent) }),
           el('div', { class: 'pill-note', text: '累积 ' + formatMicroUSD(key.spent_micro_usd) }),
-          key.held_micro_usd && intString(key.held_micro_usd) !== '0'
-            ? el('div', { class: 'pill-note', text: '持有 ' + formatMicroUSD(key.held_micro_usd) })
-            : null,
           quotaProgress(key),
         ]),
         el('td', { class: 'limits' }, [
@@ -4103,7 +4098,7 @@
     });
 
     dialog.setBody([
-      el('p', { class: 'hint hint-warn', text: '额度重置通过在账本记录新基线快照生效，不会抹除或篡改已入账历史。未结清的预扣款与挂起请求不受影响。' }),
+      el('p', { class: 'hint hint-warn', text: '额度重置通过在账本记录新基线快照生效，不会抹除或篡改已入账历史。未结算的待定请求与并发状态不受影响。' }),
       el('div', { class: 'form-grid' }, [
         el('div', { class: 'field' }, [
           el('label', { text: '重置周期选择' }),
