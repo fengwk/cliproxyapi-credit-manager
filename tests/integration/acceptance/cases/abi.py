@@ -3,9 +3,11 @@
 The host listing does not expose the negotiated schema version or capability
 set, so this case loads the real plugin shared library and drives its documented
 C ABI (``cliproxy_plugin_init`` + ``cliproxyPluginCall``) with ctypes. The
-credit-manager makes no host callbacks, so a host API with ABI 1 and no
-function pointers is sufficient. This verifies ABI 1 / schema 6 negotiation and
-that no executor/router/scheduler capability is declared.
+credit-manager makes no host callbacks -- it is passive, with no executor,
+router, scheduler or model-execution bridge -- so a host API with ABI 1 and no
+function pointers is sufficient. This verifies ABI 1 / schema 6 negotiation,
+that no executor/router/scheduler capability is declared, and that registering
+issues no host model-execution callback.
 """
 
 from __future__ import annotations
@@ -52,10 +54,6 @@ class PluginAPI(ctypes.Structure):
                 ("free_buffer", PLUGIN_FREE), ("shutdown", PLUGIN_SHUTDOWN)]
 
 
-def _noop_call(*_args):
-    return 1
-
-
 def _noop_free(*_args):
     return None
 
@@ -65,7 +63,15 @@ class NativePlugin:
         self.lib = ctypes.CDLL(str(library))
         self.lib.cliproxy_plugin_init.restype = ctypes.c_int
         self.lib.cliproxy_plugin_init.argtypes = [ctypes.POINTER(HostAPI), ctypes.POINTER(PluginAPI)]
-        self._call_keepalive = HOST_CALL(_noop_call)
+        # Record every host callback the plugin makes. A passive plugin must issue
+        # none: in particular no host model-execution bridge may exist.
+        self.host_calls = []
+
+        def record_host_call(_ctx, method, _payload, _length, _out):
+            self.host_calls.append(method.decode(errors="replace") if method else "")
+            return 1
+
+        self._call_keepalive = HOST_CALL(record_host_call)
         self._free_keepalive = HOST_FREE(_noop_free)
         self.host = HostAPI(abi_version=1, host_ctx=None,
                             call=self._call_keepalive, free_buffer=self._free_keepalive)
@@ -132,5 +138,11 @@ def abi_probe(ctx):
           f"schema<6 host must be refused: {refused}")
 
     plugin.shutdown()
+    # No host model-execution bridge: the plugin never invokes a host callback at
+    # any point of its lifecycle, and in particular nothing named like a model
+    # execution. A warmup-era build would call `host.model.execute` here.
+    model_calls = [name for name in plugin.host_calls if "model" in name.lower()]
+    check_eq(model_calls, [], f"no host model-execution callback may be issued: {plugin.host_calls}")
+    check_eq(plugin.host_calls, [], f"a passive plugin issues no host callback at all: {plugin.host_calls}")
     return {"abi_version": plugin.api.abi_version, "schema_version": result.get("schema_version"),
-            "capabilities": caps, "identifier": ident}
+            "capabilities": caps, "identifier": ident, "host_calls": len(plugin.host_calls)}

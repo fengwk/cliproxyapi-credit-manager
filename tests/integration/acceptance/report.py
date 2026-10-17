@@ -27,6 +27,19 @@ def check_eq(actual, expected, message):
         raise CaseFailure(f"{message}: expected {expected!r}, got {actual!r}")
 
 
+#: Field names that the post-usage architecture removed from keys, requests and
+#: reports. Admission never estimates or reserves money, so no response may
+#: expose a hold or an estimate again -- absence is asserted rather than a zero.
+RETIRED_HOLD_FIELDS = ("held_micro_usd", "initial_hold_micro_usd", "token_estimate")
+
+
+def check_no_holds(payload, label):
+    """Fail if a key, request or summary object still exposes a retired field."""
+    for field in RETIRED_HOLD_FIELDS:
+        check(field not in payload,
+              f"{label} must not expose the retired {field!r} field: {sorted(payload)}")
+
+
 class Recorder:
     def __init__(self, artifacts: Path):
         self.artifacts = Path(artifacts)

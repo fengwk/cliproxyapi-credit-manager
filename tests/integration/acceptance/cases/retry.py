@@ -4,13 +4,13 @@ The host transparently retries a failing upstream credential so the client
 issues exactly one request. The plugin records *independent* usage statistics
 per attempt: the failed attempt is an unknown-cost execution (never written off
 as free), the successful attempt is charged. Because a request carries one
-unknown execution, it stays pending with its reserve hold intact -- the host
-must never settle unknown accounting as zero.
+unknown execution, it stays pending -- the host must never settle unknown
+accounting as zero, and nothing is held or estimated while it is unresolved.
 """
 
 from __future__ import annotations
 
-from ..report import check, check_eq
+from ..report import check, check_eq, check_no_holds
 
 CASES = []
 
@@ -28,10 +28,9 @@ def _spent(ctx, key_id):
     return row["spent_micro_usd"] if row else None
 
 
-def _held(ctx, key_id):
+def _key(ctx, key_id):
     items = ctx.manager.keys().json()["items"]
-    row = next((k for k in items if k["id"] == key_id), None)
-    return row["held_micro_usd"] if row else None
+    return next((k for k in items if k["id"] == key_id), None)
 
 
 def _request(ctx, key_id):
@@ -77,15 +76,15 @@ def failover(ctx):
     check_eq(success[0]["quality"], "complete", "successful attempt accounting is complete")
     check_eq(success[0]["cost_micro_usd"], 14, "successful attempt charged exactly 14")
     check(failed[0]["auth_id"] != success[0]["auth_id"], "attempts used different upstream credentials")
-    # The unknown failed attempt keeps the request open (hold retained), never free.
+    # The unknown failed attempt keeps the request open, never free and never held.
     check_eq(request["outcome"], "succeeded", "request outcome is succeeded")
     check_eq(request["state"], "pending", "unknown attempt keeps the request pending")
-    check(request["held_micro_usd"] > 0, "reserve hold retained while an attempt is unknown")
+    check_no_holds(request, "pending request with an unknown attempt")
     check_eq(_spent(ctx, item["id"]), 14, "key billed once (14), not twice")
-    check(_held(ctx, item["id"]) > 0, "key hold retained (unknown not auto-free)")
+    check_no_holds(_key(ctx, item["id"]), "key row")
     return {"upstream_calls": len(calls), "credentials": sorted(credentials),
             "client_requests": report["total"], "key_spent": _spent(ctx, item["id"]),
-            "key_held": _held(ctx, item["id"]), "request_state": request["state"],
+            "request_state": request["state"],
             "attempts": [{"failed": ex["failed"], "quality": ex["quality"], "cost": ex.get("cost_micro_usd"),
                           "status": ex.get("status_code")} for ex in executions]}
 
@@ -108,5 +107,6 @@ def all_failures(ctx):
               "a fully failed request must not settle as a billed success")
         check(not any(ex.get("cost_micro_usd") for ex in request["executions"]),
               "no execution may carry a cost for a fully failed request")
+        check_no_holds(request, "fully failed request")
     return {"status": response.status, "upstream_calls": ctx.mock.count("/chat/completions"),
             "key_spent": _spent(ctx, item["id"])}

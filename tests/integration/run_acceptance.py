@@ -29,8 +29,8 @@ from acceptance.context import Context, load_specs  # noqa: E402
 from acceptance.mock import Script  # noqa: E402
 from acceptance.report import Recorder  # noqa: E402
 
-DEFAULT_MODULES = ["abi", "core", "accounting", "auth", "capture", "report", "resources",
-                   "namespace", "lifecycle", "retry", "warmup", "affinity", "gemini", "browser",
+DEFAULT_MODULES = ["abi", "core", "accounting", "admission", "auth", "capture", "report", "resources",
+                   "namespace", "lifecycle", "retry", "passive", "affinity", "gemini", "browser",
                    "lookup", "management", "keyops", "reset", "audit", "pricing", "reference"]
 
 

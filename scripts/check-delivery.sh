@@ -79,6 +79,22 @@ then
 	fail "python syntax check"
 fi
 
+# --- retired architecture keys ----------------------------------------------
+# The post-usage architecture removed the admission backlog gate and the host
+# model-execution (warmup) bridge. Their configuration keys must not come back:
+# they are a hard config error now, so shipping them in the example config would
+# advertise an unsupported setting, and the harness only uses them to assert the
+# rejection path. The check is YAML-key anchored so the explanatory comments and
+# the harness' retired-setting fixtures do not trip it.
+retired_key_re='^[[:space:]]*(warmup|max_pending_requests):'
+if grep -Eq -- "$retired_key_re" config.example.yaml; then
+	fail "config.example.yaml carries no retired architecture key"
+else
+	pass "config.example.yaml carries no retired architecture key"
+fi
+require "the acceptance harness still rejects retired settings" \
+	tests/integration/acceptance/cases/passive.py "RETIRED_SETTINGS"
+
 # --- no goreleaser -----------------------------------------------------------
 
 goreleaser="$(find . -maxdepth 2 -name '.goreleaser*' -not -path './.workspace/*' -not -path './.git/*' -print -quit)"
