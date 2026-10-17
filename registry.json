@@ -4,11 +4,11 @@
     {
       "id": "cliproxyapi-credit-manager",
       "name": "Credit Manager",
-      "description": "Credit and quota manager for CLIProxyAPI with token billing, key management, request capture and web console.",
+      "description": "CLIProxyAPI key and token quota manager with query-time reference costs, display-only budgets, request capture and web console.",
       "author": "fengwk",
       "repository": "https://github.com/fengwk/cliproxyapi-credit-manager",
       "license": "MIT",
-      "tags": ["credit", "billing", "token", "quota", "management"],
+      "tags": ["usage", "cost", "token", "quota", "management"],
       "install": {
         "type": "github-release"
       }

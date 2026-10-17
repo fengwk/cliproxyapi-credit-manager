@@ -324,7 +324,7 @@ metadata.json                            # id/name/version/goos/goarch/sdk/commi
 | --- | --- |
 | [`docs/operations.md`](docs/operations.md) | 全新安装、当前数据格式、配置、备份恢复、保留与清理、快照、故障处理 |
 | [`docs/features.md`](docs/features.md) | 当前管理功能、成本语义与职责边界 |
-| [`docs/release-notes-v0.1.6.md`](docs/release-notes-v0.1.6.md) | **本地候选/未发布**：查询时定价与预算只展示的实现说明 |
+| [`docs/release-notes-v0.1.6.md`](docs/release-notes-v0.1.6.md) | v0.1.6 查询时定价、预算只展示与不兼容升级说明 |
 | [`docs/release-notes-v0.1.5.md`](docs/release-notes-v0.1.5.md) | v0.1.5 移除迁移与旧字段回退；历史发布事实 |
 | [`docs/release-notes-v0.1.4.md`](docs/release-notes-v0.1.4.md) | v0.1.4 移除预占、软额度准入及管理/定价/分析功能恢复；含升级注意事项 |
 | [`docs/release-notes-v0.1.3.md`](docs/release-notes-v0.1.3.md) | v0.1.3 修复 CPA 插件商店注入 store 配置导致注册失败问题 |
@@ -336,9 +336,9 @@ metadata.json                            # id/name/version/goos/goarch/sdk/commi
 | [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) | 第三方许可与改编说明 |
 | [`tests/integration/README.md`](tests/integration/README.md) | 验收工具与用例清单 |
 
-`release-notes-v0.1.0.md` 至 `release-notes-v0.1.5.md` 记录对应已发布版本，
-不代表当前实现兼容这些版本的数据或接口。`release-notes-v0.1.6.md` 只是本地候选，
-未发布，也不代表已通过任何验证。
+各版本的 release notes 记录对应版本的行为，不代表当前实现兼容旧版本的数据或接口。
+可安装版本及对应产物以 [Releases](https://github.com/fengwk/cliproxyapi-credit-manager/releases)
+为准。
 
 ## 许可
 

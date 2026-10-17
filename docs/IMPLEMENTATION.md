@@ -324,5 +324,5 @@ to publish a tag without them. Config example and operations guidance live in
 `config.example.yaml` and `docs/operations.md`.
 Do not publish placeholders or hide incomplete requirements. Event delivery is
 memory-only CPA queue: no end-to-end crash-safe exactly-once claim.
-A local `v0.1.6` candidate label does not imply a release, CI run or completed
-verification.
+A local version label alone never implies a published release or completed
+verification. Installable artifacts must come from the verified tagged release.
