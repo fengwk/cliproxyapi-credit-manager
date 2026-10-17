@@ -267,12 +267,12 @@ func TestLookupDispatchServesOwnLookupAssets(t *testing.T) {
 	}
 }
 
-// seedLedgerRequest reserves and settles one request for key through the store.
+// seedLedgerRequest admits and settles one request for key through the store.
 func seedLedgerRequest(t *testing.T, h *harness, key credit.Key, id, trace string) {
 	t.Helper()
 	ctx := context.Background()
-	if _, err := h.store().Reserve(ctx, credit.ReserveInput{ID: id, TraceID: trace, KeyID: key.ID, RequestedModel: testModel}); err != nil {
-		t.Fatalf("Reserve(%s): %v", id, err)
+	if _, err := h.store().Admit(ctx, credit.AdmitInput{ID: id, TraceID: trace, KeyID: key.ID, RequestedModel: testModel}); err != nil {
+		t.Fatalf("Admit(%s): %v", id, err)
 	}
 	if err := h.store().RecordUsage(ctx, credit.Usage{
 		ID: "exec-" + id, RequestID: id, TraceID: trace, KeyID: key.ID,

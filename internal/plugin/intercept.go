@@ -19,9 +19,6 @@ import (
 )
 
 const (
-	// defaultOutputEstimate is the conservative output reservation used when the
-	// request declares no maximum token field.
-	defaultOutputEstimate = 4096
 	// countTokensSuffix matches the Claude count-tokens endpoint.
 	countTokensSuffix = "/count_tokens"
 	// countTokensMarker matches the Gemini :countTokens method suffix.
@@ -62,13 +59,13 @@ func (m *Manager) handleInterceptAfter(request []byte) (resp []byte, err error) 
 	return okEnvelope(pluginapi.RequestInterceptResponse{})
 }
 
-// interceptBefore resolves the caller identity, admits the request with a
-// bounded reservation, and enqueues a diagnostic snapshot.
+// interceptBefore resolves the caller identity, admits the request for
+// accounting, and enqueues a diagnostic snapshot.
 func (m *Manager) interceptBefore(req pluginapi.RequestInterceptRequest) pluginapi.RequestInterceptResponse {
 	deps, ok := m.begin(true)
 	if !ok {
-		// Not configured, quiesced, shut down, or failed closed after a finance
-		// fault: refuse new accounting instead of admitting unmetered traffic.
+		// Not configured, quiesced or shut down: refuse new accounting instead
+		// of admitting unmetered traffic.
 		return terminate(http.StatusServiceUnavailable, "credit manager is unavailable")
 	}
 	defer m.end()
@@ -80,16 +77,19 @@ func (m *Manager) interceptBefore(req pluginapi.RequestInterceptRequest) plugina
 	ctx := context.Background()
 	key, err := deps.store.KeyByScope(ctx, scope)
 	if err != nil {
+		// An unknown caller is a per-request rejection. A genuine storage or
+		// permission failure is reported through health, which never gates
+		// other keys: the next admission validates its own storage state.
 		if !errors.Is(err, credit.ErrNotFound) && !errors.Is(err, credit.ErrUnauthorized) {
-			m.recordFinanceFault(err)
+			m.recordError(err)
 		}
 		return terminate(http.StatusUnauthorized, "unknown caller identity")
 	}
 
 	model := requestedModel(req)
 	if isCountTokens(req) {
-		// Native token counting is not billed and holds no reservation, but it
-		// must not bypass key permissions.
+		// Native token counting is not billed and creates no accounting row,
+		// but it must not bypass key permissions.
 		if errPermit := permitCountTokens(key, model, m.now()); errPermit != nil {
 			return terminate(http.StatusForbidden, errPermit.Error())
 		}
@@ -104,25 +104,27 @@ func (m *Manager) interceptBefore(req pluginapi.RequestInterceptRequest) plugina
 	}
 	// The requested image count is only a billing input for a per-image price;
 	// the ledger decides whether an unsupported declared value is refused.
+	// Nothing here estimates amount or tokens: admission checks the actual used
+	// quotas and key concurrency only, so a positive remaining quota admits even
+	// a very large declared output limit or input payload.
 	imageCount, imageCountDeclared := requestImageCount(req.Body)
-	if _, errReserve := deps.store.Reserve(ctx, credit.ReserveInput{
+	if _, errAdmit := deps.store.Admit(ctx, credit.AdmitInput{
 		ID:                 strings.TrimSpace(req.RequestID),
 		TraceID:            traceID,
 		KeyID:              key.ID,
 		RequestedModel:     model,
-		InputEstimate:      int64(len(req.Body)),
-		OutputEstimate:     outputEstimate(req.Body),
 		ServiceTier:        requestServiceTier(req.Body),
 		ImageCount:         imageCount,
 		ImageCountDeclared: imageCountDeclared,
 		At:                 m.now(),
-	}); errReserve != nil {
-		if !isBusinessRejection(errReserve) {
-			// An unrecognized storage or transaction failure means admission can
-			// no longer be trusted, so it fails closed for every key.
-			m.recordFinanceFault(errReserve)
+	}); errAdmit != nil {
+		if !isBusinessRejection(errAdmit) {
+			// A storage or transaction failure refuses this request and is
+			// reported through health. It never latches a global gate, so one
+			// transient failure can not permanently block every key.
+			m.recordError(errAdmit)
 		}
-		return terminate(reserveStatus(errReserve), reserveMessage(errReserve))
+		return terminate(admitStatus(errAdmit), admitMessage(errAdmit))
 	}
 
 	if deps.captures != nil {
@@ -202,32 +204,6 @@ func metadataString(metadata map[string]any, key string) string {
 		return ""
 	}
 	return strings.TrimSpace(text)
-}
-
-// outputEstimate reads the declared maximum output tokens from the raw request
-// body without modifying it, falling back to a conservative constant.
-func outputEstimate(body []byte) int64 {
-	if len(body) == 0 {
-		return defaultOutputEstimate
-	}
-	var fields map[string]json.RawMessage
-	if err := json.Unmarshal(body, &fields); err != nil {
-		return defaultOutputEstimate
-	}
-	for _, name := range []string{"max_output_tokens", "max_completion_tokens", "max_tokens"} {
-		raw, ok := fields[name]
-		if !ok {
-			continue
-		}
-		var value int64
-		if err := json.Unmarshal(raw, &value); err != nil {
-			continue
-		}
-		if value > 0 {
-			return value
-		}
-	}
-	return defaultOutputEstimate
 }
 
 // requestServiceTier reads the requested service tier from the raw request body
@@ -328,16 +304,16 @@ func integralInt64(raw json.RawMessage) (int64, bool) {
 // isBusinessRejection reports whether a credit failure refuses one request
 // because of that request, its key or its model. Those are normal outcomes: the
 // caller gets an error response while every other key keeps working. Only an
-// unrecognized failure indicates that the accounting store itself is broken.
+// unrecognized failure indicates that the accounting store itself is broken,
+// which is reported through health without latching a global admission gate.
 //
-// A conflicting request id is included: Resolve/Reserve reject a duplicate or
+// A conflicting request id is included: Admit rejects a duplicate or
 // contradictory event for one request with 409, which must not be escalated
 // into a global admission block for every key.
 func isBusinessRejection(err error) bool {
 	switch {
 	case errors.Is(err, credit.ErrQuota),
 		errors.Is(err, credit.ErrConcurrency),
-		errors.Is(err, credit.ErrPending),
 		errors.Is(err, credit.ErrUnauthorized),
 		errors.Is(err, credit.ErrDenied),
 		errors.Is(err, credit.ErrUnpriced),
@@ -349,10 +325,10 @@ func isBusinessRejection(err error) bool {
 	}
 }
 
-// reserveStatus maps a reservation failure to a downstream HTTP status.
-func reserveStatus(err error) int {
+// admitStatus maps an admission failure to a downstream HTTP status.
+func admitStatus(err error) int {
 	switch {
-	case errors.Is(err, credit.ErrQuota), errors.Is(err, credit.ErrConcurrency), errors.Is(err, credit.ErrPending):
+	case errors.Is(err, credit.ErrQuota), errors.Is(err, credit.ErrConcurrency):
 		return http.StatusTooManyRequests
 	case errors.Is(err, credit.ErrUnauthorized), errors.Is(err, credit.ErrDenied), errors.Is(err, credit.ErrUnpriced):
 		return http.StatusForbidden
@@ -365,16 +341,14 @@ func reserveStatus(err error) int {
 	}
 }
 
-// reserveMessage returns a safe, non-identifying message for a reservation
+// admitMessage returns a safe, non-identifying message for an admission
 // failure. No database path, key material or model detail is ever exposed.
-func reserveMessage(err error) string {
+func admitMessage(err error) string {
 	switch {
 	case errors.Is(err, credit.ErrQuota):
 		return "credit quota exceeded"
 	case errors.Is(err, credit.ErrConcurrency):
 		return "too many concurrent requests"
-	case errors.Is(err, credit.ErrPending):
-		return "too many unresolved requests"
 	case errors.Is(err, credit.ErrUnauthorized), errors.Is(err, credit.ErrDenied):
 		return "request is not permitted"
 	case errors.Is(err, credit.ErrUnpriced):

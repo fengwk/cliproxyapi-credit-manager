@@ -14,7 +14,7 @@ func TestCustomerUsageSourceCannotExemptBilling(t *testing.T) {
 		t.Run(source, func(t *testing.T) {
 			h := newHarness(t)
 			if response := h.intercept(h.request("request-source", "trace-source")); response.Terminate {
-				t.Fatalf("reserve: %+v", response)
+				t.Fatalf("admission: %+v", response)
 			}
 			h.usage(pluginapi.UsageRecord{
 				RequestID: "execution-source", TraceID: "trace-source", Provider: "openai",
@@ -27,9 +27,9 @@ func TestCustomerUsageSourceCannotExemptBilling(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if key.SpentMicroUSD != 20 || key.HeldMicroUSD != 0 || h.m.LastError() != "" {
-				t.Fatalf("source %q: spent=%d held=%d health=%q", source,
-					key.SpentMicroUSD, key.HeldMicroUSD, h.m.LastError())
+			if key.SpentMicroUSD != 20 || h.m.LastError() != "" {
+				t.Fatalf("source %q: spent=%d health=%q", source,
+					key.SpentMicroUSD, h.m.LastError())
 			}
 		})
 	}
@@ -39,7 +39,7 @@ func TestCustomerUsageSourceCannotExemptBilling(t *testing.T) {
 func TestNativeUsageWithoutTimestampReplaysIdempotently(t *testing.T) {
 	h := newHarness(t)
 	if response := h.intercept(h.request("request-replay", "trace-replay")); response.Terminate {
-		t.Fatalf("reserve: %+v", response)
+		t.Fatalf("admission: %+v", response)
 	}
 	record := pluginapi.UsageRecord{
 		RequestID: "execution-replay", TraceID: "trace-replay", Provider: "openai",
@@ -50,13 +50,13 @@ func TestNativeUsageWithoutTimestampReplaysIdempotently(t *testing.T) {
 	h.usage(record)
 	h.usage(record)
 	h.complete("request-replay", "trace-replay", pluginapi.RequestCompletionSucceeded)
-	// A duplicate after settlement must neither add a charge nor reopen a hold.
+	// A duplicate after settlement must not add a charge.
 	h.usage(record)
 	if message := h.m.LastError(); message != "" {
 		t.Fatalf("identical replay degraded health: %s", message)
 	}
 	key, err := h.store().GetKey(context.Background(), h.key.ID)
-	if err != nil || key.SpentMicroUSD != 20 || key.HeldMicroUSD != 0 {
+	if err != nil || key.SpentMicroUSD != 20 {
 		t.Fatalf("replayed key=%+v err=%v", key, err)
 	}
 	report, err := h.store().Report(context.Background(), credit.Filter{KeyID: h.key.ID})

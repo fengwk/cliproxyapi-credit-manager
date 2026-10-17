@@ -31,6 +31,9 @@ type harness struct {
 	key   credit.Key
 	plain string
 	dir   string
+	// reconfigures counts the configurations this harness has sent, so every
+	// reconfigure really differs from the live one.
+	reconfigures int
 }
 
 func newHarness(t *testing.T) *harness {
@@ -42,7 +45,7 @@ func newHarness(t *testing.T) *harness {
 	t.Cleanup(func() {
 		_, _ = m.HandleCall(pluginabi.MethodPluginShutdown, nil)
 	})
-	h.configure(h.yaml(16))
+	h.configure(h.yaml())
 	store := h.store()
 	ctx := context.Background()
 	key, plain, err := store.CreateKey(ctx, credit.KeySpec{Label: "test", Enabled: true})
@@ -57,13 +60,20 @@ func newHarness(t *testing.T) *harness {
 }
 
 // captureYAML renders a valid plugin configuration for the given data directory.
-func captureYAML(dataDir string, maxPending int) []byte {
-	return []byte(fmt.Sprintf("data_dir: %q\nhistory:\n  retention_months: 3\nmax_pending_requests: %d\nrequest_capture:\n  enabled: false\n", dataDir, maxPending))
+func captureYAML(dataDir string) []byte {
+	return captureYAMLMonths(dataDir, 3)
+}
+
+// captureYAMLMonths renders a valid plugin configuration with an explicit
+// retention window, which is a safe way to make two configurations differ
+// without touching the immutable accounting directory.
+func captureYAMLMonths(dataDir string, months int) []byte {
+	return []byte(fmt.Sprintf("data_dir: %q\nhistory:\n  retention_months: %d\nrequest_capture:\n  enabled: false\n", dataDir, months))
 }
 
 // captureEnabledYAML renders a configuration with request capture enabled.
 func captureEnabledYAML(dataDir string) []byte {
-	return []byte(fmt.Sprintf("data_dir: %q\nhistory:\n  retention_months: 3\nmax_pending_requests: 16\nrequest_capture:\n  enabled: true\n", dataDir))
+	return []byte(fmt.Sprintf("data_dir: %q\nhistory:\n  retention_months: 3\nrequest_capture:\n  enabled: true\n", dataDir))
 }
 
 func (h *harness) configure(yaml []byte) {
@@ -88,14 +98,21 @@ func (h *harness) configure(yaml []byte) {
 // yaml renders a plugin configuration for the harness data directory. The
 // accounting directory is immutable while the plugin runs, so every
 // reconfigure in these tests reuses it.
-func (h *harness) yaml(maxPending int) []byte {
-	return captureYAML(h.dir, maxPending)
+func (h *harness) yaml() []byte {
+	return captureYAML(h.dir)
 }
 
-// reconfigure applies a new configuration and returns the raw envelope.
-func (h *harness) reconfigure(maxPending int) pluginabi.Envelope {
+// reconfigure applies a new configuration and returns the raw envelope. The
+// retention window changes on every call so the host really reconfigures rather
+// than re-sending the identical configuration (the idempotent same-config
+// path), while data_dir stays immutable.
+func (h *harness) reconfigure() pluginabi.Envelope {
 	h.t.Helper()
-	payload, err := json.Marshal(lifecycleRequest{ConfigYAML: h.yaml(maxPending), SchemaVersion: pluginabi.SchemaVersion})
+	h.reconfigures++
+	payload, err := json.Marshal(lifecycleRequest{
+		ConfigYAML:    captureYAMLMonths(h.dir, 3+h.reconfigures),
+		SchemaVersion: pluginabi.SchemaVersion,
+	})
 	if err != nil {
 		h.t.Fatalf("marshal lifecycle request: %v", err)
 	}
@@ -184,7 +201,7 @@ func (h *harness) intercept(req pluginapi.RequestInterceptRequest) pluginapi.Req
 // stream hook, so the host can never route inference through it.
 func TestRegistrationDeclaresOnlyPassiveCapabilities(t *testing.T) {
 	m := NewManager()
-	payload, err := json.Marshal(lifecycleRequest{ConfigYAML: captureYAML(t.TempDir(), 16), SchemaVersion: pluginabi.SchemaVersion})
+	payload, err := json.Marshal(lifecycleRequest{ConfigYAML: captureYAML(t.TempDir()), SchemaVersion: pluginabi.SchemaVersion})
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
 	}
@@ -251,7 +268,7 @@ func TestRegistrationDeclaresOnlyPassiveCapabilities(t *testing.T) {
 // TestRegisterRejectsOldHostSchema enforces the minimum supported host contract.
 func TestRegisterRejectsOldHostSchema(t *testing.T) {
 	m := NewManager()
-	payload, err := json.Marshal(lifecycleRequest{ConfigYAML: captureYAML(t.TempDir(), 16), SchemaVersion: 5})
+	payload, err := json.Marshal(lifecycleRequest{ConfigYAML: captureYAML(t.TempDir()), SchemaVersion: 5})
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
 	}
@@ -371,9 +388,10 @@ func TestInterceptRequiresTrace(t *testing.T) {
 	}
 }
 
-// TestInterceptReserveThenSettle exercises the full accounting round trip:
-// reservation, usage normalization and terminal completion.
-func TestInterceptReserveThenSettle(t *testing.T) {
+// TestInterceptAdmitThenSettle exercises the full accounting round trip:
+// admission, usage normalization and terminal completion. Admission itself
+// charges nothing: the charge is booked from the reported actual usage.
+func TestInterceptAdmitThenSettle(t *testing.T) {
 	h := newHarness(t)
 	response := h.intercept(h.request("req-1", "trace-1"))
 	if response.Terminate {
@@ -381,6 +399,13 @@ func TestInterceptReserveThenSettle(t *testing.T) {
 	}
 	if len(response.Body) != 0 || len(response.Headers) != 0 || response.Path != "" || len(response.ClearHeaders) != 0 {
 		t.Fatalf("before-auth interception must not modify the request: %+v", response)
+	}
+	admitted, err := h.store().GetKey(context.Background(), h.key.ID)
+	if err != nil {
+		t.Fatalf("GetKey: %v", err)
+	}
+	if admitted.SpentMicroUSD != 0 {
+		t.Fatalf("spent = %d, want no charge before usage is reported", admitted.SpentMicroUSD)
 	}
 
 	h.usage(pluginapi.UsageRecord{
@@ -395,17 +420,14 @@ func TestInterceptReserveThenSettle(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetKey: %v", err)
 	}
-	if key.SpentMicroUSD <= 0 {
-		t.Fatalf("spent = %d, want a settled charge", key.SpentMicroUSD)
-	}
-	if key.HeldMicroUSD != 0 {
-		t.Fatalf("held = %d, want the hold released on completion", key.HeldMicroUSD)
+	if key.SpentMicroUSD != 2000 {
+		t.Fatalf("spent = %d, want the settled actual usage charge 2000", key.SpentMicroUSD)
 	}
 }
 
-// TestInterceptCountTokensSkipsHoldButKeepsPermissions verifies that native
-// token counting is not billed yet still cannot escape key permissions.
-func TestInterceptCountTokensSkipsHoldButKeepsPermissions(t *testing.T) {
+// TestInterceptCountTokensSkipsBillingButKeepsPermissions verifies that native
+// token counting is never billed yet still cannot escape key permissions.
+func TestInterceptCountTokensSkipsBillingButKeepsPermissions(t *testing.T) {
 	h := newHarness(t)
 	ctx := context.Background()
 	key, _, err := h.store().CreateKey(ctx, credit.KeySpec{
@@ -431,8 +453,8 @@ func TestInterceptCountTokensSkipsHoldButKeepsPermissions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetKey: %v", err)
 	}
-	if stored.HeldMicroUSD != 0 {
-		t.Fatalf("count_tokens must not hold credit, held = %d", stored.HeldMicroUSD)
+	if stored.SpentMicroUSD != 0 {
+		t.Fatalf("count_tokens must never be billed, spent = %d", stored.SpentMicroUSD)
 	}
 
 	req.RequestID = "count-2"
@@ -476,26 +498,28 @@ func TestAfterAuthInterceptIsNoOp(t *testing.T) {
 	}
 }
 
-// TestFinanceFaultBlocksAdmission verifies that a financial failure fails the
-// plugin closed: subsequent requests are refused, never unmetered.
-func TestFinanceFaultBlocksAdmission(t *testing.T) {
+// TestAdmissionStorageFaultIsRequestScoped verifies that a storage failure
+// refuses the request that hit it (fail closed) and is observable through
+// health, without latching a global gate: once storage answers again the very
+// next admission succeeds. One transient failure must never permanently block
+// every key.
+func TestAdmissionStorageFaultIsRequestScoped(t *testing.T) {
 	h := newHarness(t)
+	real := h.store()
 	h.m.mu.Lock()
-	h.m.live.store = faultBackend{Backend: h.m.live.store, reserveErr: errors.New("storage offline")}
+	h.m.live.store = &oneShotAdmitFault{Backend: real, err: errors.New("storage offline")}
 	h.m.mu.Unlock()
 
 	response := h.intercept(h.request("req-fault", "trace-fault"))
-	if !response.Terminate {
-		t.Fatalf("finance fault must terminate the request: %+v", response)
-	}
-	h.m.mu.Lock()
-	blocked := h.m.admissionBlocked
-	h.m.mu.Unlock()
-	if !blocked {
-		t.Fatal("finance fault must block new admissions")
+	if !response.Terminate || response.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("an admission storage fault must terminate the request: %+v", response)
 	}
 	if h.m.LastError() == "" {
-		t.Fatal("finance fault must be observable through health")
+		t.Fatal("an admission storage fault must be observable through health")
+	}
+	response = h.intercept(h.request("req-after-fault", "trace-after-fault"))
+	if response.Terminate {
+		t.Fatalf("a single recoverable storage fault must not block later admissions: %+v", response)
 	}
 }
 
@@ -520,13 +544,7 @@ func TestCompleteCancelledOutcomePreserved(t *testing.T) {
 func TestCompleteUnknownRequestIsBenign(t *testing.T) {
 	h := newHarness(t)
 	h.complete("never-reserved", "trace-never", pluginapi.RequestCompletionSucceeded)
-	h.m.mu.Lock()
-	blocked, message := h.m.admissionBlocked, h.m.lastError
-	h.m.mu.Unlock()
-	if blocked {
-		t.Fatal("an unknown completion must not block admissions")
-	}
-	if message != "" {
+	if message := h.m.LastError(); message != "" {
 		t.Fatalf("an unknown completion must not degrade health, got %q", message)
 	}
 	// Admission must still work after the benign completion.
@@ -572,7 +590,7 @@ func TestReconfigureRefusesWhileRequestsActive(t *testing.T) {
 	h.m.live.store = activeBackend{Backend: h.m.live.store, active: true}
 	h.m.mu.Unlock()
 
-	envelope := h.reconfigure(32)
+	envelope := h.reconfigure()
 	if envelope.OK || envelope.Error == nil || envelope.Error.HTTPStatus != http.StatusConflict {
 		t.Fatalf("active-request reconfigure must be refused with 409, got %+v", envelope)
 	}
@@ -591,7 +609,7 @@ func TestReconfigureRefusesWhenLivenessIsUnknown(t *testing.T) {
 	h.m.live.store = activeBackend{Backend: h.m.live.store, err: errors.New("liveness probe failed")}
 	h.m.mu.Unlock()
 
-	envelope := h.reconfigure(32)
+	envelope := h.reconfigure()
 	if envelope.OK || envelope.Error == nil || envelope.Error.HTTPStatus != http.StatusConflict {
 		t.Fatalf("an unknown liveness answer must refuse the swap, got %+v", envelope)
 	}
@@ -614,7 +632,7 @@ func TestQuiesceThenReconfigureReopens(t *testing.T) {
 	if !response.Terminate || response.StatusCode != http.StatusServiceUnavailable {
 		t.Fatalf("quiesced plugin must refuse admission, got %+v", response)
 	}
-	h.configure(h.yaml(16))
+	h.configure(h.yaml())
 	store := h.store()
 	ctx := context.Background()
 	key, _, err := store.CreateKey(ctx, credit.KeySpec{Label: "again", Enabled: true})
@@ -722,12 +740,12 @@ func TestManagementRoutesAndResourceWhitelist(t *testing.T) {
 	}
 }
 
-// TestQuiesceKeepsSettlingReservedRequests verifies that quiesce never loses
-// usage: a request reserved before quiesce can still be settled afterwards.
-func TestQuiesceKeepsSettlingReservedRequests(t *testing.T) {
+// TestQuiesceKeepsSettlingAdmittedRequests verifies that quiesce never loses
+// usage: a request admitted before quiesce can still be settled afterwards.
+func TestQuiesceKeepsSettlingAdmittedRequests(t *testing.T) {
 	h := newHarness(t)
 	if response := h.intercept(h.request("req-late", "trace-late")); response.Terminate {
-		t.Fatalf("reserve failed: %+v", response)
+		t.Fatalf("admission failed: %+v", response)
 	}
 	if _, err := h.m.HandleCall(pluginabi.MethodPluginQuiesce, nil); err != nil {
 		t.Fatalf("quiesce: %v", err)
@@ -736,7 +754,7 @@ func TestQuiesceKeepsSettlingReservedRequests(t *testing.T) {
 	if response := h.intercept(h.request("req-refused", "trace-refused")); !response.Terminate {
 		t.Fatalf("quiesced plugin must refuse new admissions: %+v", response)
 	}
-	// The reserved request must still settle.
+	// The admitted request must still settle in full.
 	h.usage(pluginapi.UsageRecord{
 		RequestID: "exec-late", TraceID: "trace-late", Provider: "openai", ExecutorType: "openaiExecutor",
 		Model: testModel, APIKey: h.key.Principal,
@@ -748,8 +766,8 @@ func TestQuiesceKeepsSettlingReservedRequests(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetKey: %v", err)
 	}
-	if key.SpentMicroUSD <= 0 || key.HeldMicroUSD != 0 {
-		t.Fatalf("reserved request lost on quiesce: spent=%d held=%d", key.SpentMicroUSD, key.HeldMicroUSD)
+	if key.SpentMicroUSD != 2000 {
+		t.Fatalf("admitted request lost on quiesce: spent=%d want 2000", key.SpentMicroUSD)
 	}
 }
 
@@ -813,7 +831,7 @@ func TestReconfigureAllowsWhenNothingActive(t *testing.T) {
 	h.m.mu.Lock()
 	h.m.live.store = activeBackend{Backend: h.m.live.store, active: false}
 	h.m.mu.Unlock()
-	if envelope := h.reconfigure(32); !envelope.OK {
+	if envelope := h.reconfigure(); !envelope.OK {
 		t.Fatalf("idle reconfigure must succeed: %+v", envelope)
 	}
 }
@@ -905,9 +923,6 @@ func TestConcurrentUsageAndCompletionSettleExactlyOnce(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetKey: %v", err)
 	}
-	if key.HeldMicroUSD != 0 {
-		t.Fatalf("held = %d, want 0 after completion", key.HeldMicroUSD)
-	}
 	if key.SpentMicroUSD != 2000 {
 		t.Fatalf("spent = %d, want exactly one settlement of 2000 microUSD", key.SpentMicroUSD)
 	}
@@ -963,9 +978,6 @@ func TestUsageSettlesAcrossDistinctLifecycleAndExecutionIDs(t *testing.T) {
 	if key.SpentMicroUSD != 2000 {
 		t.Fatalf("spent = %d, want the execution charge 2000", key.SpentMicroUSD)
 	}
-	if key.HeldMicroUSD != 0 {
-		t.Fatalf("held = %d, want the hold released on completion", key.HeldMicroUSD)
-	}
 }
 
 // TestUsageConflictIsHealthOnlyAndKeepsServing verifies that a conflicting
@@ -986,12 +998,7 @@ func TestUsageConflictIsHealthOnlyAndKeepsServing(t *testing.T) {
 	record.Detail = pluginapi.UsageDetail{InputTokens: 9999, OutputTokens: 500, TotalTokens: 10499}
 	h.usage(record)
 
-	h.m.mu.Lock()
-	blocked, message := h.m.admissionBlocked, h.m.lastError
-	h.m.mu.Unlock()
-	if blocked {
-		t.Fatal("a conflicting usage record must not block admissions for every key")
-	}
+	message := h.m.LastError()
 	if message == "" || !strings.Contains(message, h.key.ID) {
 		t.Fatalf("a conflicting usage record must be reported with the affected key, got %q", message)
 	}
@@ -1007,10 +1014,11 @@ func TestUsageConflictIsHealthOnlyAndKeepsServing(t *testing.T) {
 	}
 }
 
-// TestUsageStorageFaultBlocksAdmissions verifies that a genuine accounting
-// write failure fails the plugin closed rather than being reported as a
-// per-request problem.
-func TestUsageStorageFaultBlocksAdmissions(t *testing.T) {
+// TestUsageStorageFaultIsHealthOnly verifies that a genuine accounting write
+// failure is reported through health and does not poison future admissions: the
+// next request validates its own storage state instead of being refused by a
+// sticky global gate.
+func TestUsageStorageFaultIsHealthOnly(t *testing.T) {
 	h := newHarness(t)
 	real := h.store()
 	h.m.mu.Lock()
@@ -1018,7 +1026,7 @@ func TestUsageStorageFaultBlocksAdmissions(t *testing.T) {
 	h.m.mu.Unlock()
 
 	if response := h.intercept(h.request("req-storage", "trace-storage")); response.Terminate {
-		t.Fatalf("reserve failed: %+v", response)
+		t.Fatalf("admission failed: %+v", response)
 	}
 	h.usage(pluginapi.UsageRecord{
 		RequestID: "exec-storage", TraceID: "trace-storage", Provider: "openai", Model: testModel,
@@ -1026,23 +1034,20 @@ func TestUsageStorageFaultBlocksAdmissions(t *testing.T) {
 		Detail: pluginapi.UsageDetail{InputTokens: 10, OutputTokens: 5, TotalTokens: 15},
 	})
 
-	h.m.mu.Lock()
-	blocked, message := h.m.admissionBlocked, h.m.lastError
-	h.m.mu.Unlock()
-	if !blocked {
-		t.Fatal("a usage storage fault must block new admissions")
-	}
-	if message == "" {
+	if message := h.m.LastError(); message == "" {
 		t.Fatal("a usage storage fault must be observable through health")
 	}
-	response := h.intercept(h.request("req-blocked", "trace-blocked"))
-	if !response.Terminate || response.StatusCode != http.StatusServiceUnavailable {
-		t.Fatalf("admissions must fail closed after a storage fault, got %+v", response)
+	response := h.intercept(h.request("req-after-storage", "trace-after-storage"))
+	if response.Terminate {
+		t.Fatalf("a usage storage fault must not block later admissions: %+v", response)
 	}
 }
 
-// TestQuotaRejectionDoesNotDisableOtherKeys verifies that a business rejection
-// for one key leaves every other key working and does not degrade health.
+// TestQuotaRejectionDoesNotDisableOtherKeys pins soft post-usage quota
+// admission: a key with a positive remaining quota admits a request even with a
+// tiny configured limit (quota=1, spent=0), the reported actual usage is charged
+// in full beyond that limit, only then does the exhausted key reject the next
+// request, and no other key or the health state is affected.
 func TestQuotaRejectionDoesNotDisableOtherKeys(t *testing.T) {
 	h := newHarness(t)
 	ctx := context.Background()
@@ -1052,20 +1057,40 @@ func TestQuotaRejectionDoesNotDisableOtherKeys(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateKey: %v", err)
 	}
+	limitedRequest := func(id, trace string) pluginapi.RequestInterceptRequest {
+		req := h.request(id, trace)
+		req.Metadata = map[string]any{"caller_scope": limited.Scope, "request_path": "/v1/messages"}
+		return req
+	}
 
-	blocked := h.request("req-quota", "trace-quota")
-	blocked.Metadata = map[string]any{"caller_scope": limited.Scope, "request_path": "/v1/messages"}
-	response := h.intercept(blocked)
+	// A positive remaining quota admits the request: admission compares no
+	// estimate against the limit, so a declared body far larger than the quota
+	// is still admitted.
+	if response := h.intercept(limitedRequest("req-quota-admit", "trace-quota-admit")); response.Terminate {
+		t.Fatalf("a positive remaining quota must admit the request: %+v", response)
+	}
+	// The reported actual usage is charged in full, beyond the limit.
+	h.usage(pluginapi.UsageRecord{
+		RequestID: "exec-quota", TraceID: "trace-quota-admit", Provider: "openai", Model: testModel,
+		APIKey: limited.Principal, AccessProvider: "plugin:cliproxyapi-credit-manager:" + authProviderID,
+		Detail: pluginapi.UsageDetail{InputTokens: 1000, OutputTokens: 500, TotalTokens: 1500},
+	})
+	h.complete("req-quota-admit", "trace-quota-admit", pluginapi.RequestCompletionSucceeded)
+	used, err := h.store().GetKey(ctx, limited.ID)
+	if err != nil {
+		t.Fatalf("GetKey: %v", err)
+	}
+	if used.SpentMicroUSD != 2000 || used.QuotaUsedMicroUSD <= 1 {
+		t.Fatalf("actual usage must be charged in full beyond the quota: spent=%d quota_used=%d",
+			used.SpentMicroUSD, used.QuotaUsedMicroUSD)
+	}
+
+	// The exhausted key rejects the next request as a normal business outcome.
+	response := h.intercept(limitedRequest("req-quota", "trace-quota"))
 	if !response.Terminate || response.StatusCode != http.StatusTooManyRequests {
 		t.Fatalf("quota rejection must terminate with 429, got %+v", response)
 	}
-	h.m.mu.Lock()
-	fault, message := h.m.admissionBlocked, h.m.lastError
-	h.m.mu.Unlock()
-	if fault {
-		t.Fatal("a quota rejection must not block admissions globally")
-	}
-	if message != "" {
+	if message := h.m.LastError(); message != "" {
 		t.Fatalf("a quota rejection must not degrade health, got %q", message)
 	}
 
@@ -1084,11 +1109,8 @@ func TestUnpricedModelRejectedThenPricedSucceeds(t *testing.T) {
 	if !response.Terminate || response.StatusCode != http.StatusForbidden {
 		t.Fatalf("unpriced model must terminate with 403, got %+v", response)
 	}
-	h.m.mu.Lock()
-	fault, message := h.m.admissionBlocked, h.m.lastError
-	h.m.mu.Unlock()
-	if fault || message != "" {
-		t.Fatalf("an unpriced model must not fault the plugin: blocked=%v health=%q", fault, message)
+	if message := h.m.LastError(); message != "" {
+		t.Fatalf("an unpriced model must not degrade health, got %q", message)
 	}
 
 	if err := h.store().PutPrice(context.Background(), credit.Price{
@@ -1103,13 +1125,13 @@ func TestUnpricedModelRejectedThenPricedSucceeds(t *testing.T) {
 	}
 }
 
-// TestReconfigureDrainsReserveBeforeLivenessCheck pins the interleaving that a
-// naive check order would get wrong: a reservation that is still inside Reserve
+// TestReconfigureDrainsAdmissionBeforeLivenessCheck pins the interleaving that a
+// naive check order would get wrong: an admission that is still inside Admit
 // when the reconfigure starts must be drained and then observed by the
 // liveness check, so its database is retained instead of abandoned.
-func TestReconfigureDrainsReserveBeforeLivenessCheck(t *testing.T) {
+func TestReconfigureDrainsAdmissionBeforeLivenessCheck(t *testing.T) {
 	h := newHarness(t)
-	blocking := blockingReserveBackend{
+	blocking := blockingAdmitBackend{
 		Backend: h.store(),
 		entered: make(chan struct{}),
 		release: make(chan struct{}),
@@ -1121,12 +1143,12 @@ func TestReconfigureDrainsReserveBeforeLivenessCheck(t *testing.T) {
 	intercepted := make(chan pluginapi.RequestInterceptResponse, 1)
 	go func() { intercepted <- h.m.interceptBefore(h.request("req-drained", "trace-drained")) }()
 
-	// Barrier 1: the reservation is inside Reserve and holds the shared gate.
+	// Barrier 1: the admission is inside Admit and holds the shared gate.
 	<-blocking.entered
 
 	reconfigured := make(chan pluginabi.Envelope, 1)
 	go func() {
-		payload, err := json.Marshal(lifecycleRequest{ConfigYAML: h.yaml(32), SchemaVersion: pluginabi.SchemaVersion})
+		payload, err := json.Marshal(lifecycleRequest{ConfigYAML: captureYAMLMonths(h.dir, 6), SchemaVersion: pluginabi.SchemaVersion})
 		if err != nil {
 			reconfigured <- pluginabi.Envelope{}
 			return
@@ -1145,26 +1167,25 @@ func TestReconfigureDrainsReserveBeforeLivenessCheck(t *testing.T) {
 	}()
 
 	// Barrier 2: the reconfigure stopped new admissions and is now waiting for
-	// the shared gate, so the reservation below commits after that point.
+	// the shared gate, so the admission below commits after that point.
 	h.waitForState(stateReconfiguring)
 	close(blocking.release)
 
 	if response := <-intercepted; response.Terminate {
-		t.Fatalf("a reservation drained by the reconfigure must still be admitted: %+v", response)
+		t.Fatalf("an admission drained by the reconfigure must still be admitted: %+v", response)
 	}
 	envelope := <-reconfigured
 	if envelope.OK || envelope.Error == nil || envelope.Error.HTTPStatus != http.StatusConflict {
-		t.Fatalf("the drained reservation must make the swap unsafe (409), got %+v", envelope)
+		t.Fatalf("the drained admission must make the swap unsafe (409), got %+v", envelope)
 	}
-	if _, ok := h.store().(blockingReserveBackend); !ok {
+	if _, ok := h.store().(blockingAdmitBackend); !ok {
 		t.Fatal("the refused reconfigure must keep the previous store")
 	}
-	key, err := h.store().GetKey(context.Background(), h.key.ID)
-	if err != nil {
-		t.Fatalf("GetKey: %v", err)
-	}
-	if key.HeldMicroUSD == 0 {
-		t.Fatal("the drained reservation must be visible in the retained store")
+	// The drained admission is visible in the retained store as an unresolved
+	// execution, which is exactly why the swap was refused.
+	active, err := h.store().HasActive(context.Background())
+	if err != nil || !active {
+		t.Fatalf("the drained admission must be visible in the retained store: active=%v err=%v", active, err)
 	}
 }
 
@@ -1173,7 +1194,7 @@ func TestReconfigureDrainsReserveBeforeLivenessCheck(t *testing.T) {
 func TestReconfigureRefusesDataDirChange(t *testing.T) {
 	h := newHarness(t)
 	envelope := h.call(pluginabi.MethodPluginReconfigure, lifecycleRequest{
-		ConfigYAML: captureYAML(t.TempDir(), 16), SchemaVersion: pluginabi.SchemaVersion,
+		ConfigYAML: captureYAML(t.TempDir()), SchemaVersion: pluginabi.SchemaVersion,
 	})
 	if envelope.OK || envelope.Error == nil || envelope.Error.HTTPStatus != http.StatusConflict {
 		t.Fatalf("a data_dir change must be refused with 409, got %+v", envelope)
@@ -1194,11 +1215,8 @@ func TestCountTokensCompletionIsBenign(t *testing.T) {
 		t.Fatalf("count_tokens probe was terminated: %+v", response)
 	}
 	h.complete("count-benign", "trace-count-benign", pluginapi.RequestCompletionSucceeded)
-	h.m.mu.Lock()
-	blocked, message := h.m.admissionBlocked, h.m.lastError
-	h.m.mu.Unlock()
-	if blocked || message != "" {
-		t.Fatalf("a count_tokens completion must be benign: blocked=%v health=%q", blocked, message)
+	if message := h.m.LastError(); message != "" {
+		t.Fatalf("a count_tokens completion must be benign: health=%q", message)
 	}
 	if response := h.intercept(h.request("req-after-count", "trace-after-count")); response.Terminate {
 		t.Fatalf("admission blocked after a benign count_tokens completion: %+v", response)
@@ -1212,18 +1230,18 @@ func (panicBackend) KeyByScope(context.Context, string) (credit.Key, error) {
 	panic("injected panic")
 }
 
-// faultBackend injects store failures to prove fail-closed behavior.
+// faultBackend injects store failures to prove fail-closed behavior per call.
 type faultBackend struct {
 	credit.Backend
-	reserveErr error
-	usageErr   error
+	admitErr error
+	usageErr error
 }
 
-func (f faultBackend) Reserve(ctx context.Context, in credit.ReserveInput) (credit.Request, error) {
-	if f.reserveErr != nil {
-		return credit.Request{}, f.reserveErr
+func (f faultBackend) Admit(ctx context.Context, in credit.AdmitInput) (credit.Request, error) {
+	if f.admitErr != nil {
+		return credit.Request{}, f.admitErr
 	}
-	return f.Backend.Reserve(ctx, in)
+	return f.Backend.Admit(ctx, in)
 }
 
 func (f faultBackend) RecordUsage(ctx context.Context, usage credit.Usage) error {
@@ -1233,18 +1251,18 @@ func (f faultBackend) RecordUsage(ctx context.Context, usage credit.Usage) error
 	return f.Backend.RecordUsage(ctx, usage)
 }
 
-// blockingReserveBackend parks one reservation inside Reserve so a test can
+// blockingAdmitBackend parks one admission inside Admit so a test can
 // interleave it with a lifecycle transition deterministically.
-type blockingReserveBackend struct {
+type blockingAdmitBackend struct {
 	credit.Backend
 	entered chan struct{}
 	release chan struct{}
 }
 
-func (b blockingReserveBackend) Reserve(ctx context.Context, in credit.ReserveInput) (credit.Request, error) {
+func (b blockingAdmitBackend) Admit(ctx context.Context, in credit.AdmitInput) (credit.Request, error) {
 	close(b.entered)
 	<-b.release
-	return b.Backend.Reserve(ctx, in)
+	return b.Backend.Admit(ctx, in)
 }
 
 // activeBackend advertises the optional HasActive capability.
@@ -1256,15 +1274,15 @@ type activeBackend struct {
 
 func (a activeBackend) HasActive(context.Context) (bool, error) { return a.active, a.err }
 
-// oneShotReserveFault fails only the first reservation it sees, so a test can
-// prove that one rejected request leaves the plugin admitting the next.
-type oneShotReserveFault struct {
+// oneShotAdmitFault fails only the first admission it sees, so a test can prove
+// that one storage failure leaves the plugin admitting the next request.
+type oneShotAdmitFault struct {
 	credit.Backend
 	mu  sync.Mutex
 	err error
 }
 
-func (b *oneShotReserveFault) Reserve(ctx context.Context, in credit.ReserveInput) (credit.Request, error) {
+func (b *oneShotAdmitFault) Admit(ctx context.Context, in credit.AdmitInput) (credit.Request, error) {
 	b.mu.Lock()
 	err := b.err
 	b.err = nil
@@ -1272,31 +1290,25 @@ func (b *oneShotReserveFault) Reserve(ctx context.Context, in credit.ReserveInpu
 	if err != nil {
 		return credit.Request{}, err
 	}
-	return b.Backend.Reserve(ctx, in)
+	return b.Backend.Admit(ctx, in)
 }
 
 // TestConflictRejectionDoesNotBlockOtherKeys is the F02 regression: a
 // conflicting request id is a request-level outcome that refuses only that
-// request, while an unrecognized storage failure still fails closed for every
-// key.
+// request, and an unrecognized storage failure refuses only the request that hit
+// it while still being observable through health.
 func TestConflictRejectionDoesNotBlockOtherKeys(t *testing.T) {
 	h := newHarness(t)
 	h.m.mu.Lock()
 	real := h.m.live.store
-	h.m.live.store = &oneShotReserveFault{Backend: real, err: credit.ErrConflict}
+	h.m.live.store = &oneShotAdmitFault{Backend: real, err: credit.ErrConflict}
 	h.m.mu.Unlock()
 
-	// A: the conflicting request id is refused as 409, exactly like reserveStatus
+	// A: the conflicting request id is refused as 409, exactly like admitStatus
 	// reports it.
 	response := h.intercept(h.request("req-conflict", "trace-conflict"))
 	if !response.Terminate || response.StatusCode != http.StatusConflict {
 		t.Fatalf("a conflicting request must be refused with 409, got %+v", response)
-	}
-	h.m.mu.Lock()
-	blocked := h.m.admissionBlocked
-	h.m.mu.Unlock()
-	if blocked {
-		t.Fatal("a conflicting request id must not block admissions for every key")
 	}
 	if message := h.m.LastError(); message != "" {
 		t.Fatalf("a conflicting request id must not degrade health: %q", message)
@@ -1314,26 +1326,23 @@ func TestConflictRejectionDoesNotBlockOtherKeys(t *testing.T) {
 	})
 	h.complete("req-next", "trace-next", pluginapi.RequestCompletionSucceeded)
 
-	// An unrecognized storage failure is a different class: it must fail closed
-	// for every key until the plugin is reconfigured.
+	// An unrecognized storage failure is refused with 503 and reported through
+	// health, but it is not sticky: the next request is admitted again.
 	h.m.mu.Lock()
-	h.m.live.store = faultBackend{Backend: real, reserveErr: errors.New("storage exploded")}
+	h.m.live.store = faultBackend{Backend: real, admitErr: errors.New("storage exploded")}
 	h.m.mu.Unlock()
 	response = h.intercept(h.request("req-fault", "trace-fault"))
 	if !response.Terminate || response.StatusCode != http.StatusServiceUnavailable {
 		t.Fatalf("an unrecognized storage failure must be refused with 503, got %+v", response)
 	}
-	h.m.mu.Lock()
-	blocked = h.m.admissionBlocked
-	h.m.mu.Unlock()
-	if !blocked {
-		t.Fatal("an unrecognized storage failure must block admissions for every key")
-	}
 	if h.m.LastError() == "" {
 		t.Fatal("an unrecognized storage failure must be observable through health")
 	}
-	if response := h.intercept(h.request("req-after-fault", "trace-after-fault")); !response.Terminate {
-		t.Fatalf("admissions must stay fail-closed after an unrecognized storage failure: %+v", response)
+	h.m.mu.Lock()
+	h.m.live.store = real
+	h.m.mu.Unlock()
+	if response := h.intercept(h.request("req-after-fault", "trace-after-fault")); response.Terminate {
+		t.Fatalf("a recovered storage failure must not block later admissions: %+v", response)
 	}
 }
 

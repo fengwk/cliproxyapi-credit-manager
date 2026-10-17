@@ -87,7 +87,7 @@ func TestRegistrationReportsHostComparableVersion(t *testing.T) {
 		_, _ = m.HandleCall(pluginabi.MethodPluginShutdown, nil)
 	})
 	payload, err := json.Marshal(lifecycleRequest{
-		ConfigYAML:    captureYAML(t.TempDir(), 16),
+		ConfigYAML:    captureYAML(t.TempDir()),
 		SchemaVersion: pluginabi.SchemaVersion,
 	})
 	if err != nil {

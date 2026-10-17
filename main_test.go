@@ -1,12 +1,82 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 )
+
+// pluginSources returns main.go plus every Go source of the plugin's own
+// packages, which together are the whole passive-plugin implementation.
+func pluginSources(t *testing.T) []string {
+	t.Helper()
+	targets := []string{"main.go"}
+	for _, dir := range []string{"internal/plugin", "internal/config"} {
+		matches, err := filepath.Glob(filepath.Join(dir, "*.go"))
+		if err != nil {
+			t.Fatalf("glob %s: %v", dir, err)
+		}
+		if len(matches) == 0 {
+			t.Fatalf("no Go sources found under %s", dir)
+		}
+		targets = append(targets, matches...)
+	}
+	return targets
+}
+
+// TestNoOutboundHostExecutionBridge is the ABI-level architecture guard for the
+// passive plugin: background warmup and its host callback bridge were removed,
+// so no plugin source may reference a host model execution method or an
+// installed outbound bridge. The absence of an API can not be asserted by
+// calling it, so the sources themselves are scanned.
+func TestNoOutboundHostExecutionBridge(t *testing.T) {
+	forbidden := []string{
+		"MethodHostModelExecute",
+		"HostModelExecutionRequest",
+		"SetHostCall",
+		"hostCall",
+		"store_host_api",
+		"call_host_api",
+	}
+	for _, target := range pluginSources(t) {
+		data, err := os.ReadFile(target)
+		if err != nil {
+			t.Fatalf("read %s: %v", target, err)
+		}
+		for _, token := range forbidden {
+			if bytes.Contains(data, []byte(token)) {
+				t.Errorf("%s references %s; the passive plugin must make no outbound host call", target, token)
+			}
+		}
+	}
+}
+
+// TestHostABIStructAndValidationRetained pins the other half of the contract:
+// removing the outbound bridge must not change the host ABI, so the host struct
+// layout and its explicit version validation stay in the shim.
+func TestHostABIStructAndValidationRetained(t *testing.T) {
+	source, err := os.ReadFile("main.go")
+	if err != nil {
+		t.Fatalf("read main.go: %v", err)
+	}
+	for _, required := range []string{
+		"cliproxy_host_api",
+		"cliproxy_host_call_fn",
+		"cliproxy_host_free_fn",
+		"host.abi_version",
+		"pluginabi.ABIVersion",
+	} {
+		if !strings.Contains(string(source), required) {
+			t.Errorf("main.go must retain %s: the host ABI layout and validation are unchanged", required)
+		}
+	}
+}
 
 // TestRequestLenGuardRejectsBeforeReading pins the ABI-level size decision: a
 // caller can pass a small pointer with a huge length without allocating it, so

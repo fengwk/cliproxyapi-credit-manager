@@ -4,7 +4,6 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 )
 
 func TestConfiguration(t *testing.T) {
@@ -25,48 +24,23 @@ func TestConfiguration(t *testing.T) {
 	}
 }
 
-// TestWarmupConfiguration pins the optional warmup contract: disabled by
-// default with no targets, normalized targets, and rejection of a target that
-// could not pin a credential exactly.
-func TestWarmupConfiguration(t *testing.T) {
-	// The default is completely inert.
-	c, err := Parse(nil)
-	if err != nil || c.Warmup.Enabled || c.Warmup.Period != time.Hour || len(c.Warmup.Targets) != 0 {
-		t.Fatalf("warmup defaults: %#v %v", c.Warmup, err)
-	}
-	// Enabling warmup without targets is valid and probes nothing.
-	if c, err = Parse([]byte("warmup: {enabled: true}")); err != nil || !c.Warmup.Enabled || c.Warmup.Period != time.Hour {
-		t.Fatalf("enabled without targets: %#v %v", c.Warmup, err)
-	}
-
-	c, err = Parse([]byte("warmup:\n  enabled: true\n  interval: 30m\n  targets:\n    - {auth_id: ' a-1 ', provider: p1, model: m1}\n    - {auth_id: a-2, provider: p2, model: m2, protocol: GEMINI}\n"))
-	if err != nil {
-		t.Fatalf("warmup parse: %v", err)
-	}
-	if !c.Warmup.Enabled || c.Warmup.Interval != "30m" || c.Warmup.Period != 30*time.Minute || len(c.Warmup.Targets) != 2 {
-		t.Fatalf("warmup parsed: %#v", c.Warmup)
-	}
-	if c.Warmup.Targets[0].AuthID != "a-1" || c.Warmup.Targets[0].Protocol != "openai" {
-		t.Fatalf("first target must be trimmed and default to openai: %#v", c.Warmup.Targets[0])
-	}
-	if c.Warmup.Targets[1].Protocol != "gemini" {
-		t.Fatalf("protocol must be normalized to lower case: %#v", c.Warmup.Targets[1])
-	}
-
-	// A target that can not pin auth_id, provider and model exactly, or a
-	// protocol this plugin does not build a request for, is rejected.
+// TestRetiredSettingsRejected pins that the removed background warmup and the
+// pending-request backlog gate are refused with an explicit error instead of
+// being silently ignored, which would leave an operator believing the retired
+// behavior is still active.
+func TestRetiredSettingsRejected(t *testing.T) {
 	for _, raw := range []string{
-		"warmup: {interval: nope}",
-		"warmup: {interval: 0s}",
-		"warmup: {interval: -1m}",
-		"warmup: {targets: [{auth_id: a, provider: p, model: m, protocol: bogus}]}",
-		"warmup: {targets: [{provider: p, model: m}]}",
-		"warmup: {targets: [{auth_id: a, model: m}]}",
-		"warmup: {targets: [{auth_id: a, provider: p}]}",
-		"warmup: {unknown_field: 1}",
+		"warmup: {enabled: true}",
+		"warmup:\n  enabled: true\n  interval: 30m\n  targets:\n    - {auth_id: a, provider: p, model: m}",
+		"max_pending_requests: 16",
+		"data_dir: ./ledger\nmax_pending_requests: 1",
 	} {
-		if _, err := Parse([]byte(raw)); err == nil {
-			t.Fatalf("accepted %q", raw)
+		_, err := Parse([]byte(raw))
+		if err == nil {
+			t.Fatalf("accepted retired setting %q", raw)
+		}
+		if !strings.Contains(err.Error(), "no longer supported") {
+			t.Fatalf("retired setting %q error = %v, want an explicit removed-setting error", raw, err)
 		}
 	}
 }
