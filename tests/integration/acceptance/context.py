@@ -128,15 +128,28 @@ class Context:
         self.manager = Manager(self.host.config.base_url, self.management_secret, self.plugin_id)
         self.client = Client(self.host.config.base_url)
 
+    def stop_host(self):
+        """Stop the currently attached host, if any.
+
+        A case that replaces the host it is running against (for example to boot
+        a deployment with a rejected configuration) must stop the old process
+        first: leaving it running leaks a bound port and keeps the previous
+        plugin instance serving requests, so results would come from the wrong
+        host.
+        """
+        if self.host is not None:
+            self.host.stop()
+        self.host = None
+        self.manager = None
+        self.client = None
+
     def recreate_host(self, name, *, root=None, enable_plugins=True, plugin_config=None, extra_plugin_yaml="", extra_top_yaml="", client_keys=None, request_retry=3, session_affinity=False, session_affinity_ttl="1h"):
         """Stop any running host and boot a fresh isolated one.
 
         Each case gets a clean credit database and configuration unless it passes
         an explicit root/plugin_config (used by restart/persistence cases).
         """
-        if self.host is not None:
-            self.host.stop()
-            self.host = None
+        self.stop_host()
         self._host_seq += 1
         if root is None:
             safe = "".join(ch if ch.isalnum() or ch in "-." else "-" for ch in name)
@@ -197,6 +210,25 @@ class Context:
         if response.status != 200:
             raise RuntimeError(f"usage query failed: {response}")
         return response.json()
+
+    def wait_report(self, key_id, settled=0, timeout=15):
+        """Poll the usage report until at least `settled` requests are settled.
+
+        Costs are derived at query time, so every case observes them through the
+        report rather than a key ledger. Polling the request state keeps the
+        assertion deterministic on a real host.
+        """
+        def probe():
+            report = self.usage_rows(key_id=key_id, page_size=100)
+            if settled <= 0:
+                return report
+            done = [row for row in report["items"] if row["state"] == "settled"]
+            return report if len(done) >= settled else None
+
+        report = self.wait_until(probe, timeout=timeout)
+        if report is None:
+            report = self.usage_rows(key_id=key_id, page_size=100)
+        return report
 
     def find_request(self, key_id=None, model=None, search=None):
         """Return the newest matching request item from the usage report."""

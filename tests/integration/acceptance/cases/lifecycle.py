@@ -14,7 +14,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from ..mock import Script
-from ..report import check, check_eq, check_no_holds
+from ..report import check, check_eq, check_no_holds, check_no_ledger_fields
 
 CASES = []
 
@@ -31,9 +31,8 @@ def _key(ctx, key_id):
     return next((k for k in items if k["id"] == key_id), None)
 
 
-def _spent(ctx, key_id):
-    row = _key(ctx, key_id)
-    return row["spent_micro_usd"] if row else None
+def _summary(ctx, key_id):
+    return ctx.usage_rows(key_id=key_id, page_size=100)["summary"]
 
 
 @case("lifecycle.unknown_usage_stays_pending",
@@ -53,8 +52,9 @@ def unknown_usage(ctx):
     check(request["state"] != "settled", f"unknown usage must not settle: {request['state']}")
     check_eq(request["outcome"], "succeeded", "outcome is succeeded but accounting is unknown")
     check_no_holds(request, "unknown-usage request")
-    check_eq(_spent(ctx, item["id"]), 0, "unknown usage is not billed as zero")
-    report = ctx.usage_rows(key_id=item["id"])
+    summary = _summary(ctx, item["id"])
+    check_eq(summary["cost_micro_usd"], 0, "unknown usage is not billed as zero")
+    report = ctx.usage_rows(key_id=item["id"], page_size=100)
     check(report["summary"]["pending"] >= 1, f"pending surfaced in report: {report['summary']}")
     check_eq(report["summary"]["complete_executions"], 0, "no complete execution recorded")
     check_no_holds(report["summary"], "usage summary")
@@ -64,9 +64,12 @@ def unknown_usage(ctx):
     ctx.mock.default_script = Script()
     check_eq(ctx.client.chat(key, "synthetic-chat").status, 200,
              "an unresolved request does not block a later admission")
-    check(ctx.wait_until(lambda: _spent(ctx, item["id"]) == 14), "the later request still settles")
-    return {"state": request["state"], "spent": _spent(ctx, item["id"]),
-            "upstream_calls": ctx.mock.count("/chat/completions")}
+    check_eq(ctx.wait_report(item["id"], settled=1)["summary"]["cost_micro_usd"], 14,
+             "the later request still settles and derives its cost")
+    summary = _summary(ctx, item["id"])
+    check_eq(summary["pending"], 1, "the unknown request stays pending")
+    return {"state": request["state"], "cost": summary["cost_micro_usd"],
+            "pending": summary["pending"], "upstream_calls": ctx.mock.count("/chat/completions")}
 
 
 @case("lifecycle.client_cancel_pending",
@@ -100,13 +103,14 @@ def client_cancel(ctx):
     request = ctx.find_request(key_id=item["id"])
     check(request["state"] != "settled", f"cancelled request must not settle free: {request['state']}")
     check_no_holds(request, "cancelled request")
-    check_eq(_spent(ctx, item["id"]), 0, "cancel does not bill")
+    summary = _summary(ctx, item["id"])
+    check_eq(summary["cost_micro_usd"], 0, "cancel derives no cost")
     return {"elapsed_s": round(elapsed, 3), "state": request["state"],
-            "upstream_calls": ctx.mock.count("/chat/completions")}
+            "cost": summary["cost_micro_usd"], "upstream_calls": ctx.mock.count("/chat/completions")}
 
 
 @case("lifecycle.restart_retains_balance",
-      "a restarted host keeps the settled balance and keeps unfinished work pending")
+      "a restarted host keeps the derived cost and keeps unfinished work pending")
 def restart_retains(ctx):
     root = Path(ctx.artifacts) / "host-restart"
     ctx.recreate_host("restart-a", root=root)
@@ -117,21 +121,23 @@ def restart_retains(ctx):
     check_eq(ctx.client.chat(key, "synthetic-chat").status, 200, "settle request accepted")
     ctx.mock.default_script = Script(omit_usage=True)
     check_eq(ctx.client.chat(key, "synthetic-chat").status, 200, "pending request accepted")
-    check(ctx.wait_until(lambda: _spent(ctx, item["id"]) == 14), "first request settled at 14")
-    report_before = ctx.usage_rows(key_id=item["id"])
+    check_eq(ctx.wait_report(item["id"], settled=1)["summary"]["cost_micro_usd"], 14,
+             "first request settled at 14")
+    report_before = ctx.usage_rows(key_id=item["id"], page_size=100)
     pending_id = next((row["id"] for row in report_before["items"] if row["state"] != "settled"), None)
     check(pending_id is not None, f"a pending request exists before restart: {report_before['items']}")
 
     # Restart against the same data_dir.
     ctx.recreate_host("restart-b", root=root)
     check_eq(ctx.manager.health().json()["status"], "ok", "health ok after restart")
-    check_eq(_spent(ctx, item["id"]), 14, "settled balance survives restart")
-    report_after = ctx.usage_rows(key_id=item["id"])
-    check_eq(report_after["summary"]["cost_micro_usd"], 14, "durable cost after restart")
+    report_after = ctx.usage_rows(key_id=item["id"], page_size=100)
+    check_eq(report_after["summary"]["cost_micro_usd"], 14, "derived cost survives restart")
     pending_after = next((row for row in report_after["items"] if row["id"] == pending_id), None)
     check(pending_after is not None, "unfinished request row survives restart")
     check(pending_after["state"] != "settled", f"unfinished work stays pending, not free: {pending_after['state']}")
     check_no_holds(pending_after, "pending request after restart")
     check_no_holds(_key(ctx, item["id"]), "key row after restart")
-    return {"spent_after": _spent(ctx, item["id"]), "pending_state": pending_after["state"],
+    check_no_ledger_fields(_key(ctx, item["id"]), "key row after restart")
+    return {"cost_after": report_after["summary"]["cost_micro_usd"],
+            "pending_state": pending_after["state"],
             "upstream_calls": ctx.mock.count("/chat/completions")}

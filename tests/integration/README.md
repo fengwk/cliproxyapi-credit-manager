@@ -7,17 +7,26 @@ mock.
 
 ## Accounting architecture pinned here
 
-Admission is a *correlation* step, not a reservation: the plugin authenticates
-the client key, resolves the requested model's frozen price, checks key
-permissions, actual-used monetary/token quotas and the explicitly configured key
-concurrency, then persists the request/key/trace association before execution.
-There is **no** estimate, hold or in-flight token sum, so a key/request/report
-never carries `held_micro_usd`/`initial_hold_micro_usd`/`token_estimate`, and
-quotas are soft limits on actual used amounts (`used >= limit` rejects the *next*
-request). Actual usage is always charged in full, even past a quota. Unknown or
-missing usage stays visibly pending without freezing money, and no independent
-backlog gate (`max_pending_requests`) blocks later admissions. The plugin runs no
-background model execution and declares no host model-execution callback.
+Admission is a *correlation* step, not a reservation and not a price check: the
+plugin authenticates the client key, checks key permissions, the actual-used
+model-token balances and the explicitly configured concurrency, then persists the
+request/key/trace association before execution. Prices and the four dollar
+budgets (`quota_micro_usd`/`daily`/`weekly`/`monthly_micro_usd`) are display-only;
+they never admit or deny a request. Costs are **derived at query time** from each
+recorded execution's actual `usage.model` and token counts times the price book in
+force when the report is read, so adding, changing or deleting a price reprices
+history immediately. A key no longer carries `spent_micro_usd` or any
+`*_used_micro_usd`, a request carries no frozen `price`/`price_tiers`/
+`pricing_rule_id`/`image_count`, and a summary carries no
+`adjustment_micro_usd`; a request/report never carries
+`held_micro_usd`/`initial_hold_micro_usd`/`token_estimate` either. An execution
+without a resolvable price (missing price, incomplete usage, or a `per_image`
+price whose actual image count SDK usage cannot prove) has `cost_micro_usd:null`
+and counts in `summary.unpriced_executions`; an explicit all-zero token price is
+a priced zero. Unknown usage stays visibly pending and never becomes free, and no
+independent backlog gate (`max_pending_requests`) blocks later admissions. The
+plugin runs no background model execution and declares no host model-execution
+callback.
 
 ## Safety and isolation
 
@@ -116,7 +125,7 @@ prefix never names the resource directory.
 observed result, the upstream call count/deltas and the upstream call details
 (path + upstream credential + streaming), plus `build` metadata, `elapsed_s`,
 `host_root` and `host_log`. Passing is never decided by an HTTP 200 alone: each
-case asserts the actual ledger, tokens, cost and lifecycle state.
+case asserts the actual usage, the derived cost and the lifecycle state.
 
 Each case's host lives at `<artifacts>/host-<n>-<case>/` with `config.yaml`,
 `host.log`, `data/credit.db` and `data/request-captures.db`.
@@ -127,25 +136,25 @@ Each case's host lives at `<artifacts>/host-<n>-<case>/` with `config.yaml`,
 | --- | --- |
 | `abi` | Direct `.so` probe via ctypes: ABI 1 / RPC schema 6 negotiation, an undefined (missing/0) or older host schema refused with `unsupported_host`, passive-only capabilities (no executor/router/scheduler), no host model-execution callback bridge at any lifecycle point. |
 | `core` | Host lists the plugin (enabled, bare numeric metadata version, published menu); health (build-identity diagnostic version carrying the commit); management auth gate (401 without/with wrong key). |
-| `accounting` | Exact cost (input 10 / output 4 / total 14 = 14 microUSD), canonical buckets, complete quality, distinct execution id, same-key ledger, all-zero price is free, unpriced model denied with no upstream call and no poisoning of other keys, a real usage whose upstream account label is the literal `warmup` is still billed in full. No settled request or key row exposes a hold/estimate field. |
-| `admission` | Soft post-usage limits: with 1 microUSD of quota left a large declared `max_tokens`/body is admitted and billed by actual usage; actual charges overrun a quota in full and only the next request is denied; four simultaneous same-key requests are all admitted with no estimated hold; 20 unresolved unknown-usage requests stay pending without blocking the same or another key; every admitted request keeps one unique execution and the ledger equals the exact sum of actual usage. |
+| `accounting` | Query-time cost (input 10 / output 4 / total 14 = 14 microUSD), canonical buckets, complete quality, distinct execution id, same-key history total, all-zero price is a priced free execution, a fresh key on an empty price book runs chat **and** Responses with `cost_micro_usd:null` and an explicit unpriced count, later add/change/delete of the only effective price (via a pricing rule) reprices the same history to 14 / 24 / null, a real usage whose upstream account label is the literal `warmup` is still priced in full. No settled request, summary or key row exposes a hold, a ledger or a frozen price. |
+| `admission` | Money is display-only: a key whose four dollar budgets are all exceeded keeps executing and derives every cost; an unpriced model is admitted despite an exhausted budget; actual-used model-token limits still return 429 before upstream; `max_concurrent` still rejects a second in-flight request and releases the slot on settle; `allowed_models` and `expires_at` still deny; 20 unresolved unknown-usage requests stay pending (no cost, no unpriced execution) without blocking the same or another key; every admitted request keeps one unique execution and the summary equals the exact derived sum. |
 | `auth` | Five credential locations, invalid/absent denial with no upstream call, invalid Bearer + valid Google fallback, first-candidate-wins on conflict, original CPA key rejected while exclusive, custom (non `sk-`) prefix key. Deployment fail-closed: a plugin-managed key is accepted at all five locations while the plugin is loaded, and with `plugins.enabled: false` (library not loaded) all five are denied with no upstream call while the plugin instance stays unregistered. |
 | `capture` | Disabled vs unavailable vs captured states, lazy fetch, header + JSON redaction, 64-bit integer fidelity, adjustable body limit (oversize skipped). |
 | `report` | `from/to/key_id/model/result/search/page/page_size/bucket` filters, pagination, trend sums equal the summary, full-UUID trace ids searchable. |
 | `resources` | Public static assets are embedded and credential-free; resource paths cannot reach administrative APIs. |
 | `lookup` | Explicit customer Bearer, own-key-only reports, foreign/unknown snapshot 404 equivalence, natural-month trends and exact amounts. |
-| `namespace` | Request model vs execution/response model are kept distinct for an aliased model; billing uses the requested model's price. |
-| `lifecycle` | Unknown usage stays pending (never free) with no hold, and it does not block the next admission; client cancel does not hang or fabricate a charge; restart retains the settled balance and keeps unfinished work pending. |
+| `namespace` | Request model vs actual `usage.model` are kept distinct for an aliased model; pricing uses the actual model (pricing only the request alias leaves the execution `null`, and pricing the actual model reprices it to 14). |
+| `lifecycle` | Unknown usage stays pending (never free) with no hold, and it does not block the next admission; client cancel does not hang or fabricate a charge; restart retains the derived cost and keeps unfinished work pending. |
 | `retry` | A 429 on the first upstream credential fails over, one client request, two independent per-attempt usage rows (failed-unknown not written off); all-failures never bill as free. |
-| `passive` | No background model execution: no upstream activity or credential selection without a client request. CPA can save `warmup`/`max_pending_requests` with HTTP 200, but the subsequent plugin registration refuses these fields and the native guard denies client keys. Removing the fields restores registration and the original ledger. A deployment configured with `warmup` also refuses registration with the field named in the host log. |
+| `passive` | No background model execution: no upstream activity or credential selection without a client request. CPA can save `warmup`/`max_pending_requests` with HTTP 200, but the subsequent plugin registration refuses these fields and the native guard denies client keys. Removing the fields restores registration and the original usage history and derived cost. A deployment configured with `warmup` also refuses registration with the field named in the host log. |
 | `affinity` | Native CPA session-affinity scheduling (`routing.session-affinity: true`, default round-robin, two synthetic credentials): an explicit `X-Session-ID` shared by three requests with different user content, and a grown conversation prefix (system+user stable, assistant+user appended) with **no** session header, each keep every request on one credential (identical `AuthID` and upstream key) and bill 3 x 14 = 42. Unrelated requests without a session do alternate the two credentials, so the binding is not a default. A third case binds an explicit session, then reassigns the key's caller and rotates the key material, and asserts the same session stays on the same `AuthID`/upstream key. |
 | `gemini` | Native `generateContent` and `streamGenerateContent` (`alt=sse`) authenticate, forward the upstream Google key and bill. |
 | `browser` | Real isolated Chromium: per-tab session login, optional remembered reload, logout clearing storage/charts, real ECharts/month query, lazy capture-body modal with redaction/64-bit fidelity, customer own-key snapshot lookup, the default overview tab's real ECharts aggregate, an advanced rule saved through the DOM with a lossless 2^53+1 rate, and customer model-data isolation. |
-| `management` | Every declared management route denies a missing and a wrong credential without leaking data; the read routes succeed with the management secret. |
-| `keyops` | Caller attribution metadata (server principal/scope/fingerprint, stable across reads; a disabled caller never disables its key) and reveal/rotate/soft-delete keeping the ledger, history and an unresolved request, with a retained pending request still settling. |
-| `reset` | `reset-spend` re-opens the quota baseline only: it keeps the lifetime ledger and the request history, and a retained pending request still settles. |
-| `audit` | Key, pricing-rule and resolve operations are all audited (newest first, with identifiers/reasons/details) and never contain a plaintext key. |
-| `pricing` | Nested rate sheets keep exact signed 64-bit values (2^53+1, int64 max) across save/reload without touching the ledger; rule context/service tiers resolve exactly; a native chat bills `per_image` by the requested count while an out-of-range count (100) is denied before any upstream call. |
+| `management` | Every declared management route denies a missing and a wrong credential without leaking data; the read routes succeed with the management secret; the retired `/api/resolve` and `/api/reset-spend` routes answer 404. |
+| `keyops` | Caller attribution metadata (server principal/scope/fingerprint, stable across reads; a disabled caller never disables its key) and reveal/rotate/soft-delete keeping the derived cost, the history and an unresolved pending request. |
+| `reset` | `reset-tokens` re-opens only the consumed model-token baseline: it changes neither the usage log nor the derived costs nor the pending request, and validates scope/window/reason (`total` window). |
+| `audit` | Key, pricing-rule and token-reset operations are all audited (newest first, with identifiers/reasons/details naming the token baseline) and never contain a plaintext key; no manual resolve action exists. |
+| `pricing` | Nested rate sheets keep exact signed 64-bit values (2^53+1, int64 max) across save/reload and derive no cost; rule context/service tiers resolve exactly in preview and a rule prices a live execution by its actual usage; a `per_image` price never bills the requested `n` (no actual image count in SDK usage, so the cost is `null`); a disabled rule takes no part in pricing and is not a permission denial. |
 | `reference` | `/api/model-catalog` and `/api/exchange-rate` are management-gated and, with host egress pinned to a closed loopback port, answer the safe `unavailable` envelope instead of live prices. |
 
 ## Environment notes
@@ -179,6 +188,7 @@ host; they are picked up by `make static`
 (`python3 -m unittest discover -s tests/integration -p 'test_*.py'`). The
 inventory module keeps `DEFAULT_MODULES` and `acceptance/cases/*.py` in sync,
 proves every module declares at least one case, and forbids the case files from
-reading a retired estimate/hold field again. A requested module that does not
+reading a retired estimate/hold field, a key money ledger or a frozen request
+price again. A requested module that does not
 exist (for example the removed `warmup`) fails the run with exit code 2 instead
 of being skipped.

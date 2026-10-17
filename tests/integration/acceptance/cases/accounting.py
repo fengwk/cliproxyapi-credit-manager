@@ -1,14 +1,21 @@
-"""Billing semantics: exact cost, canonical buckets, free prices and unpriced denial.
+"""Query-time accounting: actual usage x current price, never a frozen charge.
 
-Charges are actual-used only: a settled request bills exactly the usage the
-upstream reported and never carries an estimate or a hold.
+Admission never reads a price and never holds money. A report derives each
+execution's cost from the recorded actual usage (tokens and ``usage.model``)
+plus the price book in force at read time, so adding, changing or deleting a
+price reprices history immediately. An execution without a resolvable price has
+``cost_micro_usd: null`` (never zero) and is counted in
+``summary.unpriced_executions``; an explicit all-zero token price under
+complete usage is a priced zero.
 """
 
 from __future__ import annotations
 
-from ..report import check, check_eq, check_no_holds
+from ..report import check, check_eq, check_no_holds, check_no_ledger_fields, check_none
 
 CASES = []
+
+COST = 14  # 10 input + 4 output tokens at 1 microUSD/token
 
 
 def case(name, expects):
@@ -18,25 +25,22 @@ def case(name, expects):
     return wrap
 
 
-def _tokens(execution):
-    return execution["tokens"]
-
-
-def _find_key(manager, key_id):
-    items = manager.keys().json()["items"]
+def _key(ctx, key_id):
+    items = ctx.manager.keys().json()["items"]
     return next((row for row in items if row["id"] == key_id), None)
 
 
-def _settled(ctx, key_id):
-    def probe():
-        request = ctx.find_request(key_id=key_id)
-        if request and request["state"] == "settled":
-            return request
-        return None
-    return ctx.wait_until(probe, timeout=15)
+def _request(ctx, key_id, state="settled"):
+    report = ctx.wait_report(key_id, settled=1 if state == "settled" else 0)
+    return next((row for row in report["items"] if row["state"] == state), None)
 
 
-@case("billing.exact_cost_nonstream", "input 10 / output 4 settles at exactly 14 microUSD (1 microUSD/token)")
+def _summary(ctx, key_id):
+    return ctx.usage_rows(key_id=key_id, page_size=100)["summary"]
+
+
+@case("billing.exact_cost_nonstream",
+      "input 10 / output 4 settles at exactly 14 microUSD from actual usage and the current price")
 def exact_cost(ctx):
     ctx.set_price("synthetic-chat")
     item, key = ctx.new_key(label="billing-exact")
@@ -50,140 +54,206 @@ def exact_cost(ctx):
         check(call["upstream_key"] in ctx.openai_upstream_keys, f"unexpected upstream key {call['upstream_key']}")
         check(call["upstream_key"] != key, "client key leaked upstream")
 
-    request = _settled(ctx, item["id"])
+    report = ctx.wait_report(item["id"], settled=1)
+    request = next((row for row in report["items"] if row["state"] == "settled"), None)
     check(request is not None, "request settled within timeout")
-    check_eq(request["state"], "settled", "request state")
     check_eq(request["outcome"], "succeeded", "request outcome")
     check_no_holds(request, "settled request")
+    check_no_ledger_fields(request, "settled request")
     executions = request["executions"]
     check_eq(len(executions), 1, "execution count")
     ex = executions[0]
-    tokens = _tokens(ex)
+    tokens = ex["tokens"]
     check_eq(tokens["input"], 10, "canonical input (uncached)")
     check_eq(tokens["output"], 4, "canonical output")
     check_eq(tokens["reasoning"], 0, "reasoning tokens")
     check_eq(tokens["total"], 14, "total tokens")
     check_eq(ex["quality"], "complete", "accounting quality")
-    check_eq(ex["cost_micro_usd"], 14, "execution cost microUSD")
+    check_eq(ex["cost_micro_usd"], COST, "execution cost microUSD")
     check_eq(ex["response_model"], "synthetic-chat", "response model")
     check(ex["id"], "execution carries a distinct execution id")
     check(ex["id"] != request["id"], "usage/execution id differs from request/lifecycle id")
 
-    row = _find_key(ctx.manager, item["id"])
-    check_eq(row["spent_micro_usd"], 14, "key spent ledger")
+    summary = report["summary"]
+    check_eq(summary["requests"], 1, "summary requests")
+    check_eq(summary["executions"], 1, "summary executions")
+    check_eq(summary["cost_micro_usd"], COST, "summary derived cost")
+    check_eq(summary["complete_executions"], 1, "complete usage is counted independently of pricing")
+    check_eq(summary["unpriced_executions"], 0, "priced execution is not unpriced")
+    check_no_holds(summary, "usage summary")
+    check_no_ledger_fields(summary, "usage summary")
+
+    row = _key(ctx, item["id"])
+    check(row is not None, "key row readable")
+    check_no_ledger_fields(row, "key row")
     check_no_holds(row, "key row")
     return {"request_id": request["id"], "trace_id": request["trace_id"], "execution": ex,
-            "key_spent": row["spent_micro_usd"]}
+            "summary": summary}
 
 
-@case("billing.same_key_ledger", "two completions on one key accumulate a 28 microUSD same-key ledger")
-def same_key_ledger(ctx):
+@case("billing.same_key_history_accumulates",
+      "two completions on one key derive a 28 microUSD same-key total from their actual usage")
+def same_key_history(ctx):
     ctx.set_price("synthetic-chat")
-    item, key = ctx.new_key(label="billing-ledger")
+    item, key = ctx.new_key(label="billing-history")
     for _ in range(2):
         check_eq(ctx.client.chat(key, "synthetic-chat").status, 200, "client status")
     check_eq(ctx.mock.count("/chat/completions"), 2, "upstream call count")
-    row = ctx.wait_until(lambda: (r := _find_key(ctx.manager, item["id"])) and (r if r["spent_micro_usd"] == 28 else None))
-    check(row is not None, "key spent reached 28")
-    check_eq(row["spent_micro_usd"], 28, "accumulated key spent")
-    check_no_holds(row, "key row")
-    report = ctx.usage_rows(key_id=item["id"])
-    check_eq(report["summary"]["requests"], 2, "two settled requests")
-    check_eq(report["summary"]["cost_micro_usd"], 28, "summary cost")
-    check_eq(report["summary"]["executions"], 2, "two executions")
-    check_no_holds(report["summary"], "usage summary")
-    return {"key_spent": row["spent_micro_usd"], "summary": report["summary"]}
+    report = ctx.wait_report(item["id"], settled=2)
+    summary = report["summary"]
+    check_eq(summary["requests"], 2, "two settled requests")
+    check_eq(summary["executions"], 2, "two executions")
+    check_eq(summary["cost_micro_usd"], COST * 2, "summary cost is the exact derived sum")
+    check_eq(summary["unpriced_executions"], 0, "every execution is priced")
+    check_no_holds(summary, "usage summary")
+    check_no_ledger_fields(summary, "usage summary")
+    check_eq(sum(point["cost_micro_usd"] for point in report["trend"]), COST * 2,
+             "trend cost sums to the same derived total")
+    check_no_ledger_fields(_key(ctx, item["id"]), "key row")
+    return {"summary": summary, "trend_points": len(report["trend"])}
 
 
-@case("billing.all_zero_is_free", "an all-zero price is free, not a denial")
+@case("billing.all_zero_is_free",
+      "an explicit all-zero token price is a priced zero, not an unpriced or denied request")
 def free_price(ctx):
     ctx.set_price("synthetic-free", 0, 0, 0, 0)
     item, key = ctx.new_key(label="billing-free")
     check_eq(ctx.client.chat(key, "synthetic-free").status, 200, "client status")
-    request = _settled(ctx, item["id"])
+    report = ctx.wait_report(item["id"], settled=1)
+    request = next((row for row in report["items"] if row["state"] == "settled"), None)
     check(request is not None, "free request still settles")
     check_eq(request["outcome"], "succeeded", "outcome")
-    check_eq(request["executions"][0]["cost_micro_usd"], 0, "free cost")
-    check_no_holds(request, "free request")
-    row = _find_key(ctx.manager, item["id"])
-    check_eq(row["spent_micro_usd"], 0, "free key spent")
-    return {"cost": request["executions"][0]["cost_micro_usd"]}
+    execution = request["executions"][0]
+    check_eq(execution["cost_micro_usd"], 0, "free cost is an explicit zero")
+    check_eq(execution["quality"], "complete", "zero price keeps complete usage")
+    summary = report["summary"]
+    check_eq(summary["cost_micro_usd"], 0, "free summary cost")
+    check_eq(summary["unpriced_executions"], 0, "a zero price is priced, not unpriced")
+    check_eq(summary["complete_executions"], 1, "usage quality independent of price")
+    check_no_ledger_fields(_key(ctx, item["id"]), "key row")
+    return {"cost": execution["cost_micro_usd"], "unpriced": summary["unpriced_executions"]}
 
 
-@case("billing.unpriced_denied_then_other_key_ok", "an unpriced model is denied with no upstream call and does not poison other keys")
-def unpriced_denied(ctx):
-    ctx.set_price("synthetic-chat")
-    item_a, key_a = ctx.new_key(label="billing-priced-a")
-    item_b, key_b = ctx.new_key(label="billing-priced-b")
-    denied = ctx.client.chat(key_a, "synthetic-unpriced")
-    check_eq(denied.status, 403, "unpriced model denied")
-    denied_body = denied.json()
-    check_eq(denied_body["error"]["message"],
-             "model pricing is not configured or is disabled; contact the administrator",
-             "pricing rejection explains the required configuration")
-    check_eq(denied_body["error"]["type"], "permission_error", "pricing rejection type")
-    check_eq(ctx.mock.count("/chat/completions"), 0, "denied request must not reach upstream")
-    # The same key still works on a priced model.
-    check_eq(ctx.client.chat(key_a, "synthetic-chat").status, 200, "key A still usable after denial")
-    # A different key is unaffected.
-    check_eq(ctx.client.chat(key_b, "synthetic-chat").status, 200, "key B usable")
-    check_eq(ctx.manager.health().json()["status"], "ok", "health stays ok; no fail-closed poison")
-    check(ctx.wait_until(lambda: _find_key(ctx.manager, item_a["id"])["spent_micro_usd"] == 14), "key A settled")
-    check(ctx.wait_until(lambda: _find_key(ctx.manager, item_b["id"])["spent_micro_usd"] == 14), "key B settled")
-    return {"denied_status": denied.status, "upstream_calls": ctx.mock.count("/chat/completions")}
-
-
-@case("billing.fresh_key_requires_requested_alias_price",
-      "a fresh key alone does not price models; only an explicit price for the requested alias restores billing")
-def fresh_key_requires_requested_alias_price(ctx):
-    # Model existence and key permission are separate from financial pricing.
-    # The current Go list methods return a nil slice for an empty book, which
-    # the management JSON encodes as null rather than an empty array.
+@case("billing.unpriced_execution_is_null_not_free",
+      "a fresh key on an empty price book executes normally; its cost is null and it is counted as unpriced")
+def unpriced_execution(ctx):
     check_eq(ctx.manager.prices().json()["items"], None, "fresh price book")
     check_eq(ctx.manager.pricing_rules().json()["items"], None, "fresh rule book")
-    item, key = ctx.new_key(label="fresh-onboarding")
-    for phase in ("empty price book", "only upstream model priced"):
-        if phase == "only upstream model priced":
-            ctx.set_price("synthetic-upstream-name")
-        denied = ctx.client.chat(key, "synthetic-alias")
-        check_eq(denied.status, 403, phase)
-        check_eq(denied.json()["error"]["message"],
-                 "model pricing is not configured or is disabled; contact the administrator",
-                 "actionable missing-price message")
-        # Reproduce the production /v1/responses rejection without contacting
-        # any real model or requiring the upstream mock to implement Responses.
-        responses_denied = ctx.client.post(
-            "/v1/responses", {"model": "synthetic-alias", "input": "synthetic"},
-            headers={"Authorization": "Bearer " + key})
-        check_eq(responses_denied.status, 403, "Responses missing-price rejection")
-        check_eq(responses_denied.json()["error"]["message"],
-                 "model pricing is not configured or is disabled; contact the administrator",
-                 "Responses reports pricing rather than upstream availability")
-        check_eq(ctx.mock.count("/chat/completions"), 0, "unpriced request never executes")
-        check_eq(ctx.usage_rows(key_id=item["id"])["summary"]["requests"], 0,
-                 "rejected request creates no accounting")
-    ctx.set_price("synthetic-alias")
-    check_eq(ctx.manager.price_preview(model="synthetic-alias").status, 200,
-             "administrator verifies the requested alias price")
-    check_eq(ctx.client.chat(key, "synthetic-alias").status, 200,
-             "the same key works once its requested model is priced")
-    request = _settled(ctx, item["id"])
-    check(request is not None, "newly priced request settles")
-    check_eq(request["model"], "synthetic-alias", "frozen requested model")
-    check_eq(request["executions"][0]["cost_micro_usd"], 14, "full actual cost")
-    check_eq(_find_key(ctx.manager, item["id"])["spent_micro_usd"], 14, "exact key ledger")
-    check_eq(ctx.mock.count("/chat/completions"), 1, "only the priced request executes")
-    return {"requested_model": request["model"], "cost_micro_usd": 14}
+    item, key = ctx.new_key(label="billing-unpriced")
+
+    response = ctx.client.chat(key, "synthetic-unpriced")
+    check_eq(response.status, 200, "an unpriced model is executed, not denied")
+    check_eq(ctx.mock.count("/chat/completions"), 1, "unpriced request reached upstream")
+    report = ctx.wait_report(item["id"], settled=1)
+    request = next((row for row in report["items"] if row["state"] == "settled"), None)
+    check(request is not None, "unpriced complete usage still settles")
+    execution = request["executions"][0]
+    check_eq(execution["quality"], "complete", "usage quality is independent of pricing")
+    check_eq(execution["tokens"]["total"], 14, "actual usage recorded")
+    check_none(execution["cost_micro_usd"], "unpriced execution cost is null")
+    summary = report["summary"]
+    check_eq(summary["cost_micro_usd"], 0, "no priced subtotal for an unpriced execution")
+    check_eq(summary["unpriced_executions"], 1, "the unpriced execution is explicit")
+    check_eq(summary["complete_executions"], 1, "complete usage does not require a price")
+
+    # Adding a price later reprices the same historical execution.
+    ctx.set_price("synthetic-unpriced")
+    report = ctx.wait_report(item["id"], settled=1)
+    request = next((row for row in report["items"] if row["state"] == "settled"), None)
+    check_eq(request["executions"][0]["cost_micro_usd"], COST, "later price reprices history")
+    summary = report["summary"]
+    check_eq(summary["cost_micro_usd"], COST, "summary reflects the new price")
+    check_eq(summary["unpriced_executions"], 0, "the execution is no longer unpriced")
+    check_eq(ctx.mock.count("/chat/completions"), 1, "repricing executes nothing")
+    return {"unpriced_before": 1, "cost_after": summary["cost_micro_usd"]}
+
+
+@case("billing.history_reprices_on_rule_add_change_delete",
+      "a history line reprices when a rule adds, changes or removes the only effective price; deleting it makes the cost null again")
+def history_repricing(ctx):
+    item, key = ctx.new_key(label="billing-repricing")
+    check_eq(ctx.client.chat(key, "synthetic-chat").status, 200, "unpriced request accepted")
+    check_eq(ctx.mock.count("/chat/completions"), 1, "only the client request executes")
+
+    def cost_now(label):
+        report = ctx.wait_report(item["id"], settled=1)
+        check_eq(report["total"], 1, f"{label}: one historical request")
+        request = report["items"][0]
+        return request["executions"][0]["cost_micro_usd"], report["summary"]
+
+    cost, summary = cost_now("empty book")
+    check_none(cost, "no price means null cost")
+    check_eq(summary["unpriced_executions"], 1, "empty book counts the execution as unpriced")
+
+    # Add a rule that is the only effective price for the actual model.
+    rule = {"id": "history-rule", "match_kind": "exact", "pattern": "synthetic-chat",
+            "priority": 5, "enabled": True,
+            "price": {"model": "synthetic-chat",
+                      "rates": {"input": 1_000_000, "output": 1_000_000,
+                                "cache_read": 0, "cache_write": 0}}}
+    check_eq(ctx.manager.put_pricing_rule(rule).status, 200, "rule added")
+    cost, summary = cost_now("rule added")
+    check_eq(cost, COST, "adding the price reprices the historical usage")
+    check_eq(summary["unpriced_executions"], 0, "history is now priced")
+
+    # Change the rule's rate: 10 input x 2 + 4 output x 1 = 24 microUSD.
+    rule["price"]["rates"] = {"input": 2_000_000, "output": 1_000_000,
+                              "cache_read": 0, "cache_write": 0}
+    check_eq(ctx.manager.put_pricing_rule(rule).status, 200, "rule changed")
+    cost, summary = cost_now("rule changed")
+    check_eq(cost, 24, "a changed price immediately reprices history")
+
+    # Delete the last effective price: the same history becomes unpriced again.
+    check_eq(ctx.manager.delete_pricing_rule("history-rule").status, 200, "rule deleted")
+    cost, summary = cost_now("rule deleted")
+    check_none(cost, "deleting the last price makes the historical cost null")
+    check_eq(summary["cost_micro_usd"], 0, "no priced subtotal remains")
+    check_eq(summary["unpriced_executions"], 1, "deleted price restores the unpriced count")
+    check_eq(summary["complete_executions"], 1, "usage quality is unaffected by price changes")
+    check_eq(ctx.mock.count("/chat/completions"), 1, "repricing never re-executes")
+    check_no_ledger_fields(_key(ctx, item["id"]), "key row")
+    return {"empty": None, "added": COST, "changed": 24, "deleted": None,
+            "upstream_calls": ctx.mock.count("/chat/completions")}
+
+
+@case("billing.responses_prepriced_and_unpriced",
+      "Responses works on an empty price book with a null cost and is priced by actual usage once a price exists")
+def responses_pricing(ctx):
+    item, key = ctx.new_key(label="billing-responses")
+    headers = {"Authorization": "Bearer " + key}
+    body = {"model": "synthetic-chat", "input": "synthetic"}
+
+    unpriced = ctx.client.post("/v1/responses", body, headers)
+    check_eq(unpriced.status, 200, "Responses runs without any price")
+    check_eq(ctx.mock.count("/chat/completions"), 1, "Responses request reached upstream")
+    report = ctx.wait_report(item["id"], settled=1)
+    request = next((row for row in report["items"] if row["state"] == "settled"), None)
+    check(request is not None, "Responses usage settles")
+    check_none(request["executions"][0]["cost_micro_usd"], "Responses cost is null while unpriced")
+    check_eq(report["summary"]["unpriced_executions"], 1, "Responses unpriced execution is counted")
+
+    ctx.set_price("synthetic-chat")
+    priced = ctx.client.post("/v1/responses", body, headers)
+    check_eq(priced.status, 200, "Responses runs with a price")
+    report = ctx.wait_report(item["id"], settled=2)
+    priced_rows = [row for row in report["items"] if row["executions"]
+                   and row["executions"][0]["cost_micro_usd"] is not None]
+    check_eq(len(priced_rows), 2, "the later price reprices both Responses executions")
+    check_eq(report["summary"]["cost_micro_usd"], COST * 2, "derived Responses total")
+    check_eq(report["summary"]["unpriced_executions"], 0, "no unpriced execution remains")
+    check_eq(ctx.mock.count("/chat/completions"), 2, "pricing changes execute nothing")
+    return {"unpriced_status": unpriced.status, "priced_status": priced.status,
+            "summary": report["summary"]}
 
 
 @case("billing.upstream_label_never_exempts",
-      "a real CPA usage whose upstream account label is the literal 'warmup' is billed exactly 14 microUSD, never exempted")
+      "a real CPA usage whose upstream account label is the literal 'warmup' is priced exactly 14 microUSD, never exempted")
 def upstream_label_never_exempts(ctx):
     # CPA resolves a usage record's Source from the upstream account, project,
     # email or api-key label -- it is not a trusted execution origin and no label
     # can exempt a customer. Configuring the real upstream credential as the
     # string "warmup" therefore reproduces a customer whose Source collides with
-    # a former internal name: the plugin must bill it like any other customer.
+    # a former internal name: the plugin must price it like any other customer.
     original_keys = ctx.openai_upstream_keys
     try:
         ctx.openai_upstream_keys = ["warmup"]
@@ -198,16 +268,15 @@ def upstream_label_never_exempts(ctx):
         check_eq(calls[0]["upstream_key"], "warmup",
                  "upstream credential carries the literal label")
 
-        request = _settled(ctx, item["id"])
+        report = ctx.wait_report(item["id"], settled=1)
+        request = next((row for row in report["items"] if row["state"] == "settled"), None)
         check(request is not None, "request settled within timeout")
-        check_eq(request["state"], "settled", "request state")
-        check_no_holds(request, "settled request")
-        check_eq(request["executions"][0]["cost_micro_usd"], 14, "execution cost microUSD")
-        row = _find_key(ctx.manager, item["id"])
-        check_eq(row["spent_micro_usd"], 14, "key spent ledger")
-        check_no_holds(row, "key row")
+        check_eq(request["executions"][0]["cost_micro_usd"], COST, "execution cost microUSD")
+        check_eq(report["summary"]["cost_micro_usd"], COST, "summary cost")
+        check_eq(report["summary"]["unpriced_executions"], 0, "the execution is priced")
+        check_no_ledger_fields(_key(ctx, item["id"]), "key row")
         check_eq(ctx.manager.health().json()["status"], "ok", "health stays ok")
-        return {"upstream_key": calls[0]["upstream_key"], "key_spent": row["spent_micro_usd"],
+        return {"upstream_key": calls[0]["upstream_key"],
                 "execution_cost": request["executions"][0]["cost_micro_usd"]}
     finally:
         ctx.openai_upstream_keys = original_keys

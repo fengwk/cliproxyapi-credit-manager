@@ -29,7 +29,7 @@ MANAGEMENT_ROUTES = {
     "/api/rotate": ("POST",),
     "/api/reveal": ("POST",),
     "/api/delete-key": ("POST",),
-    "/api/reset-spend": ("POST",),
+    "/api/reset-tokens": ("POST",),
     "/api/callers": ("GET", "POST", "PUT"),
     "/api/audit": ("GET",),
     "/api/overview": ("GET",),
@@ -41,7 +41,6 @@ MANAGEMENT_ROUTES = {
     "/api/price-preview": ("GET",),
     "/api/usage": ("GET",),
     "/api/capture": ("GET",),
-    "/api/resolve": ("POST",),
     "/api/health": ("GET",),
 }
 
@@ -88,8 +87,19 @@ def all_routes_require_auth(ctx):
             _probe(ctx, method, suffix, "missing")
             _probe(ctx, method, suffix, "wrong")
             seen += 2
-    check(seen >= 30, f"route matrix covered ({seen} probes)")
+    check(seen >= 40, f"route matrix covered ({seen} probes)")
     return {"probes": seen, "routes": len(MANAGEMENT_ROUTES)}
+
+
+@case("management.retired_routes_are_not_registered",
+      "the removed /api/resolve and /api/reset-spend routes answer 404 instead of serving the old surface")
+def retired_routes(ctx):
+    statuses = {}
+    for suffix in ("/api/resolve", "/api/reset-spend"):
+        response = ctx.manager.retired_route(suffix, {"id": "synthetic", "total": True, "reason": "probe"})
+        statuses[suffix] = response.status
+        check_eq(response.status, 404, f"{suffix} must not be registered")
+    return statuses
 
 
 @case("management.authenticated_read_routes_succeed",

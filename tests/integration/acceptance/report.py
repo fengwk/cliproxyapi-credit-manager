@@ -27,15 +27,46 @@ def check_eq(actual, expected, message):
         raise CaseFailure(f"{message}: expected {expected!r}, got {actual!r}")
 
 
+def check_none(value, message):
+    """Require an explicitly null JSON value (never a zero or a missing key)."""
+    if value is not None:
+        raise CaseFailure(f"{message}: expected null, got {value!r}")
+
+
 #: Field names that the post-usage architecture removed from keys, requests and
 #: reports. Admission never estimates or reserves money, so no response may
 #: expose a hold or an estimate again -- absence is asserted rather than a zero.
 RETIRED_HOLD_FIELDS = ("held_micro_usd", "initial_hold_micro_usd", "token_estimate")
 
+#: Money ledgers removed by the query-time pricing contract. A key no longer
+#: carries spend/used amounts, a request carries no frozen price or manual
+#: adjustment, and a summary carries no adjustment total. Costs live only in the
+#: derived report, so these fields must never reappear in a JSON payload.
+RETIRED_MONEY_FIELDS = (
+    "spent_micro_usd",
+    "quota_used_micro_usd",
+    "daily_used_micro_usd",
+    "weekly_used_micro_usd",
+    "monthly_used_micro_usd",
+    "adjustment_micro_usd",
+)
+
+#: Request-level pricing/derivation facts removed with the frozen price and the
+#: requested image count. ``price`` here is the request field only; a price-book
+#: or rule payload legitimately carries its own ``price`` object.
+RETIRED_LEDGER_FIELDS = RETIRED_MONEY_FIELDS + ("price", "price_tiers", "pricing_rule_id", "image_count")
+
 
 def check_no_holds(payload, label):
     """Fail if a key, request or summary object still exposes a retired field."""
     for field in RETIRED_HOLD_FIELDS:
+        check(field not in payload,
+              f"{label} must not expose the retired {field!r} field: {sorted(payload)}")
+
+
+def check_no_ledger_fields(payload, label):
+    """Fail if a key/request/summary still exposes a retired money bookkeeping field."""
+    for field in RETIRED_LEDGER_FIELDS:
         check(field not in payload,
               f"{label} must not expose the retired {field!r} field: {sorted(payload)}")
 

@@ -17,7 +17,7 @@ import json
 import time
 from pathlib import Path
 
-from ..report import check, check_eq, check_no_holds
+from ..report import check, check_eq, check_no_holds, check_no_ledger_fields
 
 CASES = []
 
@@ -44,10 +44,8 @@ def case(name, expects):
     return wrap
 
 
-def _spent(ctx, key_id):
-    items = ctx.manager.keys().json()["items"]
-    row = next((k for k in items if k["id"] == key_id), None)
-    return row["spent_micro_usd"] if row else None
+def _cost(ctx, key_id):
+    return ctx.usage_rows(key_id=key_id, page_size=100)["summary"]["cost_micro_usd"]
 
 
 def _credential_lines(ctx):
@@ -70,10 +68,11 @@ def no_background_execution(ctx):
     check_eq(ctx.mock.count(), 0, "no upstream call without a client request")
     check_eq(_credential_lines(ctx), [],
              "the host selected no credential because nothing executed")
-    check_eq(ctx.usage_rows()["total"], 0, "no ledger rows without traffic")
-    check_eq(_spent(ctx, item["id"]), 0, "no key charged")
-    check_no_holds(next((k for k in ctx.manager.keys().json()["items"] if k["id"] == item["id"]), {}),
-                   "idle key row")
+    check_eq(ctx.usage_rows()["total"], 0, "no usage rows without traffic")
+    check_eq(_cost(ctx, item["id"]), 0, "no derived cost without traffic")
+    idle = next((k for k in ctx.manager.keys().json()["items"] if k["id"] == item["id"]), {})
+    check_no_holds(idle, "idle key row")
+    check_no_ledger_fields(idle, "idle key row")
     payload = ctx.manager.health().json()
     check_eq(payload.get("status"), "ok", "health is ok with the passive plugin")
     check_eq(payload.get("last_error"), "", "health reports no background error")
@@ -119,15 +118,19 @@ def retired_settings_rejected(ctx):
         check_eq(ctx.manager.health().json()["status"], "ok", "the corrected configuration restores health")
 
     check_eq(ctx.client.chat(key, MODEL).status, 200, "the restored plugin authenticates the original key")
-    check(ctx.wait_until(lambda: _spent(ctx, item["id"]) == 14), "the original ledger survives both reloads")
+    check_eq(ctx.wait_report(item["id"], settled=1)["summary"]["cost_micro_usd"], 14,
+             "the original history survives both reloads and still derives its cost")
     check_eq(ctx.mock.count("/chat/completions"), 1, "exactly the accepted request reached upstream")
-    return {"statuses": statuses, "key_spent": _spent(ctx, item["id"]), "health": "ok"}
+    return {"statuses": statuses, "cost": _cost(ctx, item["id"]), "health": "ok"}
 
 
 @case("passive.boot_rejects_retired_settings",
       "a deployment configured with a retired setting refuses plugin registration with a clear config error")
 def boot_rejects_retired(ctx):
     root = Path(ctx.artifacts) / "host-passive-boot"
+    # Replace the case host deliberately: stop it first so the rejected boot does
+    # not leave the previous CPA process (and its bound port) running.
+    ctx.stop_host()
     ctx.build_host(root=root, extra_plugin_yaml=RETIRED_SETTINGS["warmup"][0])
     ctx.host.start()
     registration = ctx.host.plugin_registration(timeout=8)

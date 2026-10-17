@@ -16,9 +16,8 @@ def case(name, expects):
     return wrap
 
 
-def _spent(ctx, key_id):
-    row = next((k for k in ctx.manager.keys().json()["items"] if k["id"] == key_id), None)
-    return row["spent_micro_usd"] if row else None
+def _cost(ctx, key_id, settled):
+    return ctx.wait_report(key_id, settled=settled)["summary"]["cost_micro_usd"]
 
 
 @case("gemini.native_generate", "native Gemini generateContent authenticates, forwards the upstream key and bills")
@@ -33,10 +32,10 @@ def generate(ctx):
     check_eq(calls[0]["upstream_key"], ctx.gemini_upstream_keys[0], "upstream gemini credential used")
     for call in ctx.mock.calls_for("/v1beta"):
         check(call["upstream_key"] != key, "client key leaked upstream")
-    check(ctx.wait_until(lambda: _spent(ctx, item["id"]) == 14), "gemini request billed 14")
-    request = ctx.wait_until(lambda: ctx.find_request(key_id=item["id"]))
+    check_eq(_cost(ctx, item["id"], 1), 14, "gemini request derives 14")
+    request = ctx.wait_report(item["id"], settled=1)["items"][0]
     check_eq(request["executions"][0]["cost_micro_usd"], 14, "execution cost")
-    return {"status": response.status, "key_spent": _spent(ctx, item["id"])}
+    return {"status": response.status, "cost": _cost(ctx, item["id"], 1)}
 
 
 @case("gemini.native_stream", "native Gemini streamGenerateContent (alt=sse) bills through the plugin")
@@ -49,5 +48,5 @@ def stream(ctx):
     check_eq(len(calls), 1, "one gemini streaming upstream call")
     check(calls[0]["stream"], "upstream call was streaming")
     check_eq(calls[0]["upstream_key"], ctx.gemini_upstream_keys[0], "upstream gemini credential used")
-    check(ctx.wait_until(lambda: _spent(ctx, item["id"]) == 14, timeout=20), "gemini stream billed 14")
-    return {"status": response.status, "key_spent": _spent(ctx, item["id"])}
+    check_eq(_cost(ctx, item["id"], 1), 14, "gemini stream derives 14")
+    return {"status": response.status, "cost": _cost(ctx, item["id"], 1)}

@@ -1,14 +1,15 @@
-"""Structured pricing: nested rates, exact 64-bit fidelity, rules, tiers, per-image.
+"""Pricing book and rules: stored prices are inputs to query-time costs only.
 
-The aligned price contract nests the rate sheet under `rates` (all int64 microUSD
-per million tokens), keeps `billing_mode`/`per_image_micro_usd` on the price, and
-puts context/service tiers on a rule. Saving a price or a rule must never touch
-the monetary ledger; only an admitted request is billed.
+Saving a price or a rule never touches a ledger because no ledger exists: a
+cost is derived from actual usage and the price in force when a report is read.
+Rules select an effective price for the actual usage model; a disabled rule
+takes no part in pricing (it is not a model permission gate), and a per-image
+price has no provable image count in SDK usage, so its executions stay unpriced.
 """
 
 from __future__ import annotations
 
-from ..report import check, check_eq
+from ..report import check, check_eq, check_none, check_no_ledger_fields
 
 CASES = []
 
@@ -37,8 +38,13 @@ def _zero_rates():
     return {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0}
 
 
+def _settled_row(ctx, key_id):
+    report = ctx.wait_report(key_id, settled=1)
+    return report, next((row for row in report["items"] if row["state"] == "settled"), None)
+
+
 @case("pricing.nested_rates_signed64_roundtrip_without_ledger",
-      "nested rates keep exact 64-bit values across save/reload and saving a price never consumes the ledger")
+      "nested rates keep exact 64-bit values across save/reload and saving a price derives no cost")
 def nested_rates(ctx):
     payload = {"model": "pricing-big",
                "rates": {"input": TWO53_PLUS_1, "output": LARGE, "cache_read": 0,
@@ -62,11 +68,11 @@ def nested_rates(ctx):
     check_eq(ctx.manager.put_price(ceiling).status, 200, "int64 ceiling accepted")
     check_eq(_price(ctx, "pricing-ceiling")["rates"]["input"], INT64_MAX, "int64 ceiling round-trips")
 
-    # Re-saving bumps the stored version, never the ledger.
+    # Re-saving bumps the stored version; there is no ledger to consume.
     check_eq(ctx.manager.put_price(payload).status, 200, "price re-save accepted")
     check_eq(_price(ctx, "pricing-big")["version"], 2, "re-save increments the version")
 
-    # A per-image price keeps its flat rate and billing mode.
+    # A per-image price keeps its flat rate and billing mode as a catalogue value.
     image = {"model": "pricing-image", "rates": _zero_rates(), "billing_mode": "per_image",
              "per_image_micro_usd": TWO53_PLUS_1, "version": 0}
     check_eq(ctx.manager.put_price(image).status, 200, "per-image price accepted")
@@ -83,20 +89,21 @@ def nested_rates(ctx):
     unknown_mode = {"model": "pricing-bad", "rates": _zero_rates(), "billing_mode": "flat", "version": 0}
     check_eq(ctx.manager.put_price(unknown_mode).status, 400, "unknown billing mode rejected")
 
-    # No price operation consumed any ledger.
+    # No price operation derives any cost or execution.
     summary = ctx.usage_rows(page=1, page_size=5)["summary"]
-    check_eq(summary["cost_micro_usd"], 0, "saving prices consumes no ledger cost")
+    check_eq(summary["cost_micro_usd"], 0, "saving prices derives no cost")
     check_eq(summary["executions"], 0, "saving prices executes nothing")
+    check_eq(summary["unpriced_executions"], 0, "there is no execution to be unpriced")
     overview = ctx.manager.overview().json()
-    check_eq(overview["summary"]["cost_micro_usd"], 0, "overview shows no consumption")
+    check_eq(overview["summary"]["cost_micro_usd"], 0, "overview shows no derived cost")
     check_eq(overview["models"], [], "no model distribution exists without a request")
     return {"input": row["rates"]["input"], "version": _price(ctx, "pricing-big")["version"],
             "per_image": image_row["per_image_micro_usd"]}
 
 
-@case("pricing.rules_context_service_tiers_and_per_image_billing",
-      "rule context/service tiers resolve exactly, and a native chat can bill per_image while an out-of-range image count is denied before upstream")
-def rules_and_per_image(ctx):
+@case("pricing.rules_tiers_preview_and_actual_model_billing",
+      "rule context/service tiers resolve exactly in preview and a matching rule prices the actual usage model")
+def rules_and_tiers(ctx):
     rule = {"id": "tier-rule", "match_kind": "exact", "pattern": "synthetic-chat", "priority": 9, "enabled": True,
             "price": {"model": "synthetic-chat", "rates": {"input": 2_000_000, "output": 6_000_000,
                                                            "cache_read": 0, "cache_write": 0},
@@ -127,34 +134,87 @@ def rules_and_per_image(ctx):
     check_eq(priority["rates"]["input"], 9_000_000, "service tier rate applies for the named service")
     check_eq(priority["service_tier"], "priority", "preview echoes the service tier")
 
-    # A per-image price bills a native chat by the requested image count.
+    # The same rule prices a real execution by its actual usage model: the base
+    # rate (the 1K context tier is not reached) gives 10 x 2 + 4 x 6 = 44.
+    item, key = ctx.new_key(label="pricing-rule-live")
+    check_eq(ctx.client.chat(key, "synthetic-chat").status, 200, "rule-priced request accepted")
+    report, request = _settled_row(ctx, item["id"])
+    check(request is not None, "rule-priced request settled")
+    check_eq(request["executions"][0]["cost_micro_usd"], 44,
+             "the rule prices the actual usage through its base rates")
+    check_eq(report["summary"]["unpriced_executions"], 0, "the execution is priced by the rule")
+    check_no_ledger_fields(request, "rule-priced request")
+    return {"base_input": below["rates"]["input"], "context_input": above["rates"]["input"],
+            "service_input": priority["rates"]["input"],
+            "live_cost": request["executions"][0]["cost_micro_usd"]}
+
+
+@case("pricing.per_image_has_no_actual_count_and_stays_unpriced",
+      "a per-image price never bills the requested n: SDK usage carries no image count, so the cost is null")
+def per_image_unpriced(ctx):
     check_eq(ctx.manager.put_price({"model": "synthetic-free", "rates": _zero_rates(),
                                     "billing_mode": "per_image", "per_image_micro_usd": 50_000,
                                     "version": 0}).status, 200, "per-image price saved")
     item, key = ctx.new_key(label="pricing-image")
-    check_eq(ctx.client.post("/v1/chat/completions",
-                             {"model": "synthetic-free", "messages": [{"role": "user", "content": "synthetic"}], "n": 3},
-                             {"Authorization": f"Bearer {key}"}).status, 200, "per-image request accepted")
+    response = ctx.client.post("/v1/chat/completions",
+                               {"model": "synthetic-free",
+                                "messages": [{"role": "user", "content": "synthetic"}], "n": 3},
+                               {"Authorization": f"Bearer {key}"})
+    check_eq(response.status, 200, "a per-image request is admitted and executed")
     check_eq(ctx.mock.count("/chat/completions"), 1, "per-image request reached upstream once")
-    request = ctx.wait_until(lambda: (r := ctx.find_request(key_id=item["id"])) and (r if r["state"] == "settled" else None), timeout=15)
+
+    report, request = _settled_row(ctx, item["id"])
     check(request is not None, "per-image request settled")
-    check_eq(request["executions"][0]["cost_micro_usd"], 150_000, "3 images bill at 3 x the flat rate")
-    check_eq(_key_spent(ctx, item["id"]), 150_000, "key ledger matches the per-image charge")
-
-    # Declared image counts are refused for a per-image price before any
-    # upstream call: 100 images is outside the supported 1..32 range.
-    upstream_before = ctx.mock.count("/chat/completions")
-    denied = ctx.client.post("/v1/chat/completions",
-                             {"model": "synthetic-free", "messages": [{"role": "user", "content": "synthetic"}], "n": 100},
-                             {"Authorization": f"Bearer {key}"})
-    check(400 <= denied.status < 500, f"an out-of-range image count is a client error: {denied.status}")
-    check_eq(ctx.mock.count("/chat/completions"), upstream_before, "the denied request never reaches upstream")
-    report = ctx.usage_rows(key_id=item["id"], page_size=50)
-    check_eq(report["summary"]["requests"], 1, "the denied request is never admitted as a ledger row")
-    return {"base_input": below["rates"]["input"], "context_input": above["rates"]["input"],
-            "service_input": priority["rates"]["input"], "per_image_cost": request["executions"][0]["cost_micro_usd"],
-            "denied": denied.status}
+    execution = request["executions"][0]
+    check_eq(execution["quality"], "complete", "token usage is complete without an image count")
+    check_none(execution["cost_micro_usd"],
+               "the requested n is never treated as an actual image count")
+    check_eq(report["summary"]["unpriced_executions"], 1, "the per-image execution is unpriced")
+    check_eq(report["summary"]["cost_micro_usd"], 0, "no per-image charge is invented")
+    check("image_count" not in request, "the request carries no image count fact")
+    check_eq(ctx.mock.count("/chat/completions"), 1, "querying the report executes nothing")
+    return {"status": response.status, "requested_n": 3,
+            "cost_micro_usd": execution["cost_micro_usd"],
+            "unpriced": report["summary"]["unpriced_executions"]}
 
 
-def _key_spent(ctx, key_id):
-    return next((row["spent_micro_usd"] for row in ctx.manager.keys().json()["items"] if row["id"] == key_id), None)
+@case("pricing.disabled_rule_never_blocks_execution",
+      "a disabled matching rule is ignored for pricing and never acts as a model permission denial")
+def disabled_rule(ctx):
+    ctx.set_price("synthetic-chat")
+    disabled = {"id": "disabled-price", "match_kind": "exact", "pattern": "synthetic-chat",
+                "priority": 9, "enabled": False,
+                "price": {"model": "synthetic-chat",
+                          "rates": {"input": 3_000_000, "output": 3_000_000,
+                                    "cache_read": 0, "cache_write": 0}}}
+    check_eq(ctx.manager.put_pricing_rule(disabled).status, 200, "disabled rule saved")
+
+    preview = ctx.manager.price_preview(model="synthetic-chat").json()
+    check_eq(preview["rates"]["input"], 1_000_000,
+             "a disabled rule does not participate in pricing")
+
+    item, key = ctx.new_key(label="pricing-disabled-rule")
+    check_eq(ctx.client.chat(key, "synthetic-chat").status, 200,
+             "the model is not denied by a disabled rule")
+    report, request = _settled_row(ctx, item["id"])
+    check(request is not None, "the request settled")
+    check_eq(request["executions"][0]["cost_micro_usd"], 14,
+             "the enabled price book entry prices the execution")
+
+    # A model covered only by a disabled rule stays executable and unpriced.
+    disabled_other = {"id": "disabled-other", "match_kind": "exact", "pattern": "synthetic-free",
+                      "priority": 9, "enabled": False,
+                      "price": {"model": "synthetic-free",
+                                "rates": {"input": 5_000_000, "output": 5_000_000,
+                                          "cache_read": 0, "cache_write": 0}}}
+    check_eq(ctx.manager.put_pricing_rule(disabled_other).status, 200, "second disabled rule saved")
+    other_item, other_key = ctx.new_key(label="pricing-disabled-unpriced")
+    check_eq(ctx.client.chat(other_key, "synthetic-free").status, 200,
+             "a disabled rule is not a permission blacklist")
+    other_report, other_request = _settled_row(ctx, other_item["id"])
+    check(other_request is not None, "the unpriced request settled")
+    check_none(other_request["executions"][0]["cost_micro_usd"],
+               "a disabled rule contributes no price")
+    check_eq(other_report["summary"]["unpriced_executions"], 1, "the execution is unpriced")
+    return {"status": 200, "priced_cost": request["executions"][0]["cost_micro_usd"],
+            "unpriced_cost": other_request["executions"][0]["cost_micro_usd"]}

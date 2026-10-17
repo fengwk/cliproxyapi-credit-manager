@@ -47,10 +47,8 @@ def _items(ctx, key_id):
     return ctx.usage_rows(key_id=key_id).get("items") or []
 
 
-def _spent(ctx, key_id):
-    items = ctx.manager.keys().json()["items"]
-    row = next((k for k in items if k["id"] == key_id), None)
-    return row["spent_micro_usd"] if row else None
+def _cost(ctx, key_id):
+    return ctx.usage_rows(key_id=key_id, page_size=100)["summary"]["cost_micro_usd"]
 
 
 def _collect(ctx, key_id, count):
@@ -70,9 +68,10 @@ def _assert_single_credential(ctx, key_id, auth_ids, costs, mock_calls, label):
     check_eq(len(upstream), 1, f"{label}: all requests used one upstream key: {sorted(upstream)}")
     check(upstream <= set(ctx.openai_upstream_keys),
           f"{label}: upstream key is a synthetic credential: {sorted(upstream)}")
-    check_eq(sum(cost for cost in costs if cost), EXPECTED_COST,
-             f"{label}: three requests cost {EXPECTED_COST} in total: {costs}")
-    check_eq(_spent(ctx, key_id), EXPECTED_COST, f"{label}: the client key was charged {EXPECTED_COST}")
+    check_eq(sum(cost for cost in costs if cost is not None), EXPECTED_COST,
+             f"{label}: three requests derive {EXPECTED_COST} in total: {costs}")
+    check_eq(_cost(ctx, key_id), EXPECTED_COST,
+             f"{label}: the report derives exactly {EXPECTED_COST}")
 
 
 def _post(ctx, key, messages, extra_headers=None):
@@ -107,7 +106,7 @@ def explicit_session_header(ctx):
     _assert_single_credential(ctx, item["id"], auth_ids, costs, calls, "explicit session header")
     return {"session_header": SESSION_HEADER, "session_id": SESSION_ID,
             "auth_ids": auth_ids, "upstream_keys": sorted({c["upstream_key"] for c in calls}),
-            "requests": len(auth_ids), "costs": costs, "key_spent": _spent(ctx, item["id"])}
+            "requests": len(auth_ids), "costs": costs, "cost": _cost(ctx, item["id"])}
 
 
 @case("affinity.lcp_conversation_growth_binds_credential",
@@ -137,7 +136,7 @@ def lcp_conversation_growth(ctx):
     _assert_single_credential(ctx, item["id"], auth_ids, costs, calls, "lcp conversation growth")
     return {"message_counts": [len(m) for m in (first, second, third)],
             "auth_ids": auth_ids, "upstream_keys": sorted({c["upstream_key"] for c in calls}),
-            "requests": len(auth_ids), "costs": costs, "key_spent": _spent(ctx, item["id"])}
+            "requests": len(auth_ids), "costs": costs, "cost": _cost(ctx, item["id"])}
 
 
 IDENTITY_SESSION_ID = "synthetic-affinity-identity"
@@ -201,7 +200,7 @@ def identity_change_keeps_binding(ctx):
     check_eq(after_auth, bound_auth, f"the session credential is unchanged across the identity change: {after_auth}")
     check_eq(upstream_after, bound_upstream,
              f"the session upstream credential is unchanged: {sorted(upstream_after)}")
-    check_eq(sum(ex.get("cost_micro_usd") or 0 for ex in executions), 56, "four requests cost 56 microUSD")
-    check_eq(_spent(ctx, key_id), 56, "the rotated key retains the same ledger identity")
+    check_eq(sum(ex.get("cost_micro_usd") or 0 for ex in executions), 56, "four requests derive 56 microUSD")
+    check_eq(_cost(ctx, key_id), 56, "the rotated key keeps the same derived history total")
     return {"bound_auth": sorted(bound_auth), "upstream": sorted(upstream_after), "requests": len(executions),
-            "spent": _spent(ctx, key_id)}
+            "cost": _cost(ctx, key_id)}

@@ -1,18 +1,21 @@
 """Caller attribution and key lifecycle.
 
 Covers the aligned caller metadata contract and the key operations that must
-never rewrite history: reveal, rotate and soft delete all keep the ledger, the
-usage history and an unresolved request intact, while admission is governed by
-the key itself -- disabling a caller's attribution metadata must not disable its
-key.
+never rewrite history: reveal, rotate and soft delete all keep the usage log,
+the derived costs and an unresolved request intact, while admission is governed
+by the key itself -- disabling a caller's attribution metadata must not disable
+its key. Manual money resolution no longer exists, so an unresolved request
+stays pending instead of being settled by an operator.
 """
 
 from __future__ import annotations
 
 from ..mock import Script
-from ..report import check, check_eq, check_no_holds
+from ..report import check, check_eq, check_no_holds, check_no_ledger_fields
 
 CASES = []
+
+COST = 14
 
 
 def case(name, expects):
@@ -25,10 +28,6 @@ def case(name, expects):
 def _key(ctx, key_id):
     items = ctx.manager.keys().json()["items"]
     return next((row for row in items if row["id"] == key_id), None)
-
-
-def _settled(ctx, key_id, spent):
-    return ctx.wait_until(lambda: (row := _key(ctx, key_id)) and (row if row["spent_micro_usd"] == spent else None), timeout=15)
 
 
 def _chat(ctx, key, model="synthetic-chat"):
@@ -61,6 +60,7 @@ def caller_metadata(ctx):
     check(len(scope) == 64 and all(c in "0123456789abcdef" for c in scope), f"scope is 64-hex: {scope!r}")
     check(fingerprint and len(fingerprint) == 16, f"fingerprint is a short hex id: {fingerprint!r}")
     check("key" not in item["spec"], "create response never echoes stored material inside item.spec")
+    check_no_ledger_fields(item, "created key")
 
     # The identity is derived server-side and must be stable across reads.
     row = _key(ctx, item["id"])
@@ -71,25 +71,29 @@ def caller_metadata(ctx):
 
     ctx.set_price("synthetic-chat")
     check_eq(_chat(ctx, key).status, 200, "attributed key bills normally")
-    check(_settled(ctx, item["id"], 14) is not None, "first request settled at 14")
+    first = ctx.wait_report(item["id"], settled=1)
+    check_eq(first["summary"]["cost_micro_usd"], COST, "first request derives its cost")
 
     # Disabling the caller is pure metadata: the key keeps authenticating.
     updated = ctx.manager.update_caller({"id": "caller-meta", "display_name": "Synthetic Team", "enabled": False})
     check_eq(updated.status, 200, f"caller update {updated.text[:120]}")
     check_eq(updated.json()["item"]["enabled"], False, "caller metadata disabled")
     check_eq(_chat(ctx, key).status, 200, "disabling the caller does not disable its key")
-    check(_settled(ctx, item["id"], 28) is not None, "key keeps billing after caller disable")
-    return {"principal": principal, "scope": scope, "spent": _key(ctx, item["id"])["spent_micro_usd"]}
+    second = ctx.wait_report(item["id"], settled=2)
+    check_eq(second["summary"]["cost_micro_usd"], COST * 2, "the key keeps deriving cost")
+    check_no_ledger_fields(_key(ctx, item["id"]), "key row")
+    return {"principal": principal, "scope": scope,
+            "cost": second["summary"]["cost_micro_usd"]}
 
 
 @case("keyops.reveal_rotate_delete_preserve_history_and_pending",
-      "reveal/rotate/soft-delete keep the ledger, the request history and an unresolved request, and the pending request still settles")
+      "reveal/rotate/soft-delete keep the usage history, derived costs and an unresolved request")
 def reveal_rotate_delete(ctx):
     item, key = _create_key(ctx, label="keyops-lifecycle")
     key_id = item["id"]
     ctx.set_price("synthetic-chat")
     check_eq(_chat(ctx, key).status, 200, "settled request accepted")
-    check(_settled(ctx, key_id, 14) is not None, "ledger reaches 14")
+    check(ctx.wait_report(key_id, settled=1) is not None, "first request settles")
 
     revealed = ctx.manager.reveal(key_id)
     check_eq(revealed.status, 200, f"reveal {revealed.text[:120]}")
@@ -102,7 +106,7 @@ def reveal_rotate_delete(ctx):
     check_eq(rotated.json()["item"]["id"], key_id, "rotation keeps the key id")
     check_eq(_chat(ctx, key).status, 401, "the retired plaintext is denied")
     check_eq(_chat(ctx, new_key).status, 200, "the rotated plaintext is accepted")
-    check(_settled(ctx, key_id, 28) is not None, "rotation preserves the ledger")
+    check(ctx.wait_report(key_id, settled=2) is not None, "rotation preserves the history")
 
     # Open an unresolved request: it must survive every later key operation.
     ctx.mock.default_script = Script(omit_usage=True)
@@ -120,29 +124,25 @@ def reveal_rotate_delete(ctx):
     check(row is not None, "a soft-deleted key still appears in the list")
     check(row.get("deleted_at"), "soft delete stamps deleted_at")
     check_eq(row["spec"]["enabled"], False, "soft delete disables the key")
-    check_eq(row["spent_micro_usd"], 28, "soft delete keeps the ledger")
+    check_no_ledger_fields(row, "soft-deleted key row")
     check_no_holds(row, "soft-deleted key row")
     check_eq(_chat(ctx, new_key).status, 401, "a soft-deleted key is denied")
     check_eq(ctx.manager.reveal(key_id).status, 409, "a soft-deleted key cannot be revealed")
     after = ctx.manager.delete_key(key_id, "synthetic decommission")
     check_eq(after.status, 200, "repeated delete is an idempotent no-op")
 
-    report = ctx.usage_rows(key_id=key_id, page_size=50)
-    check_eq(report["summary"]["cost_micro_usd"], 28, "history keeps its settled cost")
+    report = ctx.usage_rows(key_id=key_id, page_size=100)
+    check_eq(report["summary"]["cost_micro_usd"], COST * 2, "history keeps its derived cost")
+    check_eq(report["summary"]["requests"], 3, "history keeps all admitted requests")
     check(report["summary"]["pending"] >= 1, "history keeps the pending request")
     pending_after = next((r for r in report["items"] if r["id"] == pending["id"]), None)
     check(pending_after is not None, "the pending request row survives soft delete")
     check(pending_after["state"] != "settled", "soft delete never writes off a pending request")
     check_no_holds(pending_after, "pending request after soft delete")
-
-    # The retained pending request can still be resolved after the key is gone.
-    resolved = ctx.manager.resolve(pending["id"], "release", reason="retained pending settles")
-    check_eq(resolved.status, 200, f"resolve retained pending {resolved.text[:120]}")
-    settled = ctx.wait_until(lambda: _request(ctx, key_id, pending["id"]), timeout=15)
-    check(settled is not None and settled["state"] == "settled", f"retained pending settles: {settled and settled['state']}")
-    check_eq(_key(ctx, key_id)["spent_micro_usd"], 28, "release does not invent a charge")
+    check_no_ledger_fields(pending_after, "pending request after soft delete")
     return {"revealed": revealed.status, "rotated": rotated.status, "deleted": deleted.status,
-            "final_spent": _key(ctx, key_id)["spent_micro_usd"]}
+            "cost": report["summary"]["cost_micro_usd"],
+            "pending": report["summary"]["pending"]}
 
 
 def _pending_request(ctx, key_id):
@@ -150,8 +150,3 @@ def _pending_request(ctx, key_id):
     if request and request["state"] != "settled":
         return request
     return None
-
-
-def _request(ctx, key_id, request_id):
-    report = ctx.usage_rows(key_id=key_id, page_size=50)
-    return next((r for r in report["items"] if r["id"] == request_id), None)

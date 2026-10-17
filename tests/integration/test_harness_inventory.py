@@ -1,8 +1,8 @@
 """Harness contract tests that need neither the plugin library nor a host.
 
 They keep the case inventory, the retired-field boundary and the runner's module
-list honest, so a renamed module or a reintroduced estimate/hold field is caught
-by `make static` instead of silently shrinking coverage.
+list honest, so a renamed module or a reintroduced estimate/hold/ledger field is
+caught by `make static` instead of silently shrinking coverage.
 """
 
 import ast
@@ -12,7 +12,9 @@ from pathlib import Path
 
 import run_acceptance
 from acceptance.cases import passive
-from acceptance.report import RETIRED_HOLD_FIELDS, CaseFailure, check_no_holds
+from acceptance.report import (RETIRED_HOLD_FIELDS, RETIRED_LEDGER_FIELDS,
+                               RETIRED_MONEY_FIELDS, CaseFailure, check_no_holds,
+                               check_no_ledger_fields)
 
 CASES_DIR = Path(__file__).resolve().parent / "acceptance" / "cases"
 
@@ -38,15 +40,37 @@ class HarnessInventoryTests(unittest.TestCase):
         # Reading `payload["held_micro_usd"]` (or an estimate) is how the obsolete
         # reservation architecture was asserted; only `check_no_holds` may name
         # those fields, and only to prove their absence.
+        offenders = self._scan_case_files(RETIRED_HOLD_FIELDS, allow_checks=("check_no_holds",))
+        self.assertEqual(offenders, [], f"retired hold/estimate fields are still asserted: {offenders}")
+
+    def test_case_files_never_read_a_retired_money_field(self):
+        # The query-time pricing rewrite removed key ledgers and manual
+        # adjustments. A case that reads one of these fields would mean the old
+        # money bookkeeping silently returned.
+        offenders = self._scan_case_files(RETIRED_MONEY_FIELDS, allow_checks=("check_no_ledger_fields",))
+        self.assertEqual(offenders, [], f"retired money fields are still asserted: {offenders}")
+
+    def test_case_files_never_read_a_frozen_request_price(self):
+        offenders = self._scan_case_files(("price_tiers", "pricing_rule_id"),
+                                          allow_checks=("check_no_ledger_fields",))
+        self.assertEqual(offenders, [], f"frozen pricing request fields are still asserted: {offenders}")
+
+    def _scan_case_files(self, fields, allow_checks):
         offenders = []
+        pattern = re.compile(r"""\[\s*["']([a-z_]+)["']\s*\]|\.get\(\s*["']([a-z_]+)["']""")
+        allowed = set(allow_checks)
         for path in sorted(CASES_DIR.glob("*.py")):
             source = path.read_text(encoding="utf-8")
-            for field in RETIRED_HOLD_FIELDS:
-                patterns = (re.compile(rf"""\[\s*["']{field}["']\s*\]"""),
-                            re.compile(rf"""\.get\(\s*["']{field}["']"""))
-                if any(pattern.search(source) for pattern in patterns):
-                    offenders.append(f"{path.name}: {field}")
-        self.assertEqual(offenders, [], f"retired hold/estimate fields are still asserted: {offenders}")
+            for match in pattern.finditer(source):
+                field = match.group(1) or match.group(2)
+                if field not in fields:
+                    continue
+                line = source.count("\n", 0, match.start()) + 1
+                line_text = source.splitlines()[line - 1]
+                if any(check in line_text for check in allowed):
+                    continue
+                offenders.append(f"{path.name}:{line}: {field}")
+        return offenders
 
     def test_retired_settings_are_pinned_for_rejection(self):
         # The passive boundary must keep testing the two removed settings as
@@ -68,9 +92,32 @@ class NoHoldBoundaryTests(unittest.TestCase):
                     check_no_holds({"id": "x", field: 0}, "synthetic request")
 
     def test_check_no_holds_accepts_a_clean_payload(self):
-        # A clean key/request carries only actual-used fields; the absence check
-        # must not be a blanket field-name ban.
-        check_no_holds({"id": "x", "spent_micro_usd": 14, "quota_used_micro_usd": 14}, "synthetic key")
+        # A clean key/request carries only current fields; the absence check must
+        # not be a blanket field-name ban.
+        check_no_holds({"id": "x", "state": "settled", "spec": {"quota_micro_usd": 14}},
+                       "synthetic key")
+
+    def test_check_no_ledger_fields_rejects_every_retired_money_field(self):
+        for field in RETIRED_MONEY_FIELDS:
+            with self.subTest(field=field):
+                with self.assertRaises(CaseFailure):
+                    check_no_ledger_fields({"id": "x", field: 14}, "synthetic key")
+
+    def test_check_no_ledger_fields_rejects_a_frozen_request_price(self):
+        for field in ("price", "price_tiers", "pricing_rule_id", "image_count"):
+            with self.subTest(field=field):
+                with self.assertRaises(CaseFailure):
+                    check_no_ledger_fields({"id": "x", field: 0}, "synthetic request")
+
+    def test_check_no_ledger_fields_accepts_current_key_and_request(self):
+        # A key keeps its four display budgets, and a request keeps service_tier;
+        # neither is a money ledger.
+        check_no_ledger_fields(
+            {"id": "x",
+             "spec": {"quota_micro_usd": 1, "daily_micro_usd": 1,
+                      "weekly_micro_usd": 1, "monthly_micro_usd": 1},
+             "service_tier": "priority"},
+            "synthetic key/request")
 
     def test_case_modules_parse(self):
         # Cheap guard: every case module must still be syntactically valid Python
