@@ -220,7 +220,7 @@ func TestUsageBeforeCompletionIsChargedOnce(t *testing.T) {
 	if got := h.key(key.ID); got.SpentMicroUSD != 300 {
 		t.Fatalf("after replay spent = %d, want 300", got.SpentMicroUSD)
 	}
-	// Cost exceeding the hold is still charged in full.
+	// A late execution is still charged in full after request completion.
 	extra := usageFor("u2", req, "m1", tokens(0, 0, 0, 1000, 0))
 	extra.Provider = "openai"
 	h.mustUsage(extra)
@@ -405,7 +405,7 @@ func TestCompletionOutcomes(t *testing.T) {
 		t.Fatalf("failed-zero-unknown state = %q, want pending", got)
 	}
 	// An unaccounted execution contradicts a rejection claim, so the request
-	// stays open for reconciliation instead of writing the hold off.
+	// stays open for reconciliation instead of silently discarding unknown cost.
 	rejectedUnknown := reserve("r-unknown")
 	ru := usageFor("uru", rejectedUnknown, "m1", Tokens{})
 	ru.Quality = QualityUnknown
@@ -891,10 +891,6 @@ func TestZeroRatePriceStillRequiresUsage(t *testing.T) {
 	}
 }
 
-// TestPeriodLimitsCountUnresolvedHolds proves that a hold which is already
-// admitted in the current period blocks further admissions, so two concurrent
-// requests cannot jointly exceed a daily/weekly/monthly monetary limit while
-// neither has been charged yet.
 // TestPeriodLimitsGateOnActualUsage proves that a period money limit is a soft
 // admission gate on already-charged usage: a fresh window admits, and once the
 // window's actual usage has reached the limit the next admission is refused.
@@ -933,9 +929,6 @@ func TestPeriodLimitsGateOnActualUsage(t *testing.T) {
 	}
 }
 
-// TestPeriodLimitsIgnoreHoldsFromOtherPeriods keeps the same-period rule from
-// overcorrecting: work admitted in an earlier period keeps its hold, but it
-// does not occupy the next period's monetary window.
 // TestPeriodLimitsUseTheirOwnWindow keeps windows independent: usage charged in
 // January must not occupy February's monthly window.
 func TestPeriodLimitsUseTheirOwnWindow(t *testing.T) {
@@ -964,9 +957,6 @@ func TestPeriodLimitsUseTheirOwnWindow(t *testing.T) {
 	}
 }
 
-// TestTokenEstimatesArePeriodScoped makes sure an unresolved request only
-// consumes the token window it was admitted in, while the lifetime window keeps
-// counting it.
 // TestTokenLimitsUseTheirOwnWindow proves token limits gate on actual token
 // usage per window: a reached window denies, the next window admits, and the
 // lifetime limit keeps counting usage from every period.

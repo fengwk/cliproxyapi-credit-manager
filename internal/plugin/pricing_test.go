@@ -188,7 +188,7 @@ func TestUsageServiceTierSelectionOrderAndPersistence(t *testing.T) {
 
 // TestUsageReportedDefaultTierDoesNotInheritFrozen pins the host wiring of the
 // reported-tier presence rule: an upstream that reports the default tier must
-// bill base rates even though the request reserved a priority tier.
+// bill base rates even though the request's frozen tier is priority.
 func TestUsageReportedDefaultTierDoesNotInheritFrozen(t *testing.T) {
 	h := newHarness(t)
 	store := h.store()
@@ -200,7 +200,7 @@ func TestUsageReportedDefaultTierDoesNotInheritFrozen(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("PutPricingRule: %v", err)
 	}
-	// The request reserves priority, so priority is frozen on the snapshot.
+	// The request declares priority, so priority is frozen on the snapshot.
 	if resp := h.interceptBody("req-1", "trace-1", `{"model":"test-model","tier":"priority"}`); resp.Terminate {
 		t.Fatalf("intercept: %+v", resp)
 	}
