@@ -69,7 +69,6 @@ type lookupKey struct {
 	DailyUsedMicroUSD   int64                    `json:"daily_used_micro_usd"`
 	WeeklyUsedMicroUSD  int64                    `json:"weekly_used_micro_usd"`
 	MonthlyUsedMicroUSD int64                    `json:"monthly_used_micro_usd"`
-	HeldMicroUSD        int64                    `json:"held_micro_usd"`
 	CreatedAt           time.Time                `json:"created_at"`
 }
 
@@ -103,7 +102,6 @@ type lookupRequest struct {
 	State              string             `json:"state"`
 	StartedAt          time.Time          `json:"started_at"`
 	CompletedAt        *time.Time         `json:"completed_at,omitempty"`
-	HeldMicroUSD       int64              `json:"held_micro_usd"`
 	AdjustmentMicroUSD int64              `json:"adjustment_micro_usd"`
 	Price              credit.Price       `json:"price"`
 	Executions         []lookupExecution  `json:"executions"`
@@ -277,7 +275,6 @@ func sanitizeLookupKey(key credit.Key) lookupKey {
 		DailyUsedMicroUSD:   key.DailyUsedMicroUSD,
 		WeeklyUsedMicroUSD:  key.WeeklyUsedMicroUSD,
 		MonthlyUsedMicroUSD: key.MonthlyUsedMicroUSD,
-		HeldMicroUSD:        key.HeldMicroUSD,
 		CreatedAt:           key.CreatedAt,
 	}
 }
@@ -310,7 +307,6 @@ func sanitizeLookupRequest(item credit.Request) lookupRequest {
 		State:              item.State,
 		StartedAt:          item.StartedAt,
 		CompletedAt:        item.CompletedAt,
-		HeldMicroUSD:       item.HeldMicroUSD,
 		AdjustmentMicroUSD: item.AdjustmentMicroUSD,
 		Price:              item.Price,
 		Executions:         executions,

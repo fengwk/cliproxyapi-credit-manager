@@ -264,13 +264,13 @@ func createTestKey(t *testing.T, db credit.Backend, material string, spec credit
 	return key
 }
 
-// seedRequest reserves and settles one request for the given key so the report
+// seedRequest admits and settles one request for the given key so the report
 // has an item to serve, and returns its id.
 func seedRequest(t *testing.T, db credit.Backend, key credit.Key, id, trace string) {
 	t.Helper()
 	ctx := context.Background()
-	if _, err := db.Reserve(ctx, credit.ReserveInput{ID: id, TraceID: trace, KeyID: key.ID, RequestedModel: "m1"}); err != nil {
-		t.Fatalf("Reserve(%s): %v", id, err)
+	if _, err := db.Admit(ctx, credit.AdmitInput{ID: id, TraceID: trace, KeyID: key.ID, RequestedModel: "m1"}); err != nil {
+		t.Fatalf("Admit(%s): %v", id, err)
 	}
 	if err := db.RecordUsage(ctx, credit.Usage{
 		ID: "exec-" + id, RequestID: id, TraceID: trace, KeyID: key.ID,
@@ -379,6 +379,7 @@ func TestLookupDataIsConfinedAndSanitized(t *testing.T) {
 		"principal", "fingerprint", "scope", "hmac",
 		"auth_id", "auth_index", "executor", `"raw"`,
 		"synthetic-alpha-key", alpha.Principal, alpha.Fingerprint,
+		"held_micro_usd",
 	} {
 		if strings.Contains(body, leaked) {
 			t.Errorf("public report leaked %q: %s", leaked, body)

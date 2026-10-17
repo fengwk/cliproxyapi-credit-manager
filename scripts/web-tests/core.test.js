@@ -353,11 +353,11 @@ test('结果/状态/质量标签与语气与契约枚举一致', () => {
 });
 
 test('只有 pending 状态的请求才提供人工 Resolve 入口', () => {
-  // 后端 Resolve 只接受 state=pending：active 仍在执行并占用并发与持有金额，必须拒绝处理入口。
+  // 后端 Resolve 只接受 state=pending：active 仍在执行并占用并发槽位，必须拒绝处理入口。
   assert.equal(CM.isPendingRequest({ state: 'pending', executions: [] }), true);
   assert.equal(CM.isPendingRequest({ state: 'PENDING' }), true);
   assert.equal(CM.isPendingRequest({ state: 'active', executions: [] }), false);
-  assert.equal(CM.isPendingRequest({ state: 'active', held_micro_usd: 1000000 }), false);
+  assert.equal(CM.isPendingRequest({ state: 'active' }), false);
   assert.equal(CM.isPendingRequest({ state: 'settled', executions: [] }), false);
   assert.equal(CM.isPendingRequest({ executions: [] }), false, '状态缺失时不得猜测为可处理');
   assert.equal(CM.isPendingRequest(null), false);

@@ -446,6 +446,10 @@ async function main() {
       '进行中的请求不显示人工处理入口',
       await cdp.evaluate("(() => { const cards = [...document.querySelectorAll('#usage-items .card')]; const active = cards.find((c) => c.innerText.includes('req-007')); return !!active && ![...active.querySelectorAll('button')].some((b) => b.textContent.trim() === '处理待定'); })()")
     );
+    check(
+      '请求卡片在可见 DOM 中不含持有金额',
+      await cdp.evaluate("![...document.querySelectorAll('#usage-items .request-totals span')].some((s) => s.textContent.includes('持有'))")
+    );
     check('请求卡片展示人工补记而不是隐藏', itemsText.includes('人工补记（adjustment_micro_usd）') && itemsText.includes('人工补记 2.5 USD'), itemsText.replace(/\n/g, ' ').slice(0, 240));
     check('执行行区分质量状态', itemsText.includes('完整') && itemsText.includes('部分') && itemsText.includes('未知'), itemsText.slice(0, 200));
     check('结果与状态按契约枚举显示为中文', itemsText.includes('成功') && itemsText.includes('失败') && itemsText.includes('拒绝') && itemsText.includes('已结算') && itemsText.includes('待定'), itemsText.slice(0, 200));
@@ -575,6 +579,14 @@ async function main() {
     await cdp.clickText('#usage-items .card:nth-child(3) button', '处理待定');
     await cdp.waitFor("document.querySelector('.modal #resolve-action')", 10000, '财务弹窗');
     check('财务弹窗警示不可撤销', (await cdp.text('.modal')).includes('财务操作'));
+    check(
+      '财务处理弹窗可见 DOM 中不含持有金额',
+      await cdp.evaluate("![...document.querySelectorAll('.modal .kv-k')].some((k) => k.textContent.includes('持有'))")
+    );
+    check(
+      '财务处理弹窗选项中不含归还持有金额',
+      await cdp.evaluate("![...document.querySelectorAll('.modal select option')].some((o) => o.textContent.includes('持有'))")
+    );
     await cdp.clickText('.modal button', '提交处理');
     check('缺少理由与确认时拒绝提交', (await cdp.text('.modal .inline-error')).includes('理由'));
     await cdp.evaluate("document.querySelector('.modal #resolve-action').value='charge'");
@@ -598,6 +610,16 @@ async function main() {
     const keysText = await cdp.text('#keys-list');
     check('Key 列表展示标签/指纹/额度/并发', keysText.includes('生产主力') && keysText.includes('fp-abcd1234') && keysText.includes('并发'));
     check('禁用状态与不限额度如实显示', keysText.includes('已禁用') && keysText.includes('总额度不限'));
+    check(
+      'Key 列表在可见 DOM 中不含持有金额',
+      await cdp.evaluate("![...document.querySelectorAll('#keys-list tbody tr')].some((r) => r.textContent.includes('持有'))")
+    );
+    const keysNumText = await cdp.evaluate("document.querySelector('#keys-list tbody tr:first-child td.num')?.innerText || ''");
+    check(
+      'Key 列表在可见 DOM 中展示正向剩余额度进度',
+      keysNumText.includes('已用') && (await cdp.count('#keys-list .progress-fill')) > 0,
+      keysNumText
+    );
     check('允许模型与 token 限额可见', keysText.includes('opencode-go/glm-5') && keysText.includes('模型 token 限额'));
 
     await cdp.clickText('#panel-keys button', '新建 Key');

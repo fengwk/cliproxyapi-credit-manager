@@ -67,7 +67,7 @@ function alphaData() {
     "allowed_models":["m-alpha"],
     "model_token_limits":[{"model":"m-alpha","total":0,"daily":9007199254740993,"weekly":0,"monthly":1000000},
       {"model":"m-beta","total":2000000,"daily":0,"weekly":0,"monthly":0}],
-    "expires_at":"2026-12-31T00:00:00Z","spent_micro_usd":9007199254740993,"held_micro_usd":2500000,
+    "expires_at":"2026-12-31T00:00:00Z","spent_micro_usd":4503599627370496,
     "created_at":"2026-01-01T00:00:00Z"},
   "summary": {"requests":3,"executions":4,"failed":1,"pending":1,"cost_micro_usd":9007199254740993,
     "adjustment_micro_usd":2500000,
@@ -85,7 +85,7 @@ function alphaData() {
   ],
   "items": [
     {"id":"req-a1","trace_id":"trace-a1","model":"m-alpha","outcome":"succeeded","state":"settled",
-     "started_at":"2026-10-02T10:00:00Z","completed_at":"2026-10-02T10:00:01Z","held_micro_usd":0,
+     "started_at":"2026-10-02T10:00:00Z","completed_at":"2026-10-02T10:00:01Z",
      "adjustment_micro_usd":2500000,"price":{"model":"m-alpha","rates":{"input":1,"output":1,"cache_read":0,"cache_write":0}},
      "executions":[
        {"id":"exec-a1","model":"m-alpha","tokens":{"input":9007199254740993,"cache_read":0,"cache_write":0,"output":0,"reasoning":0,"total":9007199254740993},
@@ -94,7 +94,7 @@ function alphaData() {
         "quality":"complete","cost_micro_usd":1,"failed":false,"at":"2026-10-02T10:00:01Z"}
      ]},
     {"id":"req-a2","trace_id":"trace-a2","model":"m-alpha","outcome":"","state":"pending",
-     "started_at":"2026-10-02T11:00:00Z","held_micro_usd":2500000,"adjustment_micro_usd":0,
+     "started_at":"2026-10-02T11:00:00Z","adjustment_micro_usd":0,
      "price":{"model":"m-alpha","rates":{"input":1,"output":1,"cache_read":0,"cache_write":0}},
      "executions":[]}
   ],
@@ -106,7 +106,7 @@ function betaData() {
   return `{
   "key": {"id":"key-beta","label":"beta-key","enabled":true,"quota_micro_usd":0,"daily_micro_usd":0,
     "weekly_micro_usd":0,"monthly_micro_usd":0,"max_concurrent":0,"allowed_models":[],
-    "model_token_limits":[],"spent_micro_usd":7000000,"held_micro_usd":0,"created_at":"2026-02-01T00:00:00Z"},
+    "model_token_limits":[],"spent_micro_usd":7000000,"created_at":"2026-02-01T00:00:00Z"},
   "summary": {"requests":7,"executions":7,"failed":0,"pending":0,"cost_micro_usd":7000000,
     "adjustment_micro_usd":0,
     "tokens":{"input":70,"cache_read":0,"cache_write":0,"output":0,"reasoning":0,"total":70},
@@ -117,12 +117,12 @@ function betaData() {
     "complete_executions":7}],
   "items": [
     {"id":"req-b1","trace_id":"trace-b1","model":"m-beta","outcome":"succeeded","state":"settled",
-     "started_at":"2026-10-02T12:00:00Z","held_micro_usd":0,"adjustment_micro_usd":0,
+     "started_at":"2026-10-02T12:00:00Z","adjustment_micro_usd":0,
      "price":{"model":"m-beta","rates":{"input":1,"output":1,"cache_read":0,"cache_write":0}},
      "executions":[{"id":"exec-b1","model":"m-beta","tokens":{"input":7,"cache_read":0,"cache_write":0,"output":0,"reasoning":0,"total":7},
        "quality":"complete","cost_micro_usd":7000000,"failed":false,"at":"2026-10-02T12:00:00Z"}]},
     {"id":"req-a1","trace_id":"trace-foreign","model":"m-alpha","outcome":"succeeded","state":"settled",
-     "started_at":"2026-10-02T10:00:00Z","held_micro_usd":0,"adjustment_micro_usd":0,
+     "started_at":"2026-10-02T10:00:00Z","adjustment_micro_usd":0,
      "price":{"model":"m-alpha","rates":{"input":1,"output":1,"cache_read":0,"cache_write":0}},
      "executions":[]}
   ],
@@ -134,7 +134,7 @@ function emptyData() {
   return `{
   "key": {"id":"key-empty","label":"empty-key","enabled":true,"quota_micro_usd":0,"daily_micro_usd":0,
     "weekly_micro_usd":0,"monthly_micro_usd":0,"max_concurrent":0,"allowed_models":[],
-    "model_token_limits":[],"spent_micro_usd":0,"held_micro_usd":0,"created_at":"2026-03-01T00:00:00Z"},
+    "model_token_limits":[],"spent_micro_usd":0,"created_at":"2026-03-01T00:00:00Z"},
   "summary": {"requests":0,"executions":0,"failed":0,"pending":0,"cost_micro_usd":0,"adjustment_micro_usd":0,
     "tokens":{"input":0,"cache_read":0,"cache_write":0,"output":0,"reasoning":0,"total":0},"complete_executions":0},
   "trend": [], "items": [], "total": 0, "page": 1, "page_size": 10, "retention_from": "2026-07-01T00:00:00Z"
@@ -433,9 +433,19 @@ async function main() {
     check('密钥状态显示启用与到期', (await cdp.text('#key-state')).includes('已启用') && (await cdp.text('#key-state')).includes('到期'));
 
     const quotas = await cdp.text('#quotas');
-    for (const label of ['已用额度', '在途预占', '总额度', '日额度', '周额度', '月额度', '并发上限', '允许模型']) {
+    for (const label of ['已用额度', '总额度', '日额度', '周额度', '月额度', '并发上限', '允许模型']) {
       check(`额度卡片包含 ${label}`, quotas.includes(label), quotas.slice(0, 120));
     }
+    check('额度卡片已完全移除原有在途预占卡片', await cdp.evaluate("![...document.querySelectorAll('#quotas .card-label')].some((n) => n.textContent.includes('预占') || n.textContent.includes('持有'))"));
+    check('额度卡片文本中不含预占或持有', !quotas.includes('在途预占') && !quotas.includes('预占') && !quotas.includes('持有') && !quotas.includes('held_micro_usd'));
+    const expectedSpent = await cdp.evaluate("window.CMCharts.formatMoneyMicro('4503599627370496','USD',7.2)");
+    const expectedTotal = await cdp.evaluate("window.CMCharts.formatMoneyMicro('9007199254740993','USD',7.2)");
+    check('已用额度卡片精确渲染大整数实际用量', quotas.includes(expectedSpent), expectedSpent);
+    check('总额度卡片精确渲染软上限', quotas.includes(expectedTotal), expectedTotal);
+    check(
+      '已用额度小于总额度且无预占，保持正向剩余额度软准入语义',
+      await cdp.evaluate("(() => { const cards = [...document.querySelectorAll('#quotas .card')]; const spentCard = cards.find(c => c.querySelector('.card-label')?.textContent.includes('已用额度')); const totalCard = cards.find(c => c.querySelector('.card-label')?.textContent.includes('总额度')); return !!spentCard && !!totalCard && !cards.some(c => c.textContent.includes('预占')); })()")
+    );
     check('未设上限的额度显示不限', quotas.includes('不限'));
 
     // 关键回归：>2^53 的微美元必须精确，且与浮点解析的结果明显不同。
