@@ -3,9 +3,45 @@ package credit
 import (
 	"encoding/json"
 	"errors"
+	"reflect"
 	"testing"
 	"time"
 )
+
+// The initial admission and its idempotent replay must expose the same frozen
+// pricing metadata as later reads, including rule tiers and image counts.
+func TestAdmitReturnsCompleteFrozenSnapshot(t *testing.T) {
+	for _, mode := range []string{"token", billingPerImage} {
+		t.Run(mode, func(t *testing.T) {
+			h, key := billingHarness(t)
+			rule := PricingRule{
+				ID: "r", MatchKind: MatchExact, Pattern: "m1", Priority: 5, Enabled: true,
+				Price: Price{Rates: Rates{Input: million}},
+				Tiers: []PriceTier{{Kind: priceTierService, Service: "priority", Rates: Rates{Output: 9 * million}}},
+			}
+			if mode == billingPerImage {
+				rule.Price = Price{BillingMode: billingPerImage, PerImageMicroUSD: 50_000}
+				rule.Tiers = nil
+			}
+			h.mustRule(rule)
+			in := AdmitInput{
+				ID: "r1", TraceID: "t1", KeyID: key.ID, RequestedModel: "m1",
+				ServiceTier: "PRIORITY", ImageCount: 3, ImageCountDeclared: true,
+			}
+			first := h.mustAdmit(in)
+			replay := h.mustAdmit(in)
+			stored := h.request(first.ID)
+			if !reflect.DeepEqual(first, replay) || !reflect.DeepEqual(first, stored) {
+				t.Fatalf("snapshot metadata changed between admission and reads:\nfirst=%+v\nreplay=%+v\nstored=%+v",
+					first, replay, stored)
+			}
+			if first.PricingRuleID != rule.ID || first.ServiceTier != "priority" ||
+				len(first.PriceTiers) != len(rule.Tiers) || (mode == billingPerImage && first.ImageCount != 3) {
+				t.Fatalf("incomplete admission snapshot: %+v", first)
+			}
+		})
+	}
+}
 
 // mutateSnapshot rewrites the stored price snapshot of one request, modelling a
 // damaged or tampered ledger row that bypassed the validating writer.
@@ -41,12 +77,27 @@ func TestDamagedRequestSnapshotIsRefused(t *testing.T) {
 		payload string
 	}{
 		{"empty", ""},
+		{"null snapshot", "null"},
 		{"corrupt json", "{not json"},
 		{"missing price", `{"tiers":[],"service_tier":"priority"}`},
 		{"null price", `{"price":null}`},
 		{"missing model", `{"price":{"rates":{"input":1000000}}}`},
-		{"model mismatch", `{"price":{"model":"other","rates":{"input":1000000}}}`},
-		{"negative rate", `{"price":{"model":"m1","rates":{"input":-1}}}`},
+		{"missing rates", `{"price":{"model":"m1"}}`},
+		{"null rates", `{"price":{"model":"m1","rates":null}}`},
+		{"empty rates", `{"price":{"model":"m1","rates":{}}}`},
+		{"missing input", `{"price":{"model":"m1","rates":{"output":0,"cache_read":0,"cache_write":0}}}`},
+		{"null input", `{"price":{"model":"m1","rates":{"input":null,"output":0,"cache_read":0,"cache_write":0}}}`},
+		{"missing output", `{"price":{"model":"m1","rates":{"input":1000000,"cache_read":0,"cache_write":0}}}`},
+		{"null output", `{"price":{"model":"m1","rates":{"input":1000000,"output":null,"cache_read":0,"cache_write":0}}}`},
+		{"missing cache read", `{"price":{"model":"m1","rates":{"input":1000000,"output":0,"cache_write":0}}}`},
+		{"null cache read", `{"price":{"model":"m1","rates":{"input":1000000,"output":0,"cache_read":null,"cache_write":0}}}`},
+		{"missing cache write", `{"price":{"model":"m1","rates":{"input":1000000,"output":0,"cache_read":0}}}`},
+		{"null cache write", `{"price":{"model":"m1","rates":{"input":1000000,"output":0,"cache_read":0,"cache_write":null}}}`},
+		{"missing tier rates", `{"price":{"model":"m1","rates":{"input":1000000,"output":0,"cache_read":0,"cache_write":0}},"tiers":[{"kind":"service","service":"priority"}]}`},
+		{"null tier rates", `{"price":{"model":"m1","rates":{"input":1000000,"output":0,"cache_read":0,"cache_write":0}},"tiers":[{"kind":"service","service":"priority","rates":null}]}`},
+		{"incomplete tier rates", `{"price":{"model":"m1","rates":{"input":1000000,"output":0,"cache_read":0,"cache_write":0}},"tiers":[{"kind":"service","service":"priority","rates":{"input":0}}]}`},
+		{"model mismatch", `{"price":{"model":"other","rates":{"input":1000000,"output":0,"cache_read":0,"cache_write":0}}}`},
+		{"negative rate", `{"price":{"model":"m1","rates":{"input":-1,"output":0,"cache_read":0,"cache_write":0}}}`},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -71,6 +122,10 @@ func TestDamagedRequestSnapshotIsRefused(t *testing.T) {
 			}
 			if key = h.key(key.ID); key.SpentMicroUSD != 0 {
 				t.Fatalf("damaged snapshot booked %d microUSD", key.SpentMicroUSD)
+			}
+			var usages int
+			if err := h.store.db.QueryRow(`SELECT COUNT(*) FROM usages`).Scan(&usages); err != nil || usages != 0 {
+				t.Fatalf("damaged snapshot persisted %d usages, err=%v", usages, err)
 			}
 		})
 	}

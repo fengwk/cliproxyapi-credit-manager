@@ -45,6 +45,26 @@ func decodePriceSnapshot(raw, model string) (priceSnapshot, error) {
 	if err := json.Unmarshal([]byte(raw), &s); err != nil {
 		return s, fmt.Errorf("%w: decode price snapshot", ErrInvalid)
 	}
+	// The current writer includes all four rate fields on the base price and
+	// every tier, even when zero. Missing or null fields must not become free
+	// base rates or inherited tier rates on a damaged snapshot.
+	type storedRates struct {
+		Rates map[string]*int64 `json:"rates"`
+	}
+	var stored struct {
+		Price storedRates   `json:"price"`
+		Tiers []storedRates `json:"tiers"`
+	}
+	if err := json.Unmarshal([]byte(raw), &stored); err != nil {
+		return s, fmt.Errorf("%w: decode snapshot rate fields", ErrInvalid)
+	}
+	for i, card := range append([]storedRates{stored.Price}, stored.Tiers...) {
+		for _, field := range []string{"input", "output", "cache_read", "cache_write"} {
+			if card.Rates[field] == nil {
+				return s, fmt.Errorf("%w: price snapshot rate card %d field %s is missing", ErrInvalid, i, field)
+			}
+		}
+	}
 	price, err := normalizePriceBody(s.Price)
 	if err != nil {
 		return s, err

@@ -84,13 +84,14 @@ func (s *Store) Admit(ctx context.Context, in AdmitInput) (Request, error) {
 		if err := s.checkTokenLimits(ctx, tx, key, in.RequestedModel, at); err != nil {
 			return err
 		}
-		snapshot, err := encodePriceSnapshot(priceSnapshot{
+		frozen := priceSnapshot{
 			Price:       price,
 			Tiers:       tiers,
 			RuleID:      ruleID,
 			ServiceTier: normalizeServiceTier(in.ServiceTier),
 			ImageCount:  images,
-		})
+		}
+		snapshot, err := encodePriceSnapshot(frozen)
 		if err != nil {
 			return err
 		}
@@ -102,16 +103,15 @@ func (s *Store) Admit(ctx context.Context, in AdmitInput) (Request, error) {
 			snapshot); err != nil {
 			return fmt.Errorf("insert request: %w", err)
 		}
-		out = Request{
-			ID:         in.ID,
-			TraceID:    in.TraceID,
-			KeyID:      in.KeyID,
-			Model:      in.RequestedModel,
-			State:      stateActive,
-			StartedAt:  at,
-			Price:      price,
-			Executions: []Usage{},
-		}
+		out = (&reqRow{
+			id:        in.ID,
+			traceID:   in.TraceID,
+			keyID:     in.KeyID,
+			model:     in.RequestedModel,
+			state:     stateActive,
+			startedAt: at,
+			snapshot:  frozen,
+		}).toRequest(nil, 0)
 		return nil
 	})
 	if err != nil {
