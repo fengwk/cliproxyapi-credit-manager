@@ -3674,7 +3674,7 @@
     var creating = !existing;
 
     var labelInput = el('input', { type: 'text', id: 'key-label', value: spec.label || '' });
-    var enabledInput = el('input', { type: 'checkbox', id: 'key-enabled' });
+    var enabledInput = el('input', { type: 'checkbox', id: 'key-enabled', class: 'switch-input', role: 'switch' });
     enabledInput.checked = creating ? true : spec.enabled === true;
     var quotaField = moneyPairInput({ label: '总额度', micro: intString(spec.quota_micro_usd || 0) });
     var dailyField = moneyPairInput({ label: '每日额度', micro: intString(spec.daily_micro_usd || 0) });
@@ -3724,9 +3724,12 @@
           el('div', { class: 'field' }, [el('label', { for: 'key-label', text: '标签' }), labelInput]),
           el('div', { class: 'field' }, [
             el('label', { text: '状态' }),
-            el('label', { for: 'key-enabled', class: 'checkbox-label' }, [
+            el('label', { for: 'key-enabled', class: 'switch-control' }, [
               enabledInput,
-              document.createTextNode('启用（新建默认启用）'),
+              el('span', { class: 'switch-track', 'aria-hidden': 'true' }, [
+                el('span', { class: 'switch-thumb' }),
+              ]),
+              el('span', { class: 'switch-label', text: '启用（新建默认启用）' }),
             ]),
           ]),
           el('div', { class: 'field' }, [

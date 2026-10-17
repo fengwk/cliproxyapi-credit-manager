@@ -633,8 +633,42 @@ async function main() {
     await cdp.clickText('#panel-keys button', '新建 Key');
     await cdp.waitFor("document.querySelector('.modal #key-label')", 10000, '新建弹窗');
     check('新建默认启用', await cdp.evaluate("document.querySelector('.modal #key-enabled').checked === true"));
-    const boxRect = await cdp.evaluate("(() => { const el = document.querySelector('.modal #key-enabled'); const r = el.getBoundingClientRect(); return { width: r.width, height: r.height }; })()");
-    check('新建 Key 复选框未被通栏拉伸且尺寸合理', boxRect.width >= 14 && boxRect.width <= 24 && boxRect.height >= 14 && boxRect.height <= 24, JSON.stringify(boxRect));
+    const switchGeometry = await cdp.evaluate(`(() => {
+      const input = document.querySelector('#key-enabled');
+      const track = input.nextElementSibling, thumb = track.firstElementChild;
+      const r = track.getBoundingClientRect(), t = thumb.getBoundingClientRect();
+      return { width: r.width, height: r.height, thumbWidth: t.width, thumbHeight: t.height,
+        role: input.getAttribute('role'), nativeHidden: getComputedStyle(input).opacity === '0' };
+    })()`);
+    check('Key 启用使用 CPA 44×24 开关及 18×18 滑块',
+      switchGeometry.width === 44 && switchGeometry.height === 24 &&
+      switchGeometry.thumbWidth === 18 && switchGeometry.thumbHeight === 18 &&
+      switchGeometry.role === 'switch' && switchGeometry.nativeHidden, JSON.stringify(switchGeometry));
+    await cdp.click('.modal .switch-control');
+    check('点击开关标签切换原生状态', await cdp.evaluate("document.querySelector('#key-enabled').checked === false"));
+    // Use real keyboard events, not synthetic JS click/change, to pin accessibility.
+    await cdp.evaluate("document.querySelector('#key-label').focus()");
+    await cdp.send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Tab', code: 'Tab', windowsVirtualKeyCode: 9 });
+    await cdp.send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Tab', code: 'Tab', windowsVirtualKeyCode: 9 });
+    check('Tab 可聚焦隐藏的原生开关并显示轨道焦点环', await cdp.evaluate(`(() => {
+      const input = document.querySelector('#key-enabled'), style = getComputedStyle(input.nextElementSibling);
+      return document.activeElement === input && input.matches(':focus-visible') &&
+        style.outlineStyle === 'solid' && style.outlineWidth === '2px';
+    })()`));
+    await cdp.send('Input.dispatchKeyEvent', { type: 'keyDown', key: ' ', code: 'Space', windowsVirtualKeyCode: 32 });
+    await cdp.send('Input.dispatchKeyEvent', { type: 'keyUp', key: ' ', code: 'Space', windowsVirtualKeyCode: 32 });
+    check('Space 键切换开关且保持创建默认启用值', await cdp.evaluate("document.querySelector('#key-enabled').checked === true"));
+    await cdp.evaluate("document.querySelector('#key-enabled').disabled = true");
+    await cdp.click('.modal .switch-control');
+    check('禁用开关变淡且点击标签不能切换', await cdp.evaluate(`(() => {
+      const input = document.querySelector('#key-enabled');
+      return input.checked && getComputedStyle(input.nextElementSibling).opacity === '0.5';
+    })()`));
+    await cdp.evaluate("document.querySelector('#key-enabled').disabled = false");
+    await cdp.send('Emulation.setEmulatedMedia', { features: [{ name: 'prefers-reduced-motion', value: 'reduce' }] });
+    check('减少动画偏好关闭开关与滑块过渡', await cdp.evaluate(`['.switch-track', '.switch-thumb'].every(selector =>
+      getComputedStyle(document.querySelector(selector)).transitionDuration === '0s')`));
+    await cdp.send('Emulation.setEmulatedMedia', { features: [] });
     const modalText = await cdp.text('.modal');
     check('新建 Key 弹窗包含缺价上手提示', modalText.includes('创建 Key 不会自动定价') && modalText.includes('允许全部模型不等于免费'));
     const unitTags = await cdp.evaluate("[...document.querySelectorAll('.modal .money-unit-tag')].map((el) => el.textContent.trim())");
@@ -685,7 +719,17 @@ async function main() {
     await cdp.waitFor("document.querySelector('.modal #confirm-checkbox')", 10000, '二次确认弹窗');
     await cdp.clickText('.modal button', '禁用');
     check('财务/危险操作需要勾选确认', (await cdp.text('.modal .inline-error')).includes('勾选'));
-    await cdp.evaluate("document.querySelector('.modal #confirm-checkbox').checked = true");
+    const checkboxStyle = await cdp.evaluate(`(() => {
+      const input = document.querySelector('#confirm-checkbox'), style = getComputedStyle(input);
+      const r = input.getBoundingClientRect();
+      return { width: r.width, height: r.height, radius: style.borderRadius, appearance: style.appearance,
+        mark: getComputedStyle(input, '::after').opacity };
+    })()`);
+    check('确认复选框使用 CPA 22×22 圆角7px自定义外观且未选中不画勾',
+      checkboxStyle.width === 22 && checkboxStyle.height === 22 && checkboxStyle.radius === '7px' &&
+      checkboxStyle.appearance === 'none' && checkboxStyle.mark === '0', JSON.stringify(checkboxStyle));
+    await cdp.click('#confirm-checkbox');
+    check('确认框选中后显示 CSS 勾形', await cdp.evaluate("getComputedStyle(document.querySelector('#confirm-checkbox'), '::after').opacity === '1'"));
     await cdp.clickText('.modal button', '禁用');
     await sleep(300);
     const disableBody = JSON.parse((await debug('keys:update')).body);
@@ -1680,7 +1724,7 @@ async function main() {
       await cdp.waitFor("document.querySelector('#keys-list .keys-table')", 10000, 'Key 表格');
       for (const width of [1280, 390]) {
         await cdp.send('Emulation.setDeviceMetricsOverride', { width, height: 900, deviceScaleFactor: 1, mobile: width === 390 });
-        for (const theme of ['white', 'dark']) {
+        for (const theme of ['white', 'light', 'dark']) {
           await cdp.evaluate(`localStorage.setItem('cli-proxy-theme', '${theme}'); window.dispatchEvent(new StorageEvent('storage', { key: 'cli-proxy-theme' })); window.scrollTo(0, 0);`);
           const tableGeometry = await cdp.evaluate(`(() => {
             const fp = document.querySelector('.key-fingerprint');
@@ -1699,15 +1743,19 @@ async function main() {
           await cdp.click('#keys-create');
           await cdp.waitFor("document.querySelector('.modal #key-enabled')", 10000, 'Key 表单');
           const formGeometry = await cdp.evaluate(`(() => {
-            const box = document.querySelector('#key-enabled'), r = box.getBoundingClientRect();
+            const box = document.querySelector('#key-enabled'), track = box.nextElementSibling;
+            const r = track.getBoundingClientRect(), style = getComputedStyle(track);
             const modal = document.querySelector('.modal');
             return { checked: box.checked, width: r.width, height: r.height,
+              themed: style.backgroundColor === getComputedStyle(document.querySelector('.modal .btn-primary')).backgroundColor,
+              thumbTransform: getComputedStyle(track.firstElementChild).transform,
               units: document.querySelectorAll('.modal .money-unit-tag').length,
               labels: [...document.querySelectorAll('.modal .money-micro,.modal .money-usd')].every(n => n.getAttribute('aria-label')),
               fits: modal.scrollWidth <= modal.clientWidth + 1 };
           })()`);
-          check('Key 表单勾选、单位与布局 ' + width + '/' + theme,
-            formGeometry.checked && formGeometry.width === 16 && formGeometry.height === 16 &&
+          check('Key 表单主题开关、单位与布局 ' + width + '/' + theme,
+            formGeometry.checked && formGeometry.width === 44 && formGeometry.height === 24 &&
+            formGeometry.themed && formGeometry.thumbTransform === 'matrix(1, 0, 0, 1, 20, 0)' &&
             formGeometry.units === 8 && formGeometry.labels && formGeometry.fits, JSON.stringify(formGeometry));
           await cdp.screenshot('key-form-' + width + '-' + theme + '.png');
           await cdp.clickText('.modal button', '关闭');

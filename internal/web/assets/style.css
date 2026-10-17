@@ -442,20 +442,60 @@ input[aria-invalid="true"], select[aria-invalid="true"], textarea[aria-invalid="
   border-color: var(--danger);
 }
 
-input[type="checkbox"] {
-  width: 16px;
-  height: 16px;
-  min-width: 16px;
-  min-height: 16px;
+/* Match CPA's selection checkbox instead of the platform-native appearance. */
+input[type="checkbox"]:not(.switch-input) {
+  appearance: none;
+  position: relative;
+  width: 22px;
+  height: 22px;
+  min-width: 22px;
+  min-height: 22px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--control);
   padding: 0;
   margin: 0;
   flex: none;
-  align-self: flex-start;
-  accent-color: var(--accent);
+  align-self: center;
   cursor: pointer;
   box-sizing: border-box;
+  transition: border-color .16s ease, background-color .16s ease, box-shadow .16s ease;
 }
 
+input[type="checkbox"]:not(.switch-input)::after {
+  content: "";
+  position: absolute;
+  left: 7px;
+  top: 3px;
+  width: 5px;
+  height: 10px;
+  border: solid #fff;
+  border-width: 0 2px 2px 0;
+  transform: rotate(45deg);
+  opacity: 0;
+}
+
+input[type="checkbox"]:not(.switch-input):checked {
+  border-color: var(--accent);
+  background: var(--accent);
+}
+
+input[type="checkbox"]:not(.switch-input):checked::after {
+  opacity: 1;
+}
+
+input[type="checkbox"]:not(.switch-input):not(:disabled):hover,
+input[type="checkbox"]:not(.switch-input):focus-visible {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
+input[type="checkbox"]:not(.switch-input):disabled {
+  opacity: .6;
+  cursor: not-allowed;
+}
+
+.checkbox-label,
 .field > label.checkbox-label {
   display: inline-flex;
   align-items: center;
@@ -467,8 +507,83 @@ input[type="checkbox"] {
   min-height: 36px;
 }
 
-.checkbox-label input[type="checkbox"] {
-  align-self: center;
+.switch-control,
+.field > label.switch-control {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 36px;
+  cursor: pointer;
+  user-select: none;
+}
+
+input[type="checkbox"].switch-input {
+  position: absolute;
+  width: 0;
+  height: 0;
+  min-width: 0;
+  min-height: 0;
+  padding: 0;
+  margin: 0;
+  border: 0;
+  opacity: 0;
+}
+
+.switch-track {
+  position: relative;
+  display: inline-block;
+  flex: none;
+  width: 44px;
+  height: 24px;
+  border-radius: 999px;
+  background: var(--line);
+  transition: background-color .2s ease;
+}
+
+.switch-thumb {
+  position: absolute;
+  top: 3px;
+  left: 3px;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, .15);
+  transition: transform .2s ease;
+}
+
+.switch-input:checked + .switch-track {
+  background: var(--accent);
+}
+
+.switch-input:checked + .switch-track .switch-thumb {
+  transform: translateX(20px);
+}
+
+.switch-input:focus-visible + .switch-track {
+  outline: 2px solid var(--text);
+  outline-offset: 2px;
+}
+
+.switch-input:disabled + .switch-track,
+.switch-input:disabled ~ .switch-label {
+  opacity: .5;
+  cursor: not-allowed;
+}
+
+.switch-label {
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  input[type="checkbox"]:not(.switch-input),
+  .switch-track,
+  .switch-thumb {
+    transition: none;
+  }
 }
 
 textarea {
