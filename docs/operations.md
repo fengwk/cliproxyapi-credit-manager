@@ -165,7 +165,7 @@ data_dir/
 
 pending **不冻结任何金额**，也**不会阻塞后续准入**：Token 配额按“实际已用”判断，
 其他请求照常通过。**没有管理员金额裁决**：`/api/resolve` 已删除，
-旧的人工 `release`/`charge` 调整不再存在。完整但未定价（缺价、不完整价格或
+旧的人工 `release`/`charge` 调整不再存在。完整但未定价（缺价、金额溢出或
 `per_image` 无真实出图数）的用量仍可正常 `settled`，只是 `cost_micro_usd: null`
 并计入 `unpriced_executions`；显式全零价格才是已定价的免费 0。
 

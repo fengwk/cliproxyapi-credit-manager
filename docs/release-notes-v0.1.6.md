@@ -15,7 +15,7 @@
   `service_tier` 计算，不使用请求别名、`RequestedModel` 或 `ResponseModel` 猜价。
   改价/加价/删价会重算仍保留的日志。
 - 缺价、不完整/不可信用量、整数溢出、`per_image` 缺少真实出图数量时，
-  `cost_micro_usd` 为 `null` 并计入 `unpriced_executions`；显式全零价格是
+  单条执行的 `cost_micro_usd` 为 `null` 并计入 `unpriced_executions`；显式全零价格是
   已定价的免费 0。summary 成本只是已定价执行的小计。
 - `disabled` 价格规则只是不参与价格匹配，不是模型权限黑名单。
 - 价格预览按输入 token 试算，不等于实际日志费用；参考目录仍需管理员显式

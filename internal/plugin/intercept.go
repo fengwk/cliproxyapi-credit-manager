@@ -105,7 +105,7 @@ func (m *Manager) interceptBefore(req pluginapi.RequestInterceptRequest) plugina
 	traceID := strings.TrimSpace(req.TraceID)
 	if traceID == "" {
 		// Without a trace the execution can never be correlated with its
-		// lifecycle completion, so it must not be admitted for billing.
+		// lifecycle completion, so it cannot be admitted for token accounting.
 		return terminate(http.StatusBadRequest, "request trace is required")
 	}
 	// Nothing here estimates amount or tokens: admission checks the actual

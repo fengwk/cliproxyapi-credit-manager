@@ -532,7 +532,9 @@ func (b *priceBook) resolve(model string) (priceResolution, error) {
 // "not priced" rather than as an error or as a fabricated zero: a wild price
 // must never fail a whole report, and it must never become a silent amount.
 func (b *priceBook) executionCost(model string, tokens Tokens, serviceTier string, reliable bool) (int64, bool, error) {
-	if !reliable {
+	// Even a catch-all rule needs an actual model identity. An omitted model
+	// must not be priced through a wildcard or replaced with a request alias.
+	if !reliable || strings.TrimSpace(model) == "" {
 		return 0, false, nil
 	}
 	res, err := b.resolve(model)

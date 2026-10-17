@@ -234,8 +234,9 @@ func checkMaterialFree(ctx context.Context, q querier, hmac string, exceptID str
 	return nil
 }
 
-// CreateKey registers a key. The returned string is the only copy of the
-// plaintext material; it is never persisted or recoverable.
+// CreateKey registers a key and returns its plaintext material once. Ordinary
+// key views omit material; the authenticated RevealKey operation can recover
+// and verify it from the sealed ciphertext.
 func (s *Store) CreateKey(ctx context.Context, spec KeySpec) (Key, string, error) {
 	norm, err := normalizeSpec(spec)
 	if err != nil {

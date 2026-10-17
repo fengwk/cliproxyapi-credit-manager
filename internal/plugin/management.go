@@ -139,7 +139,7 @@ func managementRouteDescription(method, suffix string) string {
 	case "/api/reveal":
 		return "Reveal one recoverable credit key and audit the disclosure."
 	case "/api/delete-key":
-		return "Soft delete a credit key, preserving its ledger."
+		return "Soft delete a credit key, preserving its usage history."
 	case "/api/reset-tokens":
 		return "Reset selected token usage baselines without clearing history."
 	case "/api/callers":

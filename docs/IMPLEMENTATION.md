@@ -39,7 +39,7 @@ spending and not an admission allowance. No synonymous aliases are added.
 `MaxConcurrent` 0 means unlimited. Enabled is explicit true/false. AllowedModels
 empty=all, otherwise exact IDs (no fuzzy/slash-prefix inference). ModelTokenLimits
 match exact requested IDs, 0=unlimited. Durable lifetime/UTC period token
-counters and actual used amounts must survive history cleanup too.
+counters and token reset baselines survive history cleanup too.
 
 A Key has no `spent_micro_usd`, `quota_used_micro_usd`, daily/weekly/monthly
 used amount or other permanent monetary fields. Cost is reported only from the
@@ -52,7 +52,8 @@ rules; a zero tier rate inherits the rule price. A price may also be
 `billing_mode: "per_image"` with `per_image_micro_usd`, but see the image
 limitation below.
 
-No price, amount, adjustment or price snapshot is persisted. `AdmitInput`
+Price and display-budget configuration is persisted, but execution amounts,
+adjustments and request price snapshots are not. `AdmitInput`
 carries only the lifecycle ID, trace, key, exact requested model, request
 service tier and time. It carries no amount, price, image count or token
 estimate. Admission checks only key permissions/expiry, exact allowed model,
@@ -94,8 +95,8 @@ Admit/Usage/Complete lifecycle is unsupported. No permanent event journal is
 kept.
 
 One complete DDL initializes an empty SQLite ledger in a single transaction and
-stamps `PRAGMA user_version=2` last. The schema stores no amount, price snapshot
-or adjustment; deleted fields/tables include `keys.spent_micro_usd`,
+stamps `PRAGMA user_version=2` last. The schema stores no computed execution
+amount, request price snapshot or adjustment; deleted fields/tables include `keys.spent_micro_usd`,
 `requests.price_snapshot/charge_micro_usd/resolved`,
 `usages.cost_micro_usd/charged`, `key_money_counters`, `key_money_baselines` and
 `adjustments`. Same-format ledgers reopen without replaying or repairing DDL.
@@ -134,8 +135,8 @@ current price, the winning price is per-image (the host reports no real image
 count), or the exact product overflows. Such executions count in
 `Summary.unpriced_executions`; `Summary.cost_micro_usd` is the strict subtotal of
 priced executions. An explicitly all-zero complete rate is a priced zero (free)
-and is not counted as unpriced. `CompleteExecutions` comes from usage quality
-and never equals the priced count.
+and is not counted as unpriced. `CompleteExecutions` comes from usage quality,
+not pricing coverage; the two counts may happen to be equal.
 
 Per-image prices, rules and preview may still exist, but a log's cost must be
 `null` because SDK v8.0.30 `UsageDetail` exposes tokens only and no actual image
@@ -153,7 +154,8 @@ Rules are evaluated deterministically: priority descending, then match kind
 is a priority-zero exact candidate; a same-priority explicit exact rule wins.
 A disabled rule is skipped entirely: it neither participates in pricing nor
 denies a model, so it is not a model permission blacklist. No candidate or an
-incomplete candidate means the execution is unpriced, never a failed request.
+an amount that cannot be computed means the execution is unpriced; it never
+causes a request rejection.
 
 A context tier applies when canonical prompt size (uncached input plus cache
 read and cache write) reaches its threshold; the highest matching threshold

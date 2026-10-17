@@ -7,10 +7,10 @@ import (
 	"testing"
 )
 
-// TestSchemaStoresNoMoneyOrPrice is the storage half of the pricing contract:
-// no table may keep an amount, a price snapshot or an adjustment, so a price
-// change is guaranteed to reach the reported history of every past execution.
-func TestSchemaStoresNoMoneyOrPrice(t *testing.T) {
+// TestSchemaStoresNoExecutionAmounts is the storage half of query pricing:
+// no usage amount, request price snapshot or adjustment is persisted, so a
+// price change reaches retained execution history. Price configuration remains.
+func TestSchemaStoresNoExecutionAmounts(t *testing.T) {
 	h := newHarness(t)
 	forbiddenColumns := map[string][]string{
 		"keys":     {"spent_micro_usd"},
@@ -30,7 +30,7 @@ func TestSchemaStoresNoMoneyOrPrice(t *testing.T) {
 			t.Fatalf("table %s still exists", table)
 		}
 	}
-	// The four display budgets are the only monetary columns left.
+	// Keys retain their four display-budget configuration fields.
 	for _, column := range []string{"quota_micro_usd", "daily_micro_usd", "weekly_micro_usd", "monthly_micro_usd"} {
 		if _, ok := tableColumns(t, h, "keys")[column]; !ok {
 			t.Fatalf("display budget column keys.%s is missing", column)
