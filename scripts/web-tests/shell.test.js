@@ -76,7 +76,7 @@ test('脚本不保留已废弃的枚举别名', () => {
   for (const stale of ['inconsistent', 'unclassified', 'cancelled', "'success'", "'stopped'", "'charged'"]) {
     assert.ok(!js.includes(stale), `不应再出现旧取值 ${stale}`);
   }
-  for (const required of ['partial', 'unknown', 'active', 'pending', 'settled', 'succeeded', 'rejected', 'canceled', 'adjustment_micro_usd']) {
+  for (const required of ['partial', 'unknown', 'active', 'pending', 'settled', 'succeeded', 'rejected', 'canceled', 'unpriced_executions']) {
     assert.ok(js.includes(required), `缺少契约取值 ${required}`);
   }
 });

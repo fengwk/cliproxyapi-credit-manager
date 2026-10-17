@@ -36,7 +36,7 @@
   var GRAINS = ['hour', 'day', 'month'];
 
   var OUTCOME_LABELS = { succeeded: '成功', failed: '失败', rejected: '拒绝', canceled: '取消' };
-  var STATE_LABELS = { active: '进行中', pending: '待定', settled: '已结算' };
+  var STATE_LABELS = { active: '执行中', pending: '用量待完整', settled: '已完成' };
   var SNAPSHOT_LABELS = {
     captured: '已捕获',
     expired: '已过保留期',
@@ -340,10 +340,21 @@
     }));
   }
 
+  // 执行费用只汇总已定价执行；未定价执行返回 null 与非零计数，绝不当作 0。
   function executionCost(executions) {
-    return sumExact((executions || []).map(function (execution) {
-      return execution && execution.cost_micro_usd != null ? execution.cost_micro_usd : 0;
-    }));
+    var priced = [];
+    var unpriced = 0;
+    (executions || []).forEach(function (execution) {
+      if (execution && execution.cost_micro_usd !== null && execution.cost_micro_usd !== undefined) {
+        priced.push(execution.cost_micro_usd);
+      } else {
+        unpriced += 1;
+      }
+    });
+    return {
+      micro: priced.length ? sumExact(priced) : null,
+      unpriced: unpriced,
+    };
   }
 
   // 模型 Token 限额：后端只返回已配置的上限，0 表示该周期不限。
@@ -654,20 +665,20 @@
   function renderQuotas(key) {
     var quotas = el('quotas');
     clear(quotas);
-    var effectiveSpent = key.quota_used_micro_usd;
-    quotas.appendChild(card('已用额度', formatMoney(effectiveSpent, state.currency, state.rate)));
-    quotas.appendChild(card('总额度', key.quota_micro_usd ? formatMoney(key.quota_micro_usd, state.currency, state.rate) : '不限'));
-    quotas.appendChild(card('日额度', key.daily_micro_usd ? formatMoney(key.daily_micro_usd, state.currency, state.rate) : '不限'));
-    quotas.appendChild(card('周额度', key.weekly_micro_usd ? formatMoney(key.weekly_micro_usd, state.currency, state.rate) : '不限'));
-    quotas.appendChild(card('月额度', key.monthly_micro_usd ? formatMoney(key.monthly_micro_usd, state.currency, state.rate) : '不限'));
+    // Key 不再携带永久财务计数：这里只展示预算配置，0 表示未设置。
+    function budget(value) {
+      return value ? formatMoney(value, state.currency, state.rate) : '未设置';
+    }
+    quotas.appendChild(card('总预算（仅展示）', budget(key.quota_micro_usd)));
+    quotas.appendChild(card('日预算（仅展示）', budget(key.daily_micro_usd)));
+    quotas.appendChild(card('周预算（仅展示）', budget(key.weekly_micro_usd)));
+    quotas.appendChild(card('月预算（仅展示）', budget(key.monthly_micro_usd)));
     quotas.appendChild(card('并发上限', key.max_concurrent ? formatInt(key.max_concurrent) : '不限'));
+    quotas.appendChild(card('预算说明', '仅展示，不限制调用；费用见下方所选日志范围'));
     if (key.allowed_models && key.allowed_models.length) {
       quotas.appendChild(card('允许模型', key.allowed_models.join('、')));
     } else {
       quotas.appendChild(card('允许模型', '不限'));
-    }
-    if (key.spent_micro_usd !== undefined && key.spent_micro_usd !== null) {
-      quotas.appendChild(card('累计消费', formatMoney(key.spent_micro_usd, state.currency, state.rate)));
     }
   }
 
@@ -697,12 +708,14 @@
     var tokens = summary.tokens || {};
     var stats = el('stats');
     clear(stats);
+    var costKnown = summary.cost_micro_usd !== null && summary.cost_micro_usd !== undefined;
+    var unpriced = summary.unpriced_executions || 0;
     stats.appendChild(card('请求数', formatInt(summary.requests)));
     stats.appendChild(card('执行次数', formatInt(summary.executions)));
     stats.appendChild(card('失败请求', formatInt(summary.failed), summary.failed ? 'danger' : null));
-    stats.appendChild(card('未结算请求', formatInt(summary.pending), summary.pending ? 'warn' : null));
-    stats.appendChild(card('执行成本', formatMoney(summary.cost_micro_usd, state.currency, state.rate)));
-    stats.appendChild(card('人工补记', formatMoney(summary.adjustment_micro_usd, state.currency, state.rate)));
+    stats.appendChild(card('执行中/用量待完整请求', formatInt(summary.pending), summary.pending ? 'warn' : null));
+    stats.appendChild(card('已定价费用小计', costKnown ? formatMoney(summary.cost_micro_usd, state.currency, state.rate) : '未定价', costKnown ? null : 'warn'));
+    stats.appendChild(card('未定价执行', formatInt(unpriced) + ' 条', unpriced ? 'warn' : null));
     ['input', 'output', 'reasoning', 'cache_read', 'cache_write', 'total'].forEach(function (slot) {
       if (tokens[slot] === undefined && slot !== 'total') return;
       stats.appendChild(card('Token·' + tokenSlotLabel(slot), formatToken(tokens[slot], state.tokenUnit)));
@@ -873,7 +886,15 @@
       row.appendChild(text('td', 'model', item.model || '—'));
       row.appendChild(text('td', null, requestStatus(item)));
       row.appendChild(text('td', 'num', formatToken(executionTokens(item.executions), state.tokenUnit)));
-      row.appendChild(text('td', 'num', formatMoney(executionCost(item.executions), state.currency, state.rate)));
+      var cost = executionCost(item.executions);
+      var costCell = text('td', 'num');
+      if (cost.micro === null) {
+        costCell.textContent = cost.unpriced ? '未定价（' + cost.unpriced + ' 条，不是免费）' : '—';
+      } else {
+        costCell.textContent = formatMoney(cost.micro, state.currency, state.rate) +
+          (cost.unpriced ? '（另有 ' + cost.unpriced + ' 条未定价）' : '');
+      }
+      row.appendChild(costCell);
       var action = text('td', null);
       var button = text('button', null, '查看快照');
       button.type = 'button';

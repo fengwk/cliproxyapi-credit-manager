@@ -297,7 +297,7 @@ test('价格缺省与免费状态不混淆', () => {
   assert.equal(CM.priceMissing({ model: 'gpt-5', rates: {} }), false);
   assert.equal(CM.ratesSummaryText({ input: 0, output: 0, cache_read: 0, cache_write: 0 }), '显式全零：免费');
   assert.equal(CM.ratesSummaryText({ input: 0, output: 1, cache_read: 0, cache_write: 0 }), null);
-  assert.equal(CM.ratesSummaryText(null), '无价格记录（拒绝计费）');
+  assert.equal(CM.ratesSummaryText(null), '无当前价格（历史执行显示为未定价，不是免费）');
   assert.equal(CM.reasoningRateText({ output: 5 }), '缺失（按输出计费）');
   assert.equal(CM.reasoningRateText({ output: 5, reasoning: '1234567' }), '1,234,567 µUSD / 1M');
 });
@@ -330,9 +330,9 @@ test('结果/状态/质量标签与语气与契约枚举一致', () => {
   assert.equal(CM.outcomeLabel(''), '未知');
   assert.equal(CM.outcomeLabel(undefined), '未知');
 
-  assert.equal(CM.stateLabel('active'), '进行中');
-  assert.equal(CM.stateLabel('pending'), '待定');
-  assert.equal(CM.stateLabel('settled'), '已结算');
+  assert.equal(CM.stateLabel('active'), '执行中');
+  assert.equal(CM.stateLabel('pending'), '用量待完整');
+  assert.equal(CM.stateLabel('settled'), '已完成');
   assert.equal(CM.stateLabel('complete'), 'complete', '旧状态值不应再被翻译');
   assert.equal(CM.stateLabel(''), '—');
 
@@ -373,7 +373,7 @@ test('只有 pending 状态的请求才提供人工 Resolve 入口', () => {
   assert.equal(CM.isPendingRequest(undefined), false);
 });
 
-test('汇总卡片区分失败请求、未结算请求、执行成本与人工补记', () => {
+test('汇总卡片区分失败请求、用量待完整、已定价小计与未定价执行', () => {
   const summary = CM.parseJSON(
     JSON.stringify({
       requests: 3,
@@ -381,7 +381,7 @@ test('汇总卡片区分失败请求、未结算请求、执行成本与人工�
       failed: 2,
       pending: 1,
       cost_micro_usd: 4200000,
-      adjustment_micro_usd: 2500000,
+      unpriced_executions: 1,
       tokens: { input: 10, cache_read: 0, cache_write: 0, output: 20, reasoning: 0, total: 30 },
       complete_executions: 3,
       cache_read_ratio: 0.25,
@@ -399,26 +399,43 @@ test('汇总卡片区分失败请求、未结算请求、执行成本与人工�
   assert.ok(byLabel['失败请求'].sub.includes('failed / canceled / rejected'));
   assert.equal(cards.some((card) => card.label.indexOf('失败执行') >= 0), false);
 
-  // pending 是 active+pending 的未结算请求：已知用量照常入账。
-  assert.ok(byLabel['未结算请求'], '必须存在未结算请求卡片');
-  assert.ok(byLabel['未结算请求'].sub.includes('已知用量照常入账，未知部分待核账'));
-  assert.equal(byLabel['未结算请求'].sub.includes('不计入成本'), false);
+  // pending 只表示用量生命周期，不再叫结算/扣款。
+  assert.ok(byLabel['用量待完整请求'], '必须存在用量待完整请求卡片');
+  assert.ok(byLabel['用量待完整请求'].sub.includes('完整用量与缺价执行仍会正常完成'));
+  assert.equal(cards.some((card) => card.label.includes('未结算')), false);
 
-  // 执行成本与人工补记必须是两张独立卡片，金额互不混算。
-  assert.equal(byLabel['执行成本'].value, '4.2 USD');
-  assert.ok(byLabel['执行成本'].sub.includes('仅匹配范围内的执行计量'));
-  assert.equal(byLabel['人工补记'].value, '2.5 USD');
-  assert.ok(byLabel['人工补记'].sub.includes('不计入执行成本'));
-  assert.equal(byLabel['人工补记'].value === byLabel['执行成本'].value, false);
+  // 已定价小计与未定价执行分开：未知不等于免费。
+  assert.equal(byLabel['已定价费用小计'].value, '4.2 USD');
+  assert.ok(byLabel['已定价费用小计'].sub.includes('另有 1 条未定价执行不计入小计'));
+  assert.equal(byLabel['未定价执行'].value, '1');
+  assert.ok(byLabel['未定价执行'].sub.includes('未定价 ≠ 免费'));
+  assert.equal(cards.some((card) => card.label === '人工补记'), false);
 
   // 无 provider/auth 过滤时不得声称已按执行维度过滤。
-  assert.equal(byLabel['执行成本'].sub.includes('Provider/auth_id'), false);
-  assert.equal(byLabel['人工补记'].sub.includes('不受 Provider/auth_id 过滤'), false);
+  assert.equal(byLabel['已定价费用小计'].sub.includes('Provider/auth_id'), false);
+});
+
+test('全部未定价时金额卡片显示未定价而不是 0；显式免费 0 仍保留', () => {
+  const unpriced = CM.parseJSON(
+    '{"requests":1,"executions":1,"failed":0,"pending":0,"cost_micro_usd":null,"unpriced_executions":1,"tokens":{},"complete_executions":1}'
+  );
+  const cards = CM.usageSummaryCards(unpriced, {});
+  const cost = cards.find((card) => card.label === '已定价费用小计');
+  assert.equal(cost.value, '未定价');
+  assert.ok(cost.sub.includes('未定价不是免费'));
+  assert.equal(cost.tone, 'warn');
+
+  const free = CM.parseJSON(
+    '{"requests":1,"executions":1,"failed":0,"pending":0,"cost_micro_usd":0,"unpriced_executions":0,"tokens":{},"complete_executions":1}'
+  );
+  const freeCost = CM.usageSummaryCards(free, {}).find((card) => card.label === '已定价费用小计');
+  assert.equal(freeCost.value, '0 USD');
+  assert.equal(freeCost.tone, '');
 });
 
 test('provider/auth 过滤只作用于执行维度并如实标注', () => {
   const summary = CM.parseJSON(
-    '{"requests":1,"executions":1,"failed":0,"pending":0,"cost_micro_usd":1000000,"adjustment_micro_usd":2500000,"tokens":{},"complete_executions":1}'
+    '{"requests":1,"executions":1,"failed":0,"pending":0,"cost_micro_usd":1000000,"unpriced_executions":0,"tokens":{},"complete_executions":1}'
   );
   assert.equal(CM.hasExecutionScope({}), false);
   assert.equal(CM.hasExecutionScope({ provider: ' ' }), false);
@@ -426,19 +443,19 @@ test('provider/auth 过滤只作用于执行维度并如实标注', () => {
   assert.equal(CM.hasExecutionScope({ auth: 'auth-1' }), true);
 
   const scoped = CM.usageSummaryCards(summary, { provider: 'opencode-go', auth: 'auth-1' });
-  const cost = scoped.find((card) => card.label === '执行成本');
-  const adjustment = scoped.find((card) => card.label === '人工补记');
+  const cost = scoped.find((card) => card.label === '已定价费用小计');
   assert.ok(cost.sub.includes('已按 Provider/auth_id 过滤'));
-  assert.ok(adjustment.sub.includes('不受 Provider/auth_id 过滤'));
+  assert.equal(scoped.some((card) => card.label === '人工补记'), false);
 
   const note = CM.usageScopeNote(summary, { provider: 'opencode-go' });
-  assert.ok(note.includes('不等于全 Key 账本支出'));
-  assert.ok(note.includes('不能把该合计当作全 Key 台账'));
+  assert.ok(note.includes('只覆盖当前选中的时间范围'));
+  assert.ok(note.includes('修改、添加或删除价格后历史金额立即重算'));
+  assert.ok(note.includes('不是免费'));
   assert.ok(note.includes('完整执行占比 = 1 / 1 = 100.0%'));
   // 没有执行维度过滤时不加这段强提示，但口径说明始终存在。
   const plain = CM.usageScopeNote(summary, {});
-  assert.equal(plain.includes('不能把该合计当作全 Key 台账'), false);
-  assert.ok(plain.includes('不等于全 Key 账本支出'));
+  assert.equal(plain.includes('不代表整个 Key 的全部日志'), false);
+  assert.ok(plain.includes('不代表价格完整率'));
 });
 
 test('字节数、时长与时间格式化', () => {

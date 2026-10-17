@@ -167,13 +167,17 @@ test('记住密钥：会话优先、本地兜底、两侧独立 try、校验源�
 // --- 3. 展示映射 -----------------------------------------------------------
 
 test('请求状态与模型 Token 限额按契约展示', () => {
-  assert.equal(CMLookup.requestStatus({ outcome: 'failed', state: 'settled' }), '失败 · 已结算');
-  assert.equal(CMLookup.requestStatus({ state: 'active' }), '进行中');
+  assert.equal(CMLookup.requestStatus({ outcome: 'failed', state: 'settled' }), '失败 · 已完成');
+  assert.equal(CMLookup.requestStatus({ state: 'active' }), '执行中');
+  assert.equal(CMLookup.requestStatus({ state: 'pending' }), '用量待完整');
   assert.equal(CMLookup.requestStatus({}), '—');
   assert.equal(CMLookup.tokenLimitText(0), '不限');
   assert.equal(CMLookup.tokenLimitText({ cmIntText: '1000000' }), CMCharts.tokenText({ cmIntText: '1000000' }, 'raw'));
   assert.equal(CMLookup.executionTokens([{ tokens: { total: { cmIntText: BIG } } }, { tokens: { total: { cmIntText: BIG } } }]), '18014398509481986');
-  assert.equal(CMLookup.executionCost([{ cost_micro_usd: { cmIntText: BIG } }, { cost_micro_usd: 1 }]), '9007199254740994');
+  assert.deepEqual(CMLookup.executionCost([{ cost_micro_usd: { cmIntText: BIG } }, { cost_micro_usd: 1 }]), { micro: '9007199254740994', unpriced: 0 });
+  // 未定价执行返回 null 并计数，绝不落成 0（免费）。
+  assert.deepEqual(CMLookup.executionCost([{ cost_micro_usd: null }, { cost_micro_usd: 0 }]), { micro: '0', unpriced: 1 });
+  assert.deepEqual(CMLookup.executionCost([{ cost_micro_usd: null }]), { micro: null, unpriced: 1 });
 });
 
 test('响应体解析走无损解析，绝不使用会丢精度的 response.json', () => {
@@ -303,8 +307,10 @@ test('lookup.js 模型分析与额度基线：无未定义函数，退出清理�
   assert.ok(resetFn.includes('lookup-model-rank'), 'resetPrivateUI 必须清空模型排行列表');
 
   const quotasFn = code.slice(code.indexOf('function renderQuotas('), code.indexOf('function renderTokenLimits('));
-  assert.ok(quotasFn.includes('quota_used_micro_usd'), 'renderQuotas 必须支持周期生效配额字段');
-  assert.ok(quotasFn.includes('累计消费') || quotasFn.includes('累计支出'), 'renderQuotas 必须明确标注累计消费');
+  assert.ok(quotasFn.includes('总预算（仅展示）'), 'renderQuotas 必须展示仅作展示的预算');
+  assert.ok(quotasFn.includes('未设置'), '预算 0 必须显示为未设置');
+  assert.equal(quotasFn.includes('quota_used_micro_usd'), false, 'Key 不再有永久已用额度计数');
+  assert.equal(quotasFn.includes('spent_micro_usd'), false, 'Key 不再有永久累计消费');
   assert.equal(quotasFn.includes('在途预占'), false, 'renderQuotas 不得包含在途预占卡片');
   assert.equal(quotasFn.includes('held_micro_usd'), false, 'renderQuotas 不得引用 held_micro_usd');
 });
