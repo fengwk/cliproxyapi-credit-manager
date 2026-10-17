@@ -252,6 +252,7 @@ metadata.json                            # id/name/version/goos/goarch/sdk/commi
 | 文档 | 内容 |
 | --- | --- |
 | [`docs/operations.md`](docs/operations.md) | 安装/升级与旧库迁移、配置、备份恢复、保留与清理、快照、故障处理 |
+| [`docs/release-notes-v0.1.4.md`](docs/release-notes-v0.1.4.md) | v0.1.4 移除预占、软额度准入及管理/定价/分析功能恢复；含升级注意事项 |
 | [`docs/release-notes-v0.1.3.md`](docs/release-notes-v0.1.3.md) | v0.1.3 修复 CPA 插件商店注入 store 配置导致注册失败问题 |
 | [`docs/release-notes-v0.1.2.md`](docs/release-notes-v0.1.2.md) | v0.1.2 计费、快照隐私、边界校验与管理界面修复 |
 | [`docs/release-notes-v0.1.1.md`](docs/release-notes-v0.1.1.md) | v0.1.1 请求详情布局修复 |
