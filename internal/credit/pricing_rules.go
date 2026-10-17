@@ -146,8 +146,8 @@ func scanPricingRule(scan func(...any) error) (PricingRule, error) {
 	return r, nil
 }
 
-// PutPricingRule upserts one pricing rule. It is an administrator operation;
-// requests admitted earlier keep the price frozen on their snapshot.
+// PutPricingRule upserts one pricing rule. The next query applies the new rule
+// to retained execution logs; request admission is independent of pricing.
 func (s *Store) PutPricingRule(ctx context.Context, rule PricingRule) error {
 	return s.inTx(ctx, func(tx *sql.Tx) error {
 		if err := putPricingRule(ctx, tx, rule); err != nil {
@@ -295,7 +295,12 @@ func (s *Store) PreviewPrice(ctx context.Context, model, serviceTier string, inp
 	if inputTokens < 0 {
 		return PriceMatch{}, fmt.Errorf("%w: input tokens must not be negative", ErrInvalid)
 	}
-	book, err := loadPriceBook(ctx, s.db)
+	var book *priceBook
+	err := s.withSnapshot(ctx, func(q querier) error {
+		var err error
+		book, err = loadPriceBook(ctx, q)
+		return err
+	})
 	if err != nil {
 		return PriceMatch{}, err
 	}

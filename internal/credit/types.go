@@ -82,11 +82,10 @@ type Rates struct {
 
 // Price amounts are integer microUSD per million tokens, not USD floats.
 //
-// BillingMode selects how a request is billed: the empty string and "token"
-// bill the canonical token buckets through Rates; "per_image" bills
-// PerImageMicroUSD once per requested image. Optional rate tiers are carried by
-// the pricing rule that selects this price (see PricingRule.Tiers), so a price
-// value and its tiers can never be duplicated or disagree.
+// BillingMode selects the reference-price unit. The empty string and "token"
+// price the logged canonical token buckets through Rates. "per_image" supports
+// hypothetical previews only: the host logs no actual image count. Optional
+// rate tiers are carried by the pricing rule that selects this price.
 type Price struct {
 	Model            string `json:"model"`
 	Rates            Rates  `json:"rates"`

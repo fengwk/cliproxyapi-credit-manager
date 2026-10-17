@@ -138,15 +138,16 @@ func TestAppJSContractEnums(t *testing.T) {
 	}
 }
 
-// 界面必须区分执行成本与人工补记，并按契约解释失败/未结算计数。
+// 界面必须区分已定价小计、未定价执行与用量完整度，不能回退为财务结算界面。
 func TestAppJSAccountingWording(t *testing.T) {
 	js := readAsset(t, "app.js")
 
 	required := []string{
-		"失败请求",  // summary.failed 是失败请求数，不是失败执行数
-		"未结算请求", // summary.pending 是 active+pending
-		"执行成本",
-		"已知用量照常入账",
+		"失败请求", // summary.failed 是失败请求数，不是失败执行数
+		"用量待完整请求",
+		"已定价费用小计",
+		"未定价执行",
+		"当前价格 × 实际日志",
 	}
 	for _, token := range required {
 		if !strings.Contains(js, token) {
@@ -157,6 +158,11 @@ func TestAppJSAccountingWording(t *testing.T) {
 	for _, stale := range []string{"label: '失败执行'", "label: '待定请求'", "label: '成本合计'", "不计入成本"} {
 		if strings.Contains(js, stale) {
 			t.Errorf("app.js 仍保留错误口径卡片 %q", stale)
+		}
+	}
+	for _, retired := range []string{"/api/resolve", "/api/reset-spend", "adjustment_micro_usd", "quota_used_micro_usd", "spent_micro_usd"} {
+		if strings.Contains(js, retired) {
+			t.Errorf("app.js 不得恢复退役财务字段或接口 %q", retired)
 		}
 	}
 }

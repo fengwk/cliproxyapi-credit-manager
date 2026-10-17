@@ -13,10 +13,10 @@ import (
 )
 
 const (
-	// billingToken bills the canonical token buckets. It is the default.
+	// billingToken prices the canonical token buckets. It is the default.
 	billingToken = "token"
-	// billingPerImage bills a flat price per requested image, ignoring token
-	// counters.
+	// billingPerImage quotes a flat per-image rate for price previews only:
+	// recorded usage has no actual image count and cannot use this mode.
 	billingPerImage = "per_image"
 
 	// priceTierContext selects a tier by canonical prompt size.
@@ -24,7 +24,7 @@ const (
 	// priceTierService selects a tier by the request's service tier.
 	priceTierService = "service"
 
-	// maxImageCount caps the requested image count that is frozen and billed.
+	// maxImageCount bounds the hypothetical image count accepted by a preview.
 	maxImageCount = 32
 	// maxPriceTiers bounds the tier list of one price.
 	maxPriceTiers = 16
@@ -38,26 +38,8 @@ func resolveBillingMode(mode string) string {
 	return billingToken
 }
 
-// IsPerImage reports whether the price bills per requested image.
+// IsPerImage reports whether this is a per-image reference price.
 func (p Price) IsPerImage() bool { return resolveBillingMode(p.BillingMode) == billingPerImage }
-
-// imageCountFor resolves the billed image count of a per-image request.
-//
-// An omitted count means one image. An explicitly declared count must be one of
-// the supported 1..32 values: it is refused rather than silently billed as a
-// different number, so an unsupported request can never be under- or
-// over-charged. Only the price preview uses this; a logged execution is never
-// priced per image, because the host reports tokens and not real image counts.
-func imageCountFor(declared bool, count int64) (int64, error) {
-	if !declared {
-		return 1, nil
-	}
-	if count < 1 || count > maxImageCount {
-		return 0, fmt.Errorf("%w: requested image count %d is outside the supported 1..%d range",
-			ErrInvalid, count, maxImageCount)
-	}
-	return count, nil
-}
 
 // normalizeServiceTier maps upstream service_tier spellings onto the canonical
 // tier key used by service price tiers. The common default spellings collapse
@@ -323,9 +305,8 @@ func overlayRates(base, overlay Rates) Rates {
 	return out
 }
 
-// perImageCost prices a frozen image count once, with overflow protection. The
-// count is validated, never clamped: an unsupported count is an error so it can
-// not be silently billed as a different number.
+// perImageCost computes a hypothetical image-price preview with overflow
+// protection. It is never used to price execution logs.
 func perImageCost(price Price, imageCount int64) (int64, error) {
 	if price.PerImageMicroUSD < 0 {
 		return 0, fmt.Errorf("%w: negative per-image price", ErrInvalid)
@@ -439,21 +420,6 @@ func scanPrice(scan func(...any) error) (Price, error) {
 	if reasoning.Valid {
 		v := reasoning.Int64
 		p.Rates.Reasoning = &v
-	}
-	return p, nil
-}
-
-// lookupPrice loads the exact requested-model price. Absence is reported as
-// ErrUnpriced so the caller can fall through to the pricing rules, and never as
-// an implicit zero price.
-func lookupPrice(ctx context.Context, q querier, model string) (Price, error) {
-	row := q.QueryRowContext(ctx, `SELECT `+priceColumns+` FROM prices WHERE model = ?`, model)
-	p, err := scanPrice(row.Scan)
-	if errors.Is(err, sql.ErrNoRows) {
-		return Price{}, ErrUnpriced
-	}
-	if err != nil {
-		return Price{}, err
 	}
 	return p, nil
 }

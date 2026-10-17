@@ -78,9 +78,9 @@ const (
 // the ledger uses. It is executed exactly once, inside one transaction, on a
 // ledger that is provably empty, and never re-applied or repaired afterwards.
 //
-// No table stores a price, an amount or an adjustment. Every monetary number
-// this package reports is derived at read time from the price book and the
-// recorded executions, so a price edit retroactively changes history.
+// Price and display-budget configuration is persisted, but execution amounts,
+// request price snapshots and manual adjustments are not. Reported costs are
+// derived at read time, so a price edit reprices retained execution history.
 const schemaDDL = `
 CREATE TABLE keys (
   id TEXT PRIMARY KEY,
