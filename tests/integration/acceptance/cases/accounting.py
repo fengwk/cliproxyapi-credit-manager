@@ -1,10 +1,14 @@
-"""Billing semantics: exact cost, canonical buckets, free prices and unpriced denial."""
+"""Billing semantics: exact cost, canonical buckets, free prices and unpriced denial.
+
+Charges are actual-used only: a settled request bills exactly the usage the
+upstream reported and never carries an estimate or a hold.
+"""
 
 from __future__ import annotations
 
 import json
 
-from ..report import check, check_eq
+from ..report import check, check_eq, check_no_holds
 
 CASES = []
 
@@ -52,7 +56,7 @@ def exact_cost(ctx):
     check(request is not None, "request settled within timeout")
     check_eq(request["state"], "settled", "request state")
     check_eq(request["outcome"], "succeeded", "request outcome")
-    check_eq(request["held_micro_usd"], 0, "hold released on settle")
+    check_no_holds(request, "settled request")
     executions = request["executions"]
     check_eq(len(executions), 1, "execution count")
     ex = executions[0]
@@ -69,7 +73,7 @@ def exact_cost(ctx):
 
     row = _find_key(ctx.manager, item["id"])
     check_eq(row["spent_micro_usd"], 14, "key spent ledger")
-    check_eq(row["held_micro_usd"], 0, "key hold released")
+    check_no_holds(row, "key row")
     return {"request_id": request["id"], "trace_id": request["trace_id"], "execution": ex,
             "key_spent": row["spent_micro_usd"]}
 
@@ -84,11 +88,12 @@ def same_key_ledger(ctx):
     row = ctx.wait_until(lambda: (r := _find_key(ctx.manager, item["id"])) and (r if r["spent_micro_usd"] == 28 else None))
     check(row is not None, "key spent reached 28")
     check_eq(row["spent_micro_usd"], 28, "accumulated key spent")
-    check_eq(row["held_micro_usd"], 0, "no dangling hold")
+    check_no_holds(row, "key row")
     report = ctx.usage_rows(key_id=item["id"])
     check_eq(report["summary"]["requests"], 2, "two settled requests")
     check_eq(report["summary"]["cost_micro_usd"], 28, "summary cost")
     check_eq(report["summary"]["executions"], 2, "two executions")
+    check_no_holds(report["summary"], "usage summary")
     return {"key_spent": row["spent_micro_usd"], "summary": report["summary"]}
 
 
@@ -101,6 +106,7 @@ def free_price(ctx):
     check(request is not None, "free request still settles")
     check_eq(request["outcome"], "succeeded", "outcome")
     check_eq(request["executions"][0]["cost_micro_usd"], 0, "free cost")
+    check_no_holds(request, "free request")
     row = _find_key(ctx.manager, item["id"])
     check_eq(row["spent_micro_usd"], 0, "free key spent")
     return {"cost": request["executions"][0]["cost_micro_usd"]}
@@ -127,36 +133,36 @@ def unpriced_denied(ctx):
     return {"denied_status": denied.status, "upstream_calls": ctx.mock.count("/chat/completions")}
 
 
-@case("billing.real_reserved_label_credential_is_billed",
-      "a real CPA usage whose upstream account label is the reserved word 'warmup' is billed exactly 14 microUSD, never exempted")
-def reserved_label_still_billed(ctx):
+@case("billing.upstream_label_never_exempts",
+      "a real CPA usage whose upstream account label is the literal 'warmup' is billed exactly 14 microUSD, never exempted")
+def upstream_label_never_exempts(ctx):
     # CPA resolves a usage record's Source from the upstream account, project,
-    # email or api-key label -- it is not a trusted execution origin. Configuring
-    # the real upstream credential as "warmup" therefore reproduces a customer
-    # whose Source collides with a reserved word: the plugin must bill it like
-    # any other customer and never treat the label as a billing exemption.
+    # email or api-key label -- it is not a trusted execution origin and no label
+    # can exempt a customer. Configuring the real upstream credential as the
+    # string "warmup" therefore reproduces a customer whose Source collides with
+    # a former internal name: the plugin must bill it like any other customer.
     original_keys = ctx.openai_upstream_keys
     try:
         ctx.openai_upstream_keys = ["warmup"]
-        ctx.recreate_host("billing-reserved-label")
+        ctx.recreate_host("billing-upstream-label")
         ctx.set_price("synthetic-chat")
-        item, key = ctx.new_key(label="billing-reserved-label")
+        item, key = ctx.new_key(label="billing-upstream-label")
         response = ctx.client.chat(key, "synthetic-chat")
         check_eq(response.status, 200, "client completion status")
 
         calls = ctx.mock.calls_for("/chat/completions")
         check_eq(len(calls), 1, "upstream call count")
         check_eq(calls[0]["upstream_key"], "warmup",
-                 "upstream credential carries the reserved-word label")
+                 "upstream credential carries the literal label")
 
         request = _settled(ctx, item["id"])
         check(request is not None, "request settled within timeout")
         check_eq(request["state"], "settled", "request state")
-        check_eq(request["held_micro_usd"], 0, "hold released on settle")
+        check_no_holds(request, "settled request")
         check_eq(request["executions"][0]["cost_micro_usd"], 14, "execution cost microUSD")
         row = _find_key(ctx.manager, item["id"])
         check_eq(row["spent_micro_usd"], 14, "key spent ledger")
-        check_eq(row["held_micro_usd"], 0, "key hold released")
+        check_no_holds(row, "key row")
         check_eq(ctx.manager.health().json()["status"], "ok", "health stays ok")
         return {"upstream_key": calls[0]["upstream_key"], "key_spent": row["spent_micro_usd"],
                 "execution_cost": request["executions"][0]["cost_micro_usd"]}

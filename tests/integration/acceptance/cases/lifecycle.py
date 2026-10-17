@@ -1,4 +1,8 @@
-"""Lifecycle: unknown usage, client cancel, and durable balance across restart."""
+"""Lifecycle: unknown usage, client cancel, and durable balance across restart.
+
+Post-usage accounting: a request with no reliable usage stays ``pending`` with
+no money held, and that unresolved work never blocks a later admission.
+"""
 
 from __future__ import annotations
 
@@ -10,7 +14,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from ..mock import Script
-from ..report import check, check_eq
+from ..report import check, check_eq, check_no_holds
 
 CASES = []
 
@@ -32,13 +36,8 @@ def _spent(ctx, key_id):
     return row["spent_micro_usd"] if row else None
 
 
-def _held(ctx, key_id):
-    row = _key(ctx, key_id)
-    return row["held_micro_usd"] if row else None
-
-
 @case("lifecycle.unknown_usage_stays_pending",
-      "a completion without usage never settles as a free success; the hold is retained")
+      "a completion without usage never settles as a free success; it stays pending with no hold and blocks no later admission")
 def unknown_usage(ctx):
     ctx.set_price("synthetic-chat")
     item, key = ctx.new_key(label="lifecycle-unknown")
@@ -53,16 +52,25 @@ def unknown_usage(ctx):
     request = ctx.find_request(key_id=item["id"])
     check(request["state"] != "settled", f"unknown usage must not settle: {request['state']}")
     check_eq(request["outcome"], "succeeded", "outcome is succeeded but accounting is unknown")
-    check(request["held_micro_usd"] > 0, "hold retained for unknown usage")
+    check_no_holds(request, "unknown-usage request")
     check_eq(_spent(ctx, item["id"]), 0, "unknown usage is not billed as zero")
     report = ctx.usage_rows(key_id=item["id"])
     check(report["summary"]["pending"] >= 1, f"pending surfaced in report: {report['summary']}")
     check_eq(report["summary"]["complete_executions"], 0, "no complete execution recorded")
-    return {"state": request["state"], "held": request["held_micro_usd"], "spent": _spent(ctx, item["id"])}
+    check_no_holds(report["summary"], "usage summary")
+    check_no_holds(_key(ctx, item["id"]), "key row with unresolved work")
+
+    # No backlog gate: the unresolved request must not block the next admission.
+    ctx.mock.default_script = Script()
+    check_eq(ctx.client.chat(key, "synthetic-chat").status, 200,
+             "an unresolved request does not block a later admission")
+    check(ctx.wait_until(lambda: _spent(ctx, item["id"]) == 14), "the later request still settles")
+    return {"state": request["state"], "spent": _spent(ctx, item["id"]),
+            "upstream_calls": ctx.mock.count("/chat/completions")}
 
 
 @case("lifecycle.client_cancel_pending",
-      "an aborted client request does not hang or free the hold; the request stays pending")
+      "an aborted client request does not hang or fabricate a charge; the request stays pending with no hold")
 def client_cancel(ctx):
     ctx.set_price("synthetic-chat")
     item, key = ctx.new_key(label="lifecycle-cancel")
@@ -91,10 +99,10 @@ def client_cancel(ctx):
     time.sleep(0.8)
     request = ctx.find_request(key_id=item["id"])
     check(request["state"] != "settled", f"cancelled request must not settle free: {request['state']}")
-    check(request["held_micro_usd"] > 0, "hold retained after cancel (nothing written off)")
+    check_no_holds(request, "cancelled request")
     check_eq(_spent(ctx, item["id"]), 0, "cancel does not bill")
     return {"elapsed_s": round(elapsed, 3), "state": request["state"],
-            "held": request["held_micro_usd"], "upstream_calls": ctx.mock.count("/chat/completions")}
+            "upstream_calls": ctx.mock.count("/chat/completions")}
 
 
 @case("lifecycle.restart_retains_balance",
@@ -123,6 +131,7 @@ def restart_retains(ctx):
     pending_after = next((row for row in report_after["items"] if row["id"] == pending_id), None)
     check(pending_after is not None, "unfinished request row survives restart")
     check(pending_after["state"] != "settled", f"unfinished work stays pending, not free: {pending_after['state']}")
-    check(pending_after["held_micro_usd"] > 0, "pending hold retained across restart")
+    check_no_holds(pending_after, "pending request after restart")
+    check_no_holds(_key(ctx, item["id"]), "key row after restart")
     return {"spent_after": _spent(ctx, item["id"]), "pending_state": pending_after["state"],
-            "pending_held": pending_after["held_micro_usd"]}
+            "upstream_calls": ctx.mock.count("/chat/completions")}

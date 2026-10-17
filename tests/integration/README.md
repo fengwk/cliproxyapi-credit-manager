@@ -5,6 +5,20 @@ native plugin. It launches a **real** CLIProxyAPI 8.0.30 host, loads the **real*
 plugin shared library, and drives it over HTTP against a **loopback** upstream
 mock.
 
+## Accounting architecture pinned here
+
+Admission is a *correlation* step, not a reservation: the plugin authenticates
+the client key, resolves the requested model's frozen price, checks key
+permissions, actual-used monetary/token quotas and the explicitly configured key
+concurrency, then persists the request/key/trace association before execution.
+There is **no** estimate, hold or in-flight token sum, so a key/request/report
+never carries `held_micro_usd`/`initial_hold_micro_usd`/`token_estimate`, and
+quotas are soft limits on actual used amounts (`used >= limit` rejects the *next*
+request). Actual usage is always charged in full, even past a quota. Unknown or
+missing usage stays visibly pending without freezing money, and no independent
+backlog gate (`max_pending_requests`) blocks later admissions. The plugin runs no
+background work and declares no host model-execution callback.
+
 ## Safety and isolation
 
 - Everything is synthetic. The harness never reads real profiles, `auths/`,
@@ -107,24 +121,25 @@ Each case's host lives at `<artifacts>/host-<n>-<case>/` with `config.yaml`,
 
 | Module | Coverage |
 | --- | --- |
-| `abi` | Direct `.so` probe via ctypes: ABI 1 / RPC schema 6 negotiation, passive-only capabilities (no executor/router/scheduler), older-schema host rejected. |
+| `abi` | Direct `.so` probe via ctypes: ABI 1 / RPC schema 6 negotiation, passive-only capabilities (no executor/router/scheduler), no host model-execution callback bridge at any lifecycle point, older-schema host rejected. |
 | `core` | Host lists the plugin (enabled, bare numeric metadata version, published menu); health (build-identity diagnostic version carrying the commit); management auth gate (401 without/with wrong key). |
-| `accounting` | Exact cost (input 10 / output 4 / total 14 = 14 microUSD), canonical buckets, complete quality, distinct execution id, same-key ledger, all-zero price is free, unpriced model denied with no upstream call and no poisoning of other keys. |
+| `accounting` | Exact cost (input 10 / output 4 / total 14 = 14 microUSD), canonical buckets, complete quality, distinct execution id, same-key ledger, all-zero price is free, unpriced model denied with no upstream call and no poisoning of other keys, a real usage whose upstream account label is the literal `warmup` is still billed in full. No settled request or key row exposes a hold/estimate field. |
+| `admission` | Soft post-usage limits: with 1 microUSD of quota left a large declared `max_tokens`/body is admitted and billed by actual usage; actual charges overrun a quota in full and only the next request is denied; four simultaneous same-key requests are all admitted with no estimated hold; 20 unresolved unknown-usage requests stay pending without blocking the same or another key; every admitted request keeps one unique execution and the ledger equals the exact sum of actual usage. |
 | `auth` | Five credential locations, invalid/absent denial with no upstream call, invalid Bearer + valid Google fallback, first-candidate-wins on conflict, original CPA key rejected while exclusive, custom (non `sk-`) prefix key. Deployment fail-closed: a plugin-managed key is accepted at all five locations while the plugin is loaded, and with `plugins.enabled: false` (library not loaded) all five are denied with no upstream call while the plugin instance stays unregistered. |
 | `capture` | Disabled vs unavailable vs captured states, lazy fetch, header + JSON redaction, 64-bit integer fidelity, adjustable body limit (oversize skipped). |
 | `report` | `from/to/key_id/model/result/search/page/page_size/bucket` filters, pagination, trend sums equal the summary, full-UUID trace ids searchable. |
 | `resources` | Public static assets are embedded and credential-free; resource paths cannot reach administrative APIs. |
 | `lookup` | Explicit customer Bearer, own-key-only reports, foreign/unknown snapshot 404 equivalence, natural-month trends and exact amounts. |
 | `namespace` | Request model vs execution/response model are kept distinct for an aliased model; billing uses the requested model's price. |
-| `lifecycle` | Unknown usage stays pending (never free); client cancel does not hang and keeps the hold; restart retains the settled balance and keeps unfinished work pending. |
-| `retry` | A 429 on the first upstream credential fails over, one client request, two independent per-attempt usage rows (failed-unknown not written off), hold retained; all-failures never bill as free. |
-| `warmup` | Background warmup: default-off issues no background activity; enabled issues a *real* pinned host model execution (upstream 1, host log shows credential selection with no client scope) that creates no customer ledger row/hold/charge; an unknown `AuthID` fails with no host-side fallback; with a single bound credential a customer request runs alongside the worker on the *exact same AuthID* and is billed; a forged warmup session header is still billed in full; reconfiguring to disabled leaves no residual worker. |
+| `lifecycle` | Unknown usage stays pending (never free) with no hold, and it does not block the next admission; client cancel does not hang or fabricate a charge; restart retains the settled balance and keeps unfinished work pending. |
+| `retry` | A 429 on the first upstream credential fails over, one client request, two independent per-attempt usage rows (failed-unknown not written off); all-failures never bill as free. |
+| `passive` | No background execution: no upstream activity or credential selection without a client request. Retired settings are a config error, not a silent no-op: a hot-reload of `warmup`/`max_pending_requests` is refused and the plugin keeps serving, and a deployment configured with `warmup` refuses registration with the error in the host log and executes nothing. |
 | `affinity` | Native CPA session-affinity scheduling (`routing.session-affinity: true`, default round-robin, two synthetic credentials): an explicit `X-Session-ID` shared by three requests with different user content, and a grown conversation prefix (system+user stable, assistant+user appended) with **no** session header, each keep every request on one credential (identical `AuthID` and upstream key) and bill 3 x 14 = 42. Unrelated requests without a session do alternate the two credentials, so the binding is not a default. A third case binds an explicit session, then reassigns the key's caller and rotates the key material, and asserts the same session stays on the same `AuthID`/upstream key. |
 | `gemini` | Native `generateContent` and `streamGenerateContent` (`alt=sse`) authenticate, forward the upstream Google key and bill. |
 | `browser` | Real isolated Chromium: per-tab session login, optional remembered reload, logout clearing storage/charts, real ECharts/month query, lazy capture-body modal with redaction/64-bit fidelity, customer own-key snapshot lookup, the default overview tab's real ECharts aggregate, an advanced rule saved through the DOM with a lossless 2^53+1 rate, and customer model-data isolation. |
 | `management` | Every declared management route denies a missing and a wrong credential without leaking data; the read routes succeed with the management secret. |
-| `keyops` | Caller attribution metadata (server principal/scope/fingerprint, stable across reads; a disabled caller never disables its key) and reveal/rotate/soft-delete keeping the ledger, history and an unfinished hold, with a retained pending request still settling. |
-| `reset` | `reset-spend` re-opens the quota baseline only: it keeps the lifetime ledger, the request history and an in-flight hold (which still settles). |
+| `keyops` | Caller attribution metadata (server principal/scope/fingerprint, stable across reads; a disabled caller never disables its key) and reveal/rotate/soft-delete keeping the ledger, history and an unresolved request, with a retained pending request still settling. |
+| `reset` | `reset-spend` re-opens the quota baseline only: it keeps the lifetime ledger and the request history, and a retained pending request still settles. |
 | `audit` | Key, pricing-rule and resolve operations are all audited (newest first, with identifiers/reasons/details) and never contain a plaintext key. |
 | `pricing` | Nested rate sheets keep exact signed 64-bit values (2^53+1, int64 max) across save/reload without touching the ledger; rule context/service tiers resolve exactly; a native chat bills `per_image` by the requested count while an out-of-range count (100) is denied before any upstream call. |
 | `reference` | `/api/model-catalog` and `/api/exchange-rate` are management-gated and, with host egress pinned to a closed loopback port, answer the safe `unavailable` envelope instead of live prices. |
@@ -151,3 +166,15 @@ Each case's host lives at `<artifacts>/host-<n>-<case>/` with `config.yaml`,
   the public internet from a run (the `reference` module asserts the safe
   `unavailable` envelope); loopback traffic is exempted, so the upstream mock
   and the harness are unaffected.
+
+## Harness checks without a host
+
+`test_browser_runtime.py` and `test_harness_inventory.py` are plain `unittest`
+modules (standard library only) that need neither the plugin library nor a CPA
+host; they are picked up by `make static`
+(`python3 -m unittest discover -s tests/integration -p 'test_*.py'`). The
+inventory module keeps `DEFAULT_MODULES` and `acceptance/cases/*.py` in sync,
+proves every module declares at least one case, and forbids the case files from
+reading a retired estimate/hold field again. A requested module that does not
+exist (for example the removed `warmup`) fails the run with exit code 2 instead
+of being skipped.

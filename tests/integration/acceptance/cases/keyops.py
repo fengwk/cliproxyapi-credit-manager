@@ -2,14 +2,15 @@
 
 Covers the aligned caller metadata contract and the key operations that must
 never rewrite history: reveal, rotate and soft delete all keep the ledger, the
-usage history and an unfinished hold intact, while admission is governed by the
-key itself -- disabling a caller's attribution metadata must not disable its key.
+usage history and an unresolved request intact, while admission is governed by
+the key itself -- disabling a caller's attribution metadata must not disable its
+key.
 """
 
 from __future__ import annotations
 
 from ..mock import Script
-from ..report import check, check_eq
+from ..report import check, check_eq, check_no_holds
 
 CASES = []
 
@@ -82,7 +83,7 @@ def caller_metadata(ctx):
 
 
 @case("keyops.reveal_rotate_delete_preserve_history_and_pending",
-      "reveal/rotate/soft-delete keep the ledger, the request history and an unfinished hold, and the pending request still settles")
+      "reveal/rotate/soft-delete keep the ledger, the request history and an unresolved request, and the pending request still settles")
 def reveal_rotate_delete(ctx):
     item, key = _create_key(ctx, label="keyops-lifecycle")
     key_id = item["id"]
@@ -103,15 +104,13 @@ def reveal_rotate_delete(ctx):
     check_eq(_chat(ctx, new_key).status, 200, "the rotated plaintext is accepted")
     check(_settled(ctx, key_id, 28) is not None, "rotation preserves the ledger")
 
-    # Open an unfinished request: it holds budget and must survive every later
-    # key operation.
+    # Open an unresolved request: it must survive every later key operation.
     ctx.mock.default_script = Script(omit_usage=True)
     check_eq(_chat(ctx, new_key).status, 200, "pending request accepted")
     ctx.mock.default_script = Script()
     pending = ctx.wait_until(lambda: _pending_request(ctx, key_id), timeout=15)
     check(pending is not None, "a pending request exists before delete")
-    held_before = pending["held_micro_usd"]
-    check(held_before > 0, "pending request holds budget")
+    check_no_holds(pending, "pending request before delete")
 
     deleted = ctx.manager.delete_key(key_id, "synthetic decommission")
     check_eq(deleted.status, 200, f"soft delete {deleted.text[:120]}")
@@ -122,6 +121,7 @@ def reveal_rotate_delete(ctx):
     check(row.get("deleted_at"), "soft delete stamps deleted_at")
     check_eq(row["spec"]["enabled"], False, "soft delete disables the key")
     check_eq(row["spent_micro_usd"], 28, "soft delete keeps the ledger")
+    check_no_holds(row, "soft-deleted key row")
     check_eq(_chat(ctx, new_key).status, 401, "a soft-deleted key is denied")
     check_eq(ctx.manager.reveal(key_id).status, 409, "a soft-deleted key cannot be revealed")
     after = ctx.manager.delete_key(key_id, "synthetic decommission")
@@ -133,7 +133,7 @@ def reveal_rotate_delete(ctx):
     pending_after = next((r for r in report["items"] if r["id"] == pending["id"]), None)
     check(pending_after is not None, "the pending request row survives soft delete")
     check(pending_after["state"] != "settled", "soft delete never writes off a pending request")
-    check(pending_after["held_micro_usd"] > 0, "the hold survives soft delete")
+    check_no_holds(pending_after, "pending request after soft delete")
 
     # The retained pending request can still be resolved after the key is gone.
     resolved = ctx.manager.resolve(pending["id"], "release", reason="retained pending settles")
@@ -142,7 +142,7 @@ def reveal_rotate_delete(ctx):
     check(settled is not None and settled["state"] == "settled", f"retained pending settles: {settled and settled['state']}")
     check_eq(_key(ctx, key_id)["spent_micro_usd"], 28, "release does not invent a charge")
     return {"revealed": revealed.status, "rotated": rotated.status, "deleted": deleted.status,
-            "pending_held": held_before, "final_spent": _key(ctx, key_id)["spent_micro_usd"]}
+            "final_spent": _key(ctx, key_id)["spent_micro_usd"]}
 
 
 def _pending_request(ctx, key_id):
