@@ -60,7 +60,7 @@ const KEYS = [
     id: 'key-1',
     principal: 'cmk:11111111-1111-1111-1111-111111111111',
     scope: 'scope-1',
-    fingerprint: 'fp-abcd1234',
+    fingerprint: '1daf934d4c6a6818',
     spec: {
       label: '生产主力',
       enabled: true,
@@ -85,7 +85,7 @@ const KEYS = [
     id: 'key-2',
     principal: 'cmk:22222222-2222-2222-2222-222222222222',
     scope: 'scope-2',
-    fingerprint: 'fp-efgh5678',
+    fingerprint: '213fdfea5995202e',
     spec: {
       label: '内部试用',
       enabled: false,
@@ -994,10 +994,16 @@ async function handle(req, res) {
     }
     if (endpoint === '/api/callers' && req.method === 'POST') {
       const body = await readBody(req);
+      recorded.last['callers:create'] = { body };
       const parsed = JSON.parse(body || '{}');
+      const name = String(parsed.display_name || '').trim();
+      if (!name) {
+        json(res, 400, { error: 'invalid argument: caller display name is required' });
+        return;
+      }
       const caller = {
-        id: parsed.id || 'caller-' + (CALLERS.length + 1),
-        display_name: parsed.display_name || '',
+        id: (parsed.id && String(parsed.id).trim()) || 'caller-' + (CALLERS.length + 1),
+        display_name: name,
         enabled: parsed.enabled !== false,
         created_at: new Date().toISOString(),
       };
@@ -1007,10 +1013,21 @@ async function handle(req, res) {
     }
     if (endpoint === '/api/callers' && req.method === 'PUT') {
       const body = await readBody(req);
+      recorded.last['callers:update'] = { body };
       const parsed = JSON.parse(body || '{}');
-      const caller = CALLERS.find((c) => c.id === parsed.id);
+      const id = String(parsed.id || '').trim();
+      if (!id) {
+        json(res, 400, { error: 'invalid argument: caller id is required' });
+        return;
+      }
+      const name = String(parsed.display_name || '').trim();
+      if (!name) {
+        json(res, 400, { error: 'invalid argument: caller display name is required' });
+        return;
+      }
+      const caller = CALLERS.find((c) => c.id === id);
       if (caller) {
-        if (parsed.display_name !== undefined) caller.display_name = parsed.display_name;
+        caller.display_name = name;
         if (parsed.enabled !== undefined) caller.enabled = parsed.enabled;
       }
       json(res, 200, { item: caller || parsed });
