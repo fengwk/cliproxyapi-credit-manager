@@ -627,6 +627,41 @@ test('computeModelRankings 支持 BigInt 精度、单次成本完整性判定与
   assert.equal(tpsItem.display, '3,000 tokens/s (累计吞吐)');
 });
 
+test('数值 0 小计的全未定价区间不画成免费，混合 0 仍是已定价小计', () => {
+  // 真实契约：cost_micro_usd 是 int64，全未定价时为 0；必须用执行数/未定价数判断。
+  const points = [
+    { time: '2026-01-02T03:00:00Z', requests: 1, executions: 1, cost_micro_usd: 0, unpriced_executions: 1, tokens: {} },
+    { time: '2026-01-02T04:00:00Z', requests: 2, executions: 2, cost_micro_usd: 0, unpriced_executions: 1, tokens: {} },
+    { time: '2026-01-02T05:00:00Z', requests: 2, executions: 2, cost_micro_usd: 0, unpriced_executions: 0, tokens: {} },
+  ];
+  const model = CMCharts.buildChartOptions(points, { bucket: 'hour', currency: 'USD' });
+  assert.deepEqual(model.cost.series[0].data, [null, 0, 0]);
+  const allUnpricedTooltip = model.cost.tooltip.formatter([{ dataIndex: 0 }]);
+  assert.match(allUnpricedTooltip, /未定价（不是免费）/);
+  const mixedTooltip = model.cost.tooltip.formatter([{ dataIndex: 1 }]);
+  assert.match(mixedTooltip, /已定价费用小计：0 USD/);
+  assert.match(mixedTooltip, /未定价执行：1 条/);
+});
+
+test('效率榜按执行数判定全未定价，不把数值 0 当免费', () => {
+  const models = [
+    { model: 'all-unpriced', requests: 2, executions: 2, complete_executions: 2, pending: 0,
+      cost_micro_usd: 0, unpriced_executions: 2, tokens: { total: 100 } },
+    { model: 'mixed-zero', requests: 2, executions: 2, complete_executions: 2, pending: 0,
+      cost_micro_usd: 0, unpriced_executions: 1, tokens: { total: 100 } },
+    { model: 'free', requests: 1, executions: 1, complete_executions: 1, pending: 0,
+      cost_micro_usd: 0, unpriced_executions: 0, tokens: { total: 100 } },
+  ];
+  const ranked = CMCharts.computeModelRankings(models, 'value');
+  const allUnpriced = ranked.find((m) => m.model === 'all-unpriced');
+  assert.equal(allUnpriced.display, '—（未定价）');
+  assert.equal(allUnpriced.costMicroText, '');
+  const mixed = ranked.find((m) => m.model === 'mixed-zero');
+  assert.equal(mixed.display, '—（含未定价执行）');
+  assert.equal(mixed.costMicroText, '0');
+  assert.equal(ranked.find((m) => m.model === 'free').display, '∞ (免费)');
+});
+
 test('效率榜不将未知用量当作免费，按客户端请求数计算平均成本', () => {
   const models = [
     { model: 'unknown', requests: 1, executions: 1, complete_executions: 0, pending: 0, cost_micro_usd: 0, tokens: { total: 100 } },

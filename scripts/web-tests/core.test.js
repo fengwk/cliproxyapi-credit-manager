@@ -361,8 +361,8 @@ test('结果/状态/质量标签与语气与契约枚举一致', () => {
   assert.deepEqual(CM.credentialStatus('weird'), { label: 'weird', tone: '' });
 });
 
-test('只有 pending 状态的请求才提供人工 Resolve 入口', () => {
-  // 后端 Resolve 只接受 state=pending：active 仍在执行并占用并发槽位，必须拒绝处理入口。
+test('isPendingRequest 仅用于判定用量生命周期状态', () => {
+  // pending 只表示用量待完整，不存在人工处理入口；active 仍在执行并占用并发槽位。
   assert.equal(CM.isPendingRequest({ state: 'pending', executions: [] }), true);
   assert.equal(CM.isPendingRequest({ state: 'PENDING' }), true);
   assert.equal(CM.isPendingRequest({ state: 'active', executions: [] }), false);
@@ -417,12 +417,13 @@ test('汇总卡片区分失败请求、用量待完整、已定价小计与未�
 
 test('全部未定价时金额卡片显示未定价而不是 0；显式免费 0 仍保留', () => {
   const unpriced = CM.parseJSON(
-    '{"requests":1,"executions":1,"failed":0,"pending":0,"cost_micro_usd":null,"unpriced_executions":1,"tokens":{},"complete_executions":1}'
+    '{"requests":1,"executions":1,"failed":0,"pending":0,"cost_micro_usd":0,"unpriced_executions":1,"tokens":{},"complete_executions":1}'
   );
   const cards = CM.usageSummaryCards(unpriced, {});
   const cost = cards.find((card) => card.label === '已定价费用小计');
   assert.equal(cost.value, '未定价');
-  assert.ok(cost.sub.includes('未定价不是免费'));
+  assert.ok(cost.sub.includes('1 条执行均未定价'));
+  assert.ok(cost.sub.includes('不是免费'));
   assert.equal(cost.tone, 'warn');
 
   const free = CM.parseJSON(
@@ -431,6 +432,31 @@ test('全部未定价时金额卡片显示未定价而不是 0；显式免费 0 
   const freeCost = CM.usageSummaryCards(free, {}).find((card) => card.label === '已定价费用小计');
   assert.equal(freeCost.value, '0 USD');
   assert.equal(freeCost.tone, '');
+});
+
+test('数值 0 小计按执行数/未定价数区分全未定价与显式免费', () => {
+  // 真实契约：cost_micro_usd 是 int64 小计，全未定价时也是 0（不是 null）。
+  const allUnpriced = CM.parseJSON(
+    '{"requests":2,"executions":2,"failed":0,"pending":0,"cost_micro_usd":0,"unpriced_executions":2,"tokens":{},"complete_executions":2}'
+  );
+  const unpricedCard = CM.usageSummaryCards(allUnpriced, {}).find((card) => card.label === '已定价费用小计');
+  assert.equal(unpricedCard.value, '未定价');
+  assert.ok(unpricedCard.sub.includes('2 条执行均未定价'));
+  assert.ok(unpricedCard.sub.includes('不是免费'));
+
+  const mixedZero = CM.parseJSON(
+    '{"requests":2,"executions":2,"failed":0,"pending":0,"cost_micro_usd":0,"unpriced_executions":1,"tokens":{},"complete_executions":2}'
+  );
+  const mixedCard = CM.usageSummaryCards(mixedZero, {}).find((card) => card.label === '已定价费用小计');
+  assert.equal(mixedCard.value, '0 USD');
+  assert.ok(mixedCard.sub.includes('另有 1 条未定价执行'));
+
+  const explicitlyFree = CM.parseJSON(
+    '{"requests":2,"executions":2,"failed":0,"pending":0,"cost_micro_usd":0,"unpriced_executions":0,"tokens":{},"complete_executions":2}'
+  );
+  const freeCard = CM.usageSummaryCards(explicitlyFree, {}).find((card) => card.label === '已定价费用小计');
+  assert.equal(freeCard.value, '0 USD');
+  assert.equal(freeCard.sub.includes('未定价'), false);
 });
 
 test('provider/auth 过滤只作用于执行维度并如实标注', () => {

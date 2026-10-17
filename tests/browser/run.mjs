@@ -303,6 +303,24 @@ async function main() {
     check('概览模型占比卡片存在', await cdp.evaluate("!!document.querySelector('#overview-model-share')"));
     check('概览模型效率排行卡片存在', await cdp.evaluate("!!document.querySelector('#overview-model-rank')"));
     check('概览不显示后端未支持的来源筛选', await cdp.evaluate("document.querySelector('#overview-source') === null"));
+    await cdp.click('#model-share-metric button[data-metric="cost"]');
+    await sleep(100);
+    const shareLegend = await cdp.text('#overview-model-share-legend');
+    check(
+      '概览费用占比排除全未定价模型并说明不是免费',
+      shareLegend.includes('gpt-5') && shareLegend.includes('未定价') && shareLegend.includes('未计入费用分布') &&
+        !shareLegend.includes('gpt-5 0%'),
+      shareLegend.replace(/\n/g, ' ').slice(0, 260)
+    );
+    check('概览费用占比保留混合 0 小计并标注未定价条数', shareLegend.includes('mixed-zero') && shareLegend.includes('另有 1 条未定价'), shareLegend.replace(/\n/g, ' ').slice(0, 260));
+    const unpricedRankRow = await cdp.evaluate("(() => { const row = [...document.querySelectorAll('#overview-model-rank .model-rank-item')].find((n) => n.innerText.includes('gpt-5')); return row ? row.innerText.replace(/\\n/g, ' ') : ''; })()");
+    check('概览效率榜把全未定价模型显示为未定价而不是 0/∞', unpricedRankRow.includes('未定价') && !unpricedRankRow.includes('∞'), unpricedRankRow);
+    const mixedZeroRankRow = await cdp.evaluate("(() => { const row = [...document.querySelectorAll('#overview-model-rank .model-rank-item')].find((n) => n.innerText.includes('mixed-zero')); return row ? row.innerText.replace(/\\n/g, ' ') : ''; })()");
+    check('概览效率榜混合 0 小计明确仍有未定价执行', mixedZeroRankRow.includes('0 USD') && mixedZeroRankRow.includes('1 条未定价'), mixedZeroRankRow);
+    await cdp.evaluate("document.getElementById('overview-share-title').scrollIntoView({block: 'start'})");
+    await cdp.screenshot('02b-overview-cost-share.png');
+    await cdp.evaluate("window.scrollTo(0, 0)");
+    await cdp.click('#model-share-metric button[data-metric="requests"]');
     check('概览 Token 趋势使用真实嵌套桶而非空折线', await cdp.evaluate(
       "echarts.getInstanceByDom(document.getElementById('overview-token-chart')).getOption().series.some(s => s.data.some(v => Number(v) > 0))"
     ));
@@ -561,6 +579,22 @@ async function main() {
 
     await cdp.click('#usage-reset');
     await cdp.waitFor("document.querySelectorAll('#usage-items .row-title').length > 0", 10000, '重置后恢复');
+
+    // 真实契约：全未定价时 cost_micro_usd=0；不能仅凭 0 显示免费。
+    await cdp.setValue('#usage-model', '__unpriced__');
+    await cdp.click('#usage-apply');
+    await cdp.waitFor("document.querySelector('#usage-summary').innerText.includes('均未定价')", 10000, '全未定价汇总');
+    const allUnpricedCost = await cdp.evaluate("(() => { const card = [...document.querySelectorAll('#usage-summary .metric')].find((n) => n.innerText.includes('已定价费用小计')); return card ? card.innerText.replace(/\\n/g, ' ') : ''; })()");
+    check('全未定价的数值 0 小计显示未定价而不是 0', allUnpricedCost.includes('未定价') && allUnpricedCost.includes('2 条执行均未定价') && !allUnpricedCost.includes('0 USD'), allUnpricedCost);
+    const allUnpricedChartPoint = await cdp.evaluate("(() => { const inst = window.echarts.getInstanceByDom(document.querySelector('#usage-cost-chart')); return inst ? inst.getOption().series[0].data[0] : 'missing'; })()");
+    check('全未定价的趋势点画为断点而不是 0', allUnpricedChartPoint === null, JSON.stringify(allUnpricedChartPoint));
+    check('空态恢复为真实图表后不残留“暂无数据”覆盖层', !(await cdp.text('#usage-chart')).includes('没有可绘制'));
+    await cdp.evaluate("document.getElementById('usage-cost-chart').scrollIntoView({block: 'center'})");
+    await sleep(500);
+    await cdp.screenshot('03b-usage-all-unpriced.png');
+    await cdp.evaluate("window.scrollTo(0, 0)");
+    await cdp.click('#usage-reset');
+    await cdp.waitFor("document.querySelectorAll('#usage-items .row-title').length > 0", 10000, '全未定价后恢复');
 
     /* --- 4. 请求体快照弹窗 --- */
     await cdp.evaluate("window.__cmFirst = document.querySelectorAll('#usage-items .card')[0]");
@@ -1175,7 +1209,7 @@ async function main() {
     await cdp.click('#tab-health');
     await cdp.waitFor("document.querySelectorAll('#health-cards .metric').length >= 10", 10000, '健康卡片');
     const healthText = await cdp.text('#health-cards');
-    check('状态页展示降级与最近错误', healthText.includes('降级') && healthText.includes('status = degraded') && healthText.includes('mock 财务维护失败'), healthText.replace(/\n/g, ' ').slice(0, 160));
+    check('状态页展示降级与最近错误', healthText.includes('降级') && healthText.includes('status = degraded') && healthText.includes('mock 日志维护失败'), healthText.replace(/\n/g, ' ').slice(0, 160));
     check('状态页展示捕获状态与容量', healthText.includes('已启用') && healthText.includes('50.0 MiB') && healthText.includes('WAL'));
     check('状态页展示保留月数与丢弃计数', healthText.includes('历史保留月数') && healthText.includes('捕获丢弃计数'));
     check('未知字段原样列出', (await cdp.text('#health-extra')).includes('request_capture'));

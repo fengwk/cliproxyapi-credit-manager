@@ -340,6 +340,26 @@
     }));
   }
 
+  // 真实 Summary/ModelMetrics 的 cost 是 int64：全未定价时也是 0。
+  // 只能用执行数/未定价数判断是否全未定价，显式免费 0 与混合小计 0 仍保留。
+  function costBreakdown(cost, executions, unpriced) {
+    var execText = intText(executions || 0);
+    var unpricedText = intText(unpriced || 0);
+    var allUnpriced = false;
+    try {
+      allUnpriced = execText !== '0' && BigInt(unpricedText) >= BigInt(execText);
+    } catch (err) {
+      allUnpriced = false;
+    }
+    var known = cost !== null && cost !== undefined && !allUnpriced;
+    return {
+      known: known,
+      allUnpriced: allUnpriced,
+      hasUnpriced: unpricedText !== '0',
+      costText: known ? formatMoney(cost, state.currency, state.rate) : '未定价',
+    };
+  }
+
   // 执行费用只汇总已定价执行；未定价执行返回 null 与非零计数，绝不当作 0。
   function executionCost(executions) {
     var priced = [];
@@ -708,13 +728,15 @@
     var tokens = summary.tokens || {};
     var stats = el('stats');
     clear(stats);
-    var costKnown = summary.cost_micro_usd !== null && summary.cost_micro_usd !== undefined;
     var unpriced = summary.unpriced_executions || 0;
+    var costState = costBreakdown(summary.cost_micro_usd, summary.executions, unpriced);
+    var costValue = costState.costText +
+      (costState.known && costState.hasUnpriced ? '（另有 ' + formatInt(unpriced) + ' 条未定价）' : '');
     stats.appendChild(card('请求数', formatInt(summary.requests)));
     stats.appendChild(card('执行次数', formatInt(summary.executions)));
     stats.appendChild(card('失败请求', formatInt(summary.failed), summary.failed ? 'danger' : null));
     stats.appendChild(card('执行中/用量待完整请求', formatInt(summary.pending), summary.pending ? 'warn' : null));
-    stats.appendChild(card('已定价费用小计', costKnown ? formatMoney(summary.cost_micro_usd, state.currency, state.rate) : '未定价', costKnown ? null : 'warn'));
+    stats.appendChild(card('已定价费用小计', costValue, costState.known ? null : 'warn'));
     stats.appendChild(card('未定价执行', formatInt(unpriced) + ' 条', unpriced ? 'warn' : null));
     ['input', 'output', 'reasoning', 'cache_read', 'cache_write', 'total'].forEach(function (slot) {
       if (tokens[slot] === undefined && slot !== 'total') return;
@@ -805,11 +827,14 @@
         });
       } else {
         ranked = models.map(function (m) {
+          var costState = costBreakdown(m.cost_micro_usd, m.executions, m.unpriced_executions);
           return {
             model: m.model || 'unknown',
             requestsText: intText(m.requests || 0),
             tokensText: intText(m.tokens ? m.tokens.total : 0),
-            costMicroText: intText(m.cost_micro_usd || 0),
+            // 全未定价不能用数值 0 进入金额展示，必须保留空标记。
+            costMicroText: costState.known ? intText(m.cost_micro_usd || 0) : '',
+            unpricedText: intText(m.unpriced_executions || 0),
             display: '—',
           };
         });
@@ -830,7 +855,9 @@
         nameSpan.textContent = m.model || 'unknown';
         var valSpan = document.createElement('span');
         valSpan.className = 'rank-value mono';
-        valSpan.textContent = formatMoney(m.costMicroText, state.currency, state.rate);
+        valSpan.textContent = m.costMicroText === '' || m.costMicroText === undefined
+          ? '未定价'
+          : formatMoney(m.costMicroText, state.currency, state.rate);
         headEl.appendChild(nameSpan);
         headEl.appendChild(valSpan);
         var metaEl = document.createElement('div');
@@ -841,6 +868,12 @@
         tokSpan.textContent = formatToken(m.tokensText, state.tokenUnit);
         metaEl.appendChild(reqSpan);
         metaEl.appendChild(tokSpan);
+        var unpricedText = intText(m.unpricedText || 0);
+        if (unpricedText !== '0') {
+          var unpricedSpan = document.createElement('span');
+          unpricedSpan.textContent = formatInt(unpricedText) + ' 条未定价（不是免费）';
+          metaEl.appendChild(unpricedSpan);
+        }
 
         var orig = (models || []).find(function (item) { return item.model === m.model; }) || {};
         var measuredOut = intText(orig.measured_output_tokens || 0);
