@@ -103,6 +103,14 @@ function alphaData() {
      "executions":[{"id":"exec-a4","model":"unpriced-model","tokens":{"input":1,"cache_read":0,"cache_write":0,"output":1,"reasoning":0,"total":2},
        "quality":"complete","cost_micro_usd":null,"failed":false,"at":"2026-10-02T13:00:00Z"}]}
   ],
+  "models": [
+    {"model":"m-alpha","requests":1,"executions":2,"failed":0,"pending":0,
+     "cost_micro_usd":0,"unpriced_executions":1,"tokens":{"total":18014398509481986},"complete_executions":2},
+    {"model":"m-unpriced","requests":1,"executions":1,"failed":0,"pending":0,
+     "cost_micro_usd":0,"unpriced_executions":1,"tokens":{"total":2},"complete_executions":1},
+    {"model":"m-free","requests":1,"executions":1,"failed":0,"pending":0,
+     "cost_micro_usd":0,"unpriced_executions":0,"tokens":{"total":2},"complete_executions":1}
+  ],
   "total": 4, "page": 1, "page_size": 10, "retention_from": "2026-07-01T00:00:00Z"
 }`;
 }
@@ -112,19 +120,19 @@ function betaData() {
   "key": {"id":"key-beta","label":"beta-key","enabled":true,"quota_micro_usd":0,"daily_micro_usd":0,
     "weekly_micro_usd":0,"monthly_micro_usd":0,"max_concurrent":0,"allowed_models":[],
     "model_token_limits":[],"created_at":"2026-02-01T00:00:00Z"},
-  "summary": {"requests":7,"executions":7,"failed":0,"pending":0,"cost_micro_usd":7000000,
-    "unpriced_executions":0,
+  "summary": {"requests":7,"executions":7,"failed":0,"pending":0,"cost_micro_usd":0,
+    "unpriced_executions":7,
     "tokens":{"input":70,"cache_read":0,"cache_write":0,"output":0,"reasoning":0,"total":70},
     "complete_executions":7},
   "trend": [{"time":"2026-10-02T00:00:00Z","requests":7,"executions":7,"failed":0,"pending":0,
-    "cost_micro_usd":7000000,"unpriced_executions":0,
+    "cost_micro_usd":0,"unpriced_executions":7,
     "tokens":{"input":70,"cache_read":0,"cache_write":0,"output":0,"reasoning":0,"total":70},
     "complete_executions":7}],
   "items": [
     {"id":"req-b1","trace_id":"trace-b1","model":"m-beta","outcome":"succeeded","state":"settled",
      "started_at":"2026-10-02T12:00:00Z",
      "executions":[{"id":"exec-b1","model":"m-beta","tokens":{"input":7,"cache_read":0,"cache_write":0,"output":0,"reasoning":0,"total":7},
-       "quality":"complete","cost_micro_usd":7000000,"failed":false,"at":"2026-10-02T12:00:00Z"}]},
+       "quality":"complete","cost_micro_usd":null,"failed":false,"at":"2026-10-02T12:00:00Z"}]},
     {"id":"req-a1","trace_id":"trace-foreign","model":"m-alpha","outcome":"succeeded","state":"settled",
      "started_at":"2026-10-02T10:00:00Z",
      "executions":[]}
@@ -459,6 +467,13 @@ async function main() {
     check('缓存读取占比按契约展示', (await cdp.text('#stats')).includes('25.0%'));
     check('汇总区分已定价小计与未定价执行', (await cdp.text('#stats')).includes('已定价费用小计') && (await cdp.text('#stats')).includes('未定价执行') && (await cdp.text('#stats')).includes('2 条'));
 
+    const unpricedModelRow = await cdp.evaluate("(() => { const row = [...document.querySelectorAll('#lookup-model-rank .model-rank-item')].find((n) => n.innerText.includes('m-unpriced')); return row ? row.innerText.replace(/\\n/g, ' ') : ''; })()");
+    check('模型效率榜全未定价模型显示未定价而不是 0', unpricedModelRow.includes('未定价') && !unpricedModelRow.includes('0 USD'), unpricedModelRow);
+    const mixedModelRow = await cdp.evaluate("(() => { const row = [...document.querySelectorAll('#lookup-model-rank .model-rank-item')].find((n) => n.innerText.includes('m-alpha')); return row ? row.innerText.replace(/\\n/g, ' ') : ''; })()");
+    check('模型效率榜混合 0 小计保留 0 并标注未定价条数', mixedModelRow.includes('0 USD') && mixedModelRow.includes('1 条未定价'), mixedModelRow);
+    const freeModelRow = await cdp.evaluate("(() => { const row = [...document.querySelectorAll('#lookup-model-rank .model-rank-item')].find((n) => n.innerText.includes('m-free')); return row ? row.innerText.replace(/\\n/g, ' ') : ''; })()");
+    check('模型效率榜显式免费 0 不被误标为未定价', freeModelRow.includes('0 USD') && !freeModelRow.includes('未定价'), freeModelRow);
+
     const limits = await cdp.text('#token-limits');
     check('模型 Token 限额卡片渲染模型名', limits.includes('m-alpha') && limits.includes('m-beta'), limits.slice(0, 160));
     check('限额为 0 显示不限', limits.includes('不限'));
@@ -471,7 +486,7 @@ async function main() {
     check('最近请求的 Token 是两次执行的精确合计', rows.includes(expectedRowTokens), expectedRowTokens);
     const expectedRowCost = await cdp.evaluate("window.CMCharts.formatMoneyMicro('4503599627370496','USD',7.2)");
     check('最近请求只合计已定价执行并标出未定价条数', rows.includes(expectedRowCost) && rows.includes('另有 1 条未定价'), rows.replace(/\n/g, ' ').slice(0, 240));
-    check('显式免费 0 与未定价 null 并列可区分', rows.includes('0 USD') && rows.includes('未定价（1 条，不是免费）'), rows.replace(/\n/g, ' ').slice(0, 260));
+    check('显式免费 0 与未定价执行并列可区分', rows.includes('0 USD') && rows.includes('未定价（1 条，不是免费）'), rows.replace(/\n/g, ' ').slice(0, 260));
     check('请求状态按契约显示结果与用量生命周期', rows.includes('成功 · 已完成') && rows.includes('用量待完整'), rows.replace(/\n/g, ' ').slice(0, 240));
     // 金额必须带且只带一次货币后缀（共享格式化的精确文本）。
     check(
@@ -637,6 +652,9 @@ async function main() {
     await cdp.waitFor("document.querySelector('#dashboard').hidden === false", 10000, 'beta 登录');
     check('切换密钥后展示新密钥自己的数据', (await cdp.text('#key-label')).includes('beta-key') && (await cdp.text('#stats')).includes('7'));
     check('切换密钥后不残留上一个密钥的账务', !(await cdp.text('#stats')).includes(expectedCost));
+    const betaStats = await cdp.text('#stats');
+    check('全未定价的数值 0 小计在用户查询界面显示未定价', betaStats.includes('已定价费用小计') && betaStats.includes('未定价') && !betaStats.includes('0 USD'), betaStats.replace(/\n/g, ' ').slice(0, 260));
+    check('全未定价密钥的未定价执行条数如实展示', betaStats.includes('7 条'), betaStats.replace(/\n/g, ' ').slice(0, 260));
     const betaRows = await cdp.text('#recent-body');
     check('beta 列表包含自己的请求', betaRows.includes('m-beta'));
     // beta 递上了 alpha 的请求 id：服务端必须回通用 404，页面不得弹出任何快照。

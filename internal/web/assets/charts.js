@@ -469,7 +469,9 @@
       var isKnown = execCount > 0n && BigInt(completeExecText) === execCount && BigInt(pendingText) === 0n;
       var unpricedCount = BigInt(isIntText(unpricedText) ? unpricedText : '0');
       var hasUnpriced = unpricedCount > 0n;
-      var incompleteCost = !costKnown || hasUnpriced;
+      // 全未定价时后端仍返回 int64 小计 0；必须用执行数判定，不能把 0 当免费。
+      var allUnpriced = execCount > 0n && unpricedCount >= execCount;
+      var incompleteCost = !costKnown || allUnpriced || hasUnpriced;
 
       // TPS 仅使用与实测延迟配对的输出 token，不用全部输出补齐样本。
       var measuredOutText = intText(m.measured_output_tokens || 0);
@@ -485,9 +487,12 @@
         var tokens = BigInt(isIntText(tokText) ? tokText : '0');
         if (!isKnown) {
           display = '—（计量未完整）';
-        } else if (incompleteCost) {
-          // 未定价/部分定价都不是免费，不能给出 ∞ 或把未知计入分母。
-          display = costKnown ? '—（含未定价执行）' : '—（未定价）';
+        } else if (!costKnown || allUnpriced) {
+          // 全未定价/缺失价格都不是免费，不能给出 ∞。
+          display = '—（未定价）';
+        } else if (hasUnpriced) {
+          // 部分未定价：保留已定价小计，但不把未知计入分母。
+          display = '—（含未定价执行）';
         } else if (costMicro > 0n) {
           rational = { num: tokens * 1000000n, den: costMicro };
           var tokensPerUSD = rational.num / costMicro;
@@ -510,8 +515,9 @@
         } else {
           score = null;
           display = !isKnown ? '—（计量未完整）'
-            : incompleteCost ? (costKnown ? '—（含未定价执行）' : '—（未定价）')
-              : '—';
+            : (!costKnown || allUnpriced) ? '—（未定价）'
+              : hasUnpriced ? '—（含未定价执行）'
+                : '—';
         }
       } else if (selectedMetric === 'cache') {
         if (m.cache_read_ratio !== undefined && m.cache_read_ratio !== null) {
@@ -543,7 +549,7 @@
         display: display,
         requestsText: reqText,
         tokensText: tokText,
-        costMicroText: costMicroText,
+        costMicroText: allUnpriced ? '' : costMicroText,
         unpricedText: unpricedText,
         completeExecutionsText: completeExecText,
         executionsText: execText,
@@ -672,19 +678,27 @@
       // 合计只取互不重叠的五个桶之和，避免把 reasoning 既当独立桶又计入 output 的重复计数。
       var sum = sumIntTexts([input, output, cacheRead, cacheWrite, reasoning]);
       var stamp = formatDateTime(source.time);
+      var executions = intOrDefault(source.executions);
+      var unpricedExecutions = intOrDefault(source.unpriced_executions);
+      var allUnpriced = false;
+      try {
+        allUnpriced = BigInt(executions) > 0n && BigInt(unpricedExecutions) >= BigInt(executions);
+      } catch (err) {
+        allUnpriced = false;
+      }
       return {
         time: source.time,
         label: bucketLabel(source.time, bucket),
         // tooltip 明确标注 UTC，避免读者把 UTC 聚合桶误当本地时间。
         timeText: stamp ? stamp + ' UTC' : '',
         requests: intOrDefault(source.requests),
-        executions: intOrDefault(source.executions),
+        executions: executions,
         failed: intOrDefault(source.failed),
         pending: intOrDefault(source.pending),
-        costMicro: source.cost_micro_usd === null || source.cost_micro_usd === undefined
+        costMicro: (source.cost_micro_usd === null || source.cost_micro_usd === undefined || allUnpriced)
           ? null
           : intOrDefault(source.cost_micro_usd),
-        unpricedExecutions: intOrDefault(source.unpriced_executions),
+        unpricedExecutions: unpricedExecutions,
         tokens: {
           input: input,
           output: output,
@@ -1089,6 +1103,9 @@
     var env = environment(options);
     var echarts = options.echarts || env.echarts;
     if (!echarts || typeof echarts.init !== 'function') return null;
+    // 空态文本是容器的直接子节点；复用容器重新绘图时必须先移除，
+    // 否则“暂无数据”会残留并覆盖在真实图表上。
+    el.textContent = '';
     var chart = echarts.init(el, options.themeName || null, { renderer: options.renderer || 'svg' });
     return { chart: chart, created: true };
   }

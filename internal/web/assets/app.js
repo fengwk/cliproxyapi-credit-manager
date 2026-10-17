@@ -196,6 +196,31 @@
     return hasCostValue(value) ? formatMicroUSD(value) : '未定价';
   }
 
+  // 真实契约的 cost_micro_usd 是 int64：全未定价时也是 0。必须用
+  // executions>0 && unpriced_executions>=executions 判断“没有已定价执行”，
+  // 混合小计 0（免费 + 未定价）仍是已定价小计，显式免费 0 也保留为 0。
+  function costBreakdown(cost, executions, unpriced) {
+    var execText = intString(executions || 0);
+    var unpricedText = intString(unpriced || 0);
+    var hasExecutions = execText !== '0';
+    var allUnpriced = false;
+    try {
+      allUnpriced = hasExecutions && BigInt(unpricedText) >= BigInt(execText);
+    } catch (err) {
+      allUnpriced = false;
+    }
+    var hasUnpriced = unpricedText !== '0';
+    var known = hasCostValue(cost) && !allUnpriced;
+    return {
+      known: known,
+      allUnpriced: allUnpriced,
+      hasUnpriced: hasUnpriced,
+      unpricedText: unpricedText,
+      hasExecutions: hasExecutions,
+      costText: known ? formatMicroUSD(cost) : '未定价',
+    };
+  }
+
   function formatTokens(value) {
     var charts = getChartsApi();
     if (charts && typeof charts.tokenText === 'function') {
@@ -2363,16 +2388,18 @@
       return;
     }
     var cost = summary.cost_micro_usd;
-    var costKnown = hasCostValue(cost);
     var unpriced = summary.unpriced_executions || 0;
-    var unpricedCount = intString(unpriced);
-    var hasUnpriced = unpricedCount !== '0';
+    var costState = costBreakdown(cost, summary.executions, unpriced);
+    var costKnown = costState.known;
+    var hasUnpriced = costState.hasUnpriced;
 
-    var costSub = costKnown
-      ? (hasUnpriced
-          ? '已定价小计 ' + formatMicroUSD(cost) + '；另有 ' + formatInt(unpriced) + ' 条未定价（不是免费）'
-          : '已定价小计 · 当前价格 × 所选范围内实际日志')
-      : '所选范围内无可计算金额的执行（未定价 ≠ 免费）';
+    var costSub = costState.allUnpriced
+      ? '所选范围内 ' + formatInt(summary.executions || 0) + ' 条执行均未定价（不是免费）'
+      : costKnown
+        ? (hasUnpriced
+            ? '已定价小计 ' + formatMicroUSD(cost) + '；另有 ' + formatInt(unpriced) + ' 条未定价（不是免费）'
+            : '已定价小计 · 当前价格 × 所选范围内实际日志')
+        : '所选范围内无可计算金额的执行（未定价 ≠ 免费）';
 
     var cards = [
       el('div', { class: 'card stat-card metric-card' }, [
@@ -2387,7 +2414,7 @@
       ]),
       el('div', { class: 'card stat-card metric-card' }, [
         el('div', { class: 'stat-label metric-label', text: '已定价费用小计' }),
-        el('div', { class: 'stat-value mono' + (costKnown ? '' : ' text-warn'), text: costKnown ? formatMicroUSD(cost) : '未定价' }),
+        el('div', { class: 'stat-value mono' + (costKnown ? '' : ' text-warn'), text: costState.costText }),
         el('div', { class: 'stat-sub muted', text: costSub }),
       ]),
       el('div', { class: 'card stat-card metric-card' }, [
@@ -2457,7 +2484,9 @@
       centerTotal = formatTokens(sumTokens, state.tokenUnit);
     } else if (metric === 'cost') {
       centerTitle = '已定价小计';
-      centerTotal = formatCostValue(summary ? summary.cost_micro_usd : null);
+      centerTotal = summary
+        ? costBreakdown(summary.cost_micro_usd, summary.executions, summary.unpriced_executions).costText
+        : '未定价';
     }
 
     models.forEach(function (m) {
@@ -2471,13 +2500,16 @@
         val = Number(intString(tVal || 0));
         disp = formatTokens(tVal || 0, state.tokenUnit);
       } else if (metric === 'cost') {
-        if (!hasCostValue(m.cost_micro_usd)) {
-          // 未定价模型不能以 0 参与占比，否则会被误读为免费。
+        var modelCost = costBreakdown(m.cost_micro_usd, m.executions, m.unpriced_executions);
+        if (!modelCost.known) {
+          // 全未定价模型不能以数值 0 参与占比，否则会被误读为免费。
           unpricedModels.push(m.model || 'unknown');
           return;
         }
         val = Number(intString(m.cost_micro_usd || 0));
-        disp = formatMicroUSD(m.cost_micro_usd);
+        disp = modelCost.hasUnpriced
+          ? modelCost.costText + '（另有 ' + formatInt(m.unpriced_executions) + ' 条未定价）'
+          : modelCost.costText;
       }
       items.push({
         name: m.model || 'unknown',
@@ -2759,10 +2791,10 @@
     var failed = summaryValue(summary, 'failed');
     var pending = summaryValue(summary, 'pending');
     var cost = summary.cost_micro_usd;
-    var costKnown = hasCostValue(cost);
     var unpriced = summaryValue(summary, 'unpriced_executions');
-    var unpricedCount = intString(unpriced);
-    var hasUnpriced = unpricedCount !== '0';
+    var costState = costBreakdown(cost, executions, unpriced);
+    var costKnown = costState.known;
+    var hasUnpriced = costState.hasUnpriced;
     var completeExecutions = summaryValue(summary, 'complete_executions');
     var tokens = summary.tokens || {};
     var ratio = summary.cache_read_ratio;
@@ -2773,7 +2805,10 @@
     }
 
     var costSub;
-    if (!costKnown) {
+    if (costState.allUnpriced) {
+      costSub = '所选范围内 ' + formatInt(executions) + ' 条执行均未定价（不是免费）' +
+        (scoped ? '，且已按 Provider/auth_id 过滤' : '');
+    } else if (!costKnown) {
       costSub = '所选范围内没有可计算金额的执行（未定价不是免费）' +
         (scoped ? '，且已按 Provider/auth_id 过滤' : '');
     } else if (hasUnpriced) {
@@ -2803,7 +2838,7 @@
       },
       {
         label: '已定价费用小计',
-        value: costKnown ? formatMicroUSD(cost) : '未定价',
+        value: costState.costText,
         sub: costSub,
         tone: costKnown ? '' : 'warn',
       },

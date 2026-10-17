@@ -452,7 +452,7 @@ const HEALTH = {
   },
   retention_months: 3,
   capture_enabled: true,
-  last_error: 'mock 财务维护失败：cleanup 未完成',
+  last_error: 'mock 日志维护失败：cleanup 未完成',
   // 真实 handler 会在同一响应里附带插件配置；界面必须把它当作未知字段原样列出。
   config: {
     data_dir: '/tmp/cm-mock-data',
@@ -698,6 +698,7 @@ function usageReport(query) {
   const model = String(query.get('model') || '');
   const items = page <= 1 ? REQUESTS_PAGE_1 : page === 2 ? REQUESTS_PAGE_2 : [];
   const empty = model.includes('__none__');
+  const allUnpriced = model.includes('__unpriced__');
   return {
     summary: empty
       ? {
@@ -710,7 +711,19 @@ function usageReport(query) {
           complete_executions: 0,
           unpriced_executions: 0,
         }
-      : {
+      : allUnpriced
+        ? {
+            requests: 2,
+            executions: 2,
+            failed: 0,
+            pending: 0,
+            cost_micro_usd: 0,
+            unpriced_executions: 2,
+            tokens: { input: 30, cache_read: 0, cache_write: 0, output: 40, reasoning: 0, total: 70 },
+            complete_executions: 2,
+            cache_read_ratio: 0,
+          }
+        : {
           requests: 6,
           executions: 4,
           // 契约：pending 是用量未完整请求数；cost 是已定价小计，unpriced 单独计数。
@@ -724,14 +737,22 @@ function usageReport(query) {
         },
     trend: empty
       ? []
-      : [
+      : allUnpriced
+        ? [
+            { time: '2026-10-15T00:00:00Z', requests: 2, executions: 2, failed: 0, pending: 0, cost_micro_usd: 0, unpriced_executions: 2, tokens: { input: 30, cache_read: 0, cache_write: 0, output: 40, reasoning: 0, total: 70 } },
+          ]
+        : [
           { time: '2026-10-12T00:00:00Z', requests: 3, executions: 5, failed: 0, pending: 0, cost_micro_usd: 1200000, unpriced_executions: 0, tokens: { total: 1000 } },
           { time: '2026-10-13T00:00:00Z', requests: 7, executions: 9, failed: 2, pending: 1, cost_micro_usd: 5600000, unpriced_executions: 1, tokens: { total: 2000 } },
           { time: '2026-10-14T00:00:00Z', requests: 4, executions: 4, failed: 0, pending: 0, cost_micro_usd: BIG_COST, unpriced_executions: 0, tokens: { total: 3000 } },
-          { time: '2026-10-15T00:00:00Z', requests: 2, executions: 1, failed: 1, pending: 1, cost_micro_usd: null, unpriced_executions: 1, tokens: { total: 4000 } },
+          { time: '2026-10-15T00:00:00Z', requests: 2, executions: 1, failed: 1, pending: 1, cost_micro_usd: 0, unpriced_executions: 1, tokens: { total: 4000 } },
         ],
-    items: empty ? [] : items,
-    total: empty ? 0 : 25,
+    items: empty
+      ? []
+      : allUnpriced
+        ? items.filter(function (item) { return item.id === 'req-002' || item.id === 'req-005'; })
+        : items,
+    total: empty ? 0 : allUnpriced ? 2 : 25,
     page,
     page_size: pageSize,
     retention_from: '2026-07-01T00:00:00Z',
@@ -917,7 +938,7 @@ async function handle(req, res) {
           failed: 1,
           pending: 1,
           cost_micro_usd: 800000000000000,
-          unpriced_executions: 1,
+          unpriced_executions: 3,
           tokens: { input: 1300000000000000, output: 800000000000000, cache_read: 700000000000000, cache_write: 0, reasoning: 0, total: 2800000000000000 },
           complete_executions: 6,
           cache_read_ratio: 0.35,
@@ -925,7 +946,7 @@ async function handle(req, res) {
         trend: [
           { bucket: '2026-10-14T00:00:00Z', requests: 2, executions: 2, failed: 0, pending: 0, cost_micro_usd: 800000000000000, unpriced_executions: 0,
             tokens: { input: 800000000000000, output: 500000000000000, cache_read: 500000000000000, cache_write: 0, reasoning: 0, total: 1800000000000000 } },
-          { bucket: '2026-10-15T00:00:00Z', requests: 4, executions: 5, failed: 1, pending: 1, cost_micro_usd: null, unpriced_executions: 1,
+          { bucket: '2026-10-15T00:00:00Z', requests: 4, executions: 1, failed: 1, pending: 1, cost_micro_usd: 0, unpriced_executions: 1,
             tokens: { input: 500000000000000, output: 300000000000000, cache_read: 200000000000000, cache_write: 0, reasoning: 0, total: 1000000000000000 } },
         ],
         models: [
@@ -953,8 +974,8 @@ async function handle(req, res) {
             executions: 2,
             failed: 1,
             pending: 0,
-            cost_micro_usd: null,
-            unpriced_executions: 1,
+            cost_micro_usd: 0,
+            unpriced_executions: 2,
             tokens: { input: 500000000000000, output: 300000000000000, cache_read: 200000000000000, cache_write: 0, reasoning: 0, total: 1000000000000000 },
             complete_executions: 2,
             cache_read_ratio: 200 / 700,
@@ -964,6 +985,24 @@ async function handle(req, res) {
             ttft_samples: 1,
             output_tokens: 300000000000000,
             measured_output_tokens: 300000000000000,
+          },
+          {
+            model: 'mixed-zero',
+            requests: 2,
+            executions: 2,
+            failed: 0,
+            pending: 0,
+            cost_micro_usd: 0,
+            unpriced_executions: 1,
+            tokens: { input: 20, output: 30, cache_read: 0, cache_write: 0, reasoning: 0, total: 50 },
+            complete_executions: 2,
+            cache_read_ratio: 0,
+            latency_ms: 200,
+            latency_samples: 2,
+            ttft_ms: 100,
+            ttft_samples: 2,
+            output_tokens: 30,
+            measured_output_tokens: 30,
           },
           {
             model: 'free-model',
