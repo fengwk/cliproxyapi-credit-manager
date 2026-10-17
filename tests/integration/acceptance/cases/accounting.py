@@ -137,8 +137,10 @@ def unpriced_denied(ctx):
       "a fresh key alone does not price models; only an explicit price for the requested alias restores billing")
 def fresh_key_requires_requested_alias_price(ctx):
     # Model existence and key permission are separate from financial pricing.
-    check_eq(ctx.manager.prices().json()["items"], [], "fresh price book")
-    check_eq(ctx.manager.pricing_rules().json()["items"], [], "fresh rule book")
+    # The current Go list methods return a nil slice for an empty book, which
+    # the management JSON encodes as null rather than an empty array.
+    check_eq(ctx.manager.prices().json()["items"], None, "fresh price book")
+    check_eq(ctx.manager.pricing_rules().json()["items"], None, "fresh rule book")
     item, key = ctx.new_key(label="fresh-onboarding")
     for phase in ("empty price book", "only upstream model priced"):
         if phase == "only upstream model priced":
