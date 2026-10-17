@@ -21,7 +21,7 @@ const ASSETS_DIR = path.resolve(
   argValue('--assets', path.resolve(__dirname, '..', '..', 'internal', 'web', 'assets'))
 );
 const MANAGEMENT_KEY = argValue('--key', 'cm-mock-key');
-const RESOURCE_PREFIX = '/v0/resource/plugins/credit-manager';
+const RESOURCE_PREFIX = '/v0/resource/plugins/cliproxyapi-credit-manager';
 const MANAGER_BASE = '/v0/management/plugins/credit-manager';
 
 const CONTENT_TYPES = {
@@ -75,6 +75,10 @@ const KEYS = [
       future_policy: 'keep-me',
     },
     spent_micro_usd: 12345678,
+    quota_used_micro_usd: 2345678,
+    daily_used_micro_usd: 0,
+    weekly_used_micro_usd: 0,
+    monthly_used_micro_usd: 2345678,
     created_at: '2026-01-01T00:00:00Z',
   },
   {
@@ -93,6 +97,10 @@ const KEYS = [
       allowed_models: [],
     },
     spent_micro_usd: 0,
+    quota_used_micro_usd: 0,
+    daily_used_micro_usd: 0,
+    weekly_used_micro_usd: 0,
+    monthly_used_micro_usd: 0,
     created_at: '2026-02-02T00:00:00Z',
   },
 ];
@@ -802,7 +810,9 @@ async function handle(req, res) {
         json(res, 400, { error: materialError });
         return;
       }
-      json(res, 201, { item: { id: 'key-new', spec: parsed, spent_micro_usd: 0 }, key: 'sk-mock-onetime-5f3a9c' });
+      json(res, 201, { item: { id: 'key-new', spec: parsed, spent_micro_usd: 0,
+        quota_used_micro_usd: 0, daily_used_micro_usd: 0, weekly_used_micro_usd: 0, monthly_used_micro_usd: 0 },
+        key: 'sk-mock-onetime-5f3a9c' });
       return;
     }
     if (endpoint === '/api/keys' && req.method === 'PUT') {
@@ -956,8 +966,8 @@ async function handle(req, res) {
     if (endpoint === '/api/reveal' && req.method === 'POST') {
       const body = await readBody(req);
       const parsed = JSON.parse(body || '{}');
-      if (parsed.id === 'key-legacy') {
-        json(res, 409, { error: 'legacy key cannot be revealed, rotate to encrypted' });
+      if (parsed.id === 'key-2') {
+        json(res, 500, { error: 'stored key material failed verification' });
         return;
       }
       json(res, 200, { id: parsed.id, key: 'sk-revealed-' + (parsed.id || 'secret') });

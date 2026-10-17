@@ -7,6 +7,15 @@ const { loadCM } = require('./helpers');
 
 const CM = loadCM();
 
+test('概览只发送当前 API 支持的过滤器', () => {
+  const filters = CM.defaultOverviewFilters(new Date('2026-01-02T03:04:05Z'));
+  assert.equal(Object.hasOwn(filters, 'source'), false);
+  const params = new URLSearchParams(CM.buildOverviewQuery({ ...filters, model: 'gpt-5', source: 'ignored' }));
+  assert.equal(params.has('source'), false);
+  assert.equal(params.get('model'), 'gpt-5');
+  assert.equal(params.get('bucket'), 'day');
+});
+
 test('buildUsageQuery 覆盖过滤器并省略空值', () => {
   const now = new Date('2026-01-02T03:04:05Z');
   const filters = CM.defaultUsageFilters(now);

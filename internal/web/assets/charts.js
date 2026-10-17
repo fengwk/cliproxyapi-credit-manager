@@ -455,7 +455,7 @@
       var modelName = m.model || 'unknown';
       var reqText = intText(m.requests || 0);
       var costMicroText = intText(m.cost_micro_usd || 0);
-      var tokText = intText(m.tokens && m.tokens.total !== undefined ? m.tokens.total : m.tokens || 0);
+      var tokText = intText(m.tokens ? m.tokens.total : 0);
       var completeExecText = intText(m.complete_executions || 0);
       var execText = intText(m.executions || 0);
       var pendingText = intText(m.pending || 0);
@@ -463,7 +463,7 @@
       var requestCount = BigInt(reqText);
       var isKnown = execCount > 0n && BigInt(completeExecText) === execCount && BigInt(pendingText) === 0n;
 
-      // TPS 优先使用真实测得输出 token 字段 measured_output_tokens，fallback 至 output_tokens
+      // TPS 仅使用与实测延迟配对的输出 token，不用全部输出补齐样本。
       var measuredOutText = intText(m.measured_output_tokens || 0);
       var latencyMsText = intText(m.latency_ms || 0);
       var latencySamplesText = intText(m.latency_samples || 0);
@@ -510,7 +510,7 @@
         }
       } else if (selectedMetric === 'tps') {
         var latMs = BigInt(latencyMsText);
-        if (latMs > 0n && m.measured_output_tokens !== undefined) {
+        if (latMs > 0n) {
           rational = { num: BigInt(measuredOutText) * 1000n, den: latMs };
           display = formatDecimalRatio(rational.num, rational.den, 1) + ' tokens/s (累计吞吐)';
         }
@@ -652,8 +652,8 @@
       var tokens = source.tokens || {};
       var input = intOrDefault(tokens.input);
       var output = intOrDefault(tokens.output);
-      var cacheRead = intOrDefault(tokens.cache_read !== undefined ? tokens.cache_read : tokens.cacheRead);
-      var cacheWrite = intOrDefault(tokens.cache_write !== undefined ? tokens.cache_write : tokens.cacheWrite);
+      var cacheRead = intOrDefault(tokens.cache_read);
+      var cacheWrite = intOrDefault(tokens.cache_write);
       var reasoning = intOrDefault(tokens.reasoning);
       // 合计只取互不重叠的五个桶之和，避免把 reasoning 既当独立桶又计入 output 的重复计数。
       var sum = sumIntTexts([input, output, cacheRead, cacheWrite, reasoning]);

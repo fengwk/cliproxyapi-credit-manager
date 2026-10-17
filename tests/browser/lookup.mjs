@@ -26,7 +26,7 @@ const ARTIFACTS = process.env.CM_LOOKUP_ARTIFACTS_DIR
 const SHOTS = path.join(ARTIFACTS, 'screenshots');
 const CHROME = process.env.CHROME_BIN || '/usr/bin/google-chrome-stable';
 
-const PLUGIN_BASE = '/v0/resource/plugins/credit-manager';
+const PLUGIN_BASE = '/v0/resource/plugins/cliproxyapi-credit-manager';
 const ALPHA = 'cm-alpha-key';
 const BETA = 'cm-beta-key';
 const EXPIRED = 'cm-expired-key';
@@ -68,6 +68,7 @@ function alphaData() {
     "model_token_limits":[{"model":"m-alpha","total":0,"daily":9007199254740993,"weekly":0,"monthly":1000000},
       {"model":"m-beta","total":2000000,"daily":0,"weekly":0,"monthly":0}],
     "expires_at":"2026-12-31T00:00:00Z","spent_micro_usd":4503599627370496,
+    "quota_used_micro_usd":2251799813685248,"daily_used_micro_usd":0,"weekly_used_micro_usd":0,"monthly_used_micro_usd":0,
     "created_at":"2026-01-01T00:00:00Z"},
   "summary": {"requests":3,"executions":4,"failed":1,"pending":1,"cost_micro_usd":9007199254740993,
     "adjustment_micro_usd":2500000,
@@ -106,7 +107,8 @@ function betaData() {
   return `{
   "key": {"id":"key-beta","label":"beta-key","enabled":true,"quota_micro_usd":0,"daily_micro_usd":0,
     "weekly_micro_usd":0,"monthly_micro_usd":0,"max_concurrent":0,"allowed_models":[],
-    "model_token_limits":[],"spent_micro_usd":7000000,"created_at":"2026-02-01T00:00:00Z"},
+    "model_token_limits":[],"spent_micro_usd":7000000,"quota_used_micro_usd":7000000,
+    "daily_used_micro_usd":0,"weekly_used_micro_usd":0,"monthly_used_micro_usd":0,"created_at":"2026-02-01T00:00:00Z"},
   "summary": {"requests":7,"executions":7,"failed":0,"pending":0,"cost_micro_usd":7000000,
     "adjustment_micro_usd":0,
     "tokens":{"input":70,"cache_read":0,"cache_write":0,"output":0,"reasoning":0,"total":70},
@@ -134,7 +136,8 @@ function emptyData() {
   return `{
   "key": {"id":"key-empty","label":"empty-key","enabled":true,"quota_micro_usd":0,"daily_micro_usd":0,
     "weekly_micro_usd":0,"monthly_micro_usd":0,"max_concurrent":0,"allowed_models":[],
-    "model_token_limits":[],"spent_micro_usd":0,"created_at":"2026-03-01T00:00:00Z"},
+    "model_token_limits":[],"spent_micro_usd":0,"quota_used_micro_usd":0,
+    "daily_used_micro_usd":0,"weekly_used_micro_usd":0,"monthly_used_micro_usd":0,"created_at":"2026-03-01T00:00:00Z"},
   "summary": {"requests":0,"executions":0,"failed":0,"pending":0,"cost_micro_usd":0,"adjustment_micro_usd":0,
     "tokens":{"input":0,"cache_read":0,"cache_write":0,"output":0,"reasoning":0,"total":0},"complete_executions":0},
   "trend": [], "items": [], "total": 0, "page": 1, "page_size": 10, "retention_from": "2026-07-01T00:00:00Z"
@@ -438,9 +441,12 @@ async function main() {
     }
     check('额度卡片已完全移除原有在途预占卡片', await cdp.evaluate("![...document.querySelectorAll('#quotas .card-label')].some((n) => n.textContent.includes('预占') || n.textContent.includes('持有'))"));
     check('额度卡片文本中不含预占或持有', !quotas.includes('在途预占') && !quotas.includes('预占') && !quotas.includes('持有') && !quotas.includes('held_micro_usd'));
-    const expectedSpent = await cdp.evaluate("window.CMCharts.formatMoneyMicro('4503599627370496','USD',7.2)");
+    const expectedSpent = await cdp.evaluate("window.CMCharts.formatMoneyMicro('2251799813685248','USD',7.2)");
+    const expectedLifetime = await cdp.evaluate("window.CMCharts.formatMoneyMicro('4503599627370496','USD',7.2)");
     const expectedTotal = await cdp.evaluate("window.CMCharts.formatMoneyMicro('9007199254740993','USD',7.2)");
-    check('已用额度卡片精确渲染大整数实际用量', quotas.includes(expectedSpent), expectedSpent);
+    const usedCard = await cdp.evaluate("[...document.querySelectorAll('#quotas .card')].find(c => c.querySelector('.card-label')?.textContent === '已用额度')?.textContent");
+    check('已用额度卡片精确渲染重置后的有效用量', usedCard.includes(expectedSpent) && !usedCard.includes(expectedLifetime), usedCard);
+    check('累计消费独立显示原始总账而不当作额度用量', quotas.includes(expectedLifetime), expectedLifetime);
     check('总额度卡片精确渲染软上限', quotas.includes(expectedTotal), expectedTotal);
     check(
       '已用额度小于总额度且无预占，保持正向剩余额度软准入语义',
