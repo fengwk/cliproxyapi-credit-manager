@@ -90,7 +90,7 @@ const POINTS = [
     failed: 1,
     pending: 0,
     cost_micro_usd: '1250000',
-    adjustment_micro_usd: '500000',
+    unpriced_executions: 0,
     tokens: { input: 1000, output: 2000, cache_read: 300, cache_write: 40, reasoning: 50, total: 3390 },
   },
   {
@@ -100,7 +100,7 @@ const POINTS = [
     failed: 0,
     pending: 2,
     cost_micro_usd: '9007199254740993',
-    adjustment_micro_usd: '0',
+    unpriced_executions: 0,
     tokens: {
       input: { cmIntText: '9007199254740993' },
       output: 0,
@@ -273,14 +273,10 @@ test('buildChartOptions 产出请求/Token/成本三张图', () => {
   // tokenUnit='k' 时几何坐标按 /1000 缩放（与坐标轴单位一致）。
   assert.deepEqual(model.tokens.series.map((s) => s.data[0]), [1, 2, 0.3, 0.04, 0.05]);
 
-  // 成本：执行成本与人工补记两条独立序列，没有合并序列。
-  assert.deepEqual(
-    model.cost.series.map((s) => s.name),
-    ['执行成本', '人工补记']
-  );
-  assert.deepEqual(model.cost.series.map((s) => s.data[0]), [1.25, 0.5]);
-  assert.equal(model.cost.series[1].lineStyle.type, 'dashed');
-  assert.ok(!model.cost.series.some((s) => /合计|总计/.test(s.name)));
+  // 成本：只展示已定价小计，未定价执行不进入金额序列。
+  assert.deepEqual(model.cost.series.map((s) => s.name), ['已定价费用小计']);
+  assert.deepEqual(model.cost.series.map((s) => s.data[0]), [1.25]);
+  assert.ok(!model.cost.series.some((s) => /人工补记|合计|总计/.test(s.name)));
 });
 
 test('buildChartOptions 空数据返回空模型且不构造 option', () => {
@@ -295,7 +291,7 @@ test('buildChartOptions 空数据返回空模型且不构造 option', () => {
 });
 
 test('零值不产生 NaN，坐标轴仍固定 min:0', () => {
-  const zero = [{ time: '2026-01-02T03:04:05Z', requests: 0, executions: 0, cost_micro_usd: 0, adjustment_micro_usd: 0, tokens: {} }];
+  const zero = [{ time: '2026-01-02T03:04:05Z', requests: 0, executions: 0, cost_micro_usd: 0, unpriced_executions: 0, tokens: {} }];
   const model = CMCharts.buildChartOptions(zero, { tokenUnit: 'k' });
   assert.equal(model.empty, false);
   for (const option of [model.requests, model.tokens, model.cost]) {
@@ -303,7 +299,7 @@ test('零值不产生 NaN，坐标轴仍固定 min:0', () => {
   }
   assert.deepEqual(model.requests.series.map((s) => s.data[0]), [0, 0]);
   assert.ok(model.tokens.series.every((s) => s.data[0] === 0));
-  assert.deepEqual(model.cost.series.map((s) => s.data[0]), [0, 0]);
+  assert.deepEqual(model.cost.series.map((s) => s.data[0]), [0]);
   assert.equal(model.tokens.yAxis[0].min, 0);
 });
 
@@ -355,7 +351,7 @@ test('tooltip 使用 richText 且输出纯文本，无 HTML 注入面', () => {
   // tooltip 首行必须显式标注 UTC，说明聚合口径。
   assert.equal(
     model.requests.tooltip.formatter([{ dataIndex: 0 }]),
-    '2026-01-02 03:04:05 UTC\n请求次数：2\n执行次数：3\n失败请求：1\n未结算请求：0'
+    '2026-01-02 03:04:05 UTC\n请求次数：2\n执行次数：3\n失败请求：1\n用量待完整请求：0'
   );
   assert.equal(
     model.tokens.tooltip.formatter([{ dataIndex: 0 }]),
@@ -363,7 +359,7 @@ test('tooltip 使用 richText 且输出纯文本，无 HTML 注入面', () => {
   );
   assert.equal(
     model.cost.tooltip.formatter([{ dataIndex: 0 }]),
-    '2026-01-02 03:04:05 UTC\n执行成本：1.25 USD\n人工补记：0.5 USD（独立记账，不计入执行成本）'
+    '2026-01-02 03:04:05 UTC\n已定价费用小计：1.25 USD\n费用按当前价格 × 实际日志查询计算'
   );
   const text = [
     model.requests.tooltip.formatter([{ dataIndex: 0 }]),
@@ -373,7 +369,7 @@ test('tooltip 使用 richText 且输出纯文本，无 HTML 注入面', () => {
   assert.doesNotMatch(text, /[<>&]/);
 });
 
-test('tooltip 精确展示大整数与金额，人工补记独立不合并', () => {
+test('tooltip 精确展示大整数与已定价金额，未定价不并入金额', () => {
   const model = CMCharts.buildChartOptions(POINTS, { tokenUnit: 'raw', currency: 'USD' });
   // 第二个点：input 是超大 cmIntText，合计必须精确。
   const tokens = model.tokens.tooltip.formatter([{ dataIndex: 1 }]);
@@ -381,17 +377,17 @@ test('tooltip 精确展示大整数与金额，人工补记独立不合并', () 
   assert.match(tokens, /思考：7/);
   // 9007199254740993 + 7 = 9007199254741000，精确到个位。
   assert.match(tokens, /合计：9,007,199,254,741,000/);
-  // 成本：两条独立金额，既不相加也不丢精度（金额文本与 app.js 一致，不带千分位）。
+  // 成本：只展示已定价金额，不丢精度（金额文本与 app.js 一致，不带千分位）。
   const cost = model.cost.tooltip.formatter([{ dataIndex: 1 }]);
   assert.equal(
     cost,
-    '2026-01-02 04:04:05 UTC\n执行成本：9007199254.740993 USD\n人工补记：0 USD（独立记账，不计入执行成本）'
+    '2026-01-02 04:04:05 UTC\n已定价费用小计：9007199254.740993 USD\n费用按当前价格 × 实际日志查询计算'
   );
-  // 请求 tooltip 使用精确整数（失败/未结算按 0 兜底）。
+  // 请求 tooltip 使用精确整数（失败/用量待完整按 0 兜底）。
   const requests = model.requests.tooltip.formatter([{ dataIndex: 0 }]);
   assert.match(requests, /请求次数：2/);
   assert.match(requests, /失败请求：1/);
-  assert.match(requests, /未结算请求：0/);
+  assert.match(requests, /用量待完整请求：0/);
 });
 
 test('tooltip 对越界 dataIndex 安全返回空串', () => {
@@ -585,7 +581,7 @@ test('computeModelRankings 支持 BigInt 精度、单次成本完整性判定与
       requests: 2,
       executions: 2,
       complete_executions: 2,
-      pending: 1, // 存在在途/未结算
+      pending: 1, // 存在执行中/用量待完整
       cost_micro_usd: '0',
       tokens: { total: '2000000' },
       latency_ms: 2000,

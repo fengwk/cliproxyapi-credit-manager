@@ -32,9 +32,9 @@
   };
 
   var STATE_LABELS = {
-    active: '进行中',
-    pending: '待定',
-    settled: '已结算',
+    active: '执行中',
+    pending: '用量待完整',
+    settled: '已完成',
   };
 
   // CPA 凭据状态（sdk/cliproxy/auth 的 Status 常量）的中文显示与语气。
@@ -185,6 +185,15 @@
     var moneyText = formatMicroUSD(micro);
     if (moneyText === '—') return '—';
     return moneyText + '（' + formatInt(micro) + ' µUSD）';
+  }
+
+  // 查询派生金额：null/undefined 表示未定价，绝不能显示成 0 或“免费”。
+  function hasCostValue(value) {
+    return value !== undefined && value !== null;
+  }
+
+  function formatCostValue(value) {
+    return hasCostValue(value) ? formatMicroUSD(value) : '未定价';
   }
 
   function formatTokens(value) {
@@ -732,7 +741,7 @@
   }
 
   function ratesSummaryText(rates) {
-    if (!rates || typeof rates !== 'object') return '无价格记录（拒绝计费）';
+    if (!rates || typeof rates !== 'object') return '无当前价格（历史执行显示为未定价，不是免费）';
     var keys = ['input', 'output', 'reasoning', 'cache_read', 'cache_write'];
     var allZero = true;
     for (var i = 0; i < keys.length; i++) {
@@ -1258,8 +1267,8 @@
     deleteKey: function (id, reason) {
       return request(managerPath('/api/delete-key'), { method: 'POST', body: { id: id, reason: reason } });
     },
-    resetSpend: function (spec) {
-      return request(managerPath('/api/reset-spend'), { method: 'POST', body: spec });
+    resetTokens: function (spec) {
+      return request(managerPath('/api/reset-tokens'), { method: 'POST', body: spec });
     },
     listCallers: function () {
       return request(managerPath('/api/callers'));
@@ -1284,9 +1293,6 @@
     },
     capture: function (id) {
       return request(managerPath('/api/capture') + '?id=' + encodeURIComponent(id));
-    },
-    resolve: function (payload) {
-      return request(managerPath('/api/resolve'), { method: 'POST', body: payload });
     },
     health: function () {
       return request(managerPath('/api/health'));
@@ -2356,11 +2362,17 @@
       container.textContent = '';
       return;
     }
-    var execCost = intString(summary.cost_micro_usd || 0);
-    var adjCost = intString(summary.adjustment_micro_usd || 0);
-    var totalCostBig = BigInt(execCost) + BigInt(adjCost);
-    var totalCostText = totalCostBig.toString();
-    var hasAdj = adjCost !== '0';
+    var cost = summary.cost_micro_usd;
+    var costKnown = hasCostValue(cost);
+    var unpriced = summary.unpriced_executions || 0;
+    var unpricedCount = intString(unpriced);
+    var hasUnpriced = unpricedCount !== '0';
+
+    var costSub = costKnown
+      ? (hasUnpriced
+          ? '已定价小计 ' + formatMicroUSD(cost) + '；另有 ' + formatInt(unpriced) + ' 条未定价（不是免费）'
+          : '已定价小计 · 当前价格 × 所选范围内实际日志')
+      : '所选范围内无可计算金额的执行（未定价 ≠ 免费）';
 
     var cards = [
       el('div', { class: 'card stat-card metric-card' }, [
@@ -2374,18 +2386,23 @@
         el('div', { class: 'stat-sub muted', text: '输入 ' + formatTokens(summary.tokens ? summary.tokens.input : 0, state.tokenUnit) + ' · 输出 ' + formatTokens(summary.tokens ? summary.tokens.output : 0, state.tokenUnit) }),
       ]),
       el('div', { class: 'card stat-card metric-card' }, [
-        el('div', { class: 'stat-label metric-label', text: '总费用支出（总成本）' }),
-        el('div', { class: 'stat-value mono', text: formatMicroUSD(totalCostText) }),
-        el('div', { class: 'stat-sub muted', text: hasAdj ? '执行成本 ' + formatMicroUSD(execCost) + ' · 独立人工补记 ' + formatMicroUSD(adjCost) : '法币折合 ' + formatMoneyMicro(totalCostText, state.currency, state.currencyRate) }),
+        el('div', { class: 'stat-label metric-label', text: '已定价费用小计' }),
+        el('div', { class: 'stat-value mono' + (costKnown ? '' : ' text-warn'), text: costKnown ? formatMicroUSD(cost) : '未定价' }),
+        el('div', { class: 'stat-sub muted', text: costSub }),
+      ]),
+      el('div', { class: 'card stat-card metric-card' }, [
+        el('div', { class: 'stat-label metric-label', text: '未定价执行' }),
+        el('div', { class: 'stat-value mono' + (hasUnpriced ? ' text-warn' : ''), text: formatInt(unpriced) + ' 条' }),
+        el('div', { class: 'stat-sub muted', text: '缺价、用量不完整或无法证明计费数量；不是免费' }),
       ]),
       el('div', { class: 'card stat-card metric-card' }, [
         el('div', { class: 'stat-label metric-label', text: '缓存读取率' }),
         el('div', { class: 'stat-value mono', text: (summary.cache_read_ratio !== null && summary.cache_read_ratio !== undefined) ? (Number(summary.cache_read_ratio) * 100).toFixed(1) + '%' : '—' }),
-        el('div', { class: 'stat-sub muted', text: '完成执行 ' + formatInt(summary.complete_executions || 0) + ' 次' }),
+        el('div', { class: 'stat-sub muted', text: '完整质量执行 ' + formatInt(summary.complete_executions || 0) + ' 次（仅用量质量，不代表价格完整）' }),
       ]),
       el('div', { class: 'card stat-card metric-card' }, [
         el('div', { class: 'stat-label metric-label', text: '异常请求' }),
-        el('div', { class: 'stat-value mono' + ((Number(intString(summary.failed || 0)) > 0 || Number(intString(summary.pending || 0)) > 0) ? ' text-warn' : ''), text: formatInt(summary.failed || 0) + ' 失败 · ' + formatInt(summary.pending || 0) + ' 待定' }),
+        el('div', { class: 'stat-value mono' + ((Number(intString(summary.failed || 0)) > 0 || Number(intString(summary.pending || 0)) > 0) ? ' text-warn' : ''), text: formatInt(summary.failed || 0) + ' 失败 · ' + formatInt(summary.pending || 0) + ' 待完整' }),
         el('div', { class: 'stat-sub muted', text: '两类状态存在重叠，独立计数不累加' }),
       ]),
     ];
@@ -2430,6 +2447,7 @@
 
     var metric = state.overview.modelShareMetric || 'requests';
     var items = [];
+    var unpricedModels = [];
     var centerTitle = '总调用';
     var centerTotal = formatInt(summary && summary.requests ? summary.requests : 0);
 
@@ -2438,8 +2456,8 @@
       var sumTokens = summary && summary.tokens ? summary.tokens.total : 0;
       centerTotal = formatTokens(sumTokens, state.tokenUnit);
     } else if (metric === 'cost') {
-      centerTitle = '总费用';
-      centerTotal = formatMicroUSD(summary && summary.cost_micro_usd ? summary.cost_micro_usd : 0);
+      centerTitle = '已定价小计';
+      centerTotal = formatCostValue(summary ? summary.cost_micro_usd : null);
     }
 
     models.forEach(function (m) {
@@ -2453,8 +2471,13 @@
         val = Number(intString(tVal || 0));
         disp = formatTokens(tVal || 0, state.tokenUnit);
       } else if (metric === 'cost') {
+        if (!hasCostValue(m.cost_micro_usd)) {
+          // 未定价模型不能以 0 参与占比，否则会被误读为免费。
+          unpricedModels.push(m.model || 'unknown');
+          return;
+        }
         val = Number(intString(m.cost_micro_usd || 0));
-        disp = formatMicroUSD(m.cost_micro_usd || 0);
+        disp = formatMicroUSD(m.cost_micro_usd);
       }
       items.push({
         name: m.model || 'unknown',
@@ -2488,6 +2511,12 @@
         ]);
         legendContainer.appendChild(itemEl);
       });
+      if (unpricedModels.length) {
+        legendContainer.appendChild(el('div', {
+          class: 'share-legend-note muted',
+          text: unpricedModels.length + ' 个模型未定价，未计入费用分布（不是免费）：' + unpricedModels.join('、'),
+        }));
+      }
     }
   }
 
@@ -2528,7 +2557,8 @@
           display: '—',
           requestsText: intString(m.requests || 0),
           tokensText: intString(m.tokens ? m.tokens.total : 0),
-          costMicroText: intString(m.cost_micro_usd || 0),
+          costMicroText: hasCostValue(m.cost_micro_usd) ? intString(m.cost_micro_usd) : '',
+          unpricedText: intString(m.unpriced_executions || 0),
         };
       });
     }
@@ -2545,7 +2575,10 @@
           el('div', { class: 'rank-meta muted' }, [
             el('span', { text: formatInt(item.requestsText) + ' 次调用' }),
             el('span', { text: formatTokens(item.tokensText, state.tokenUnit) + ' tokens' }),
-            el('span', { text: formatMicroUSD(item.costMicroText) }),
+            el('span', { text: item.costMicroText ? formatMicroUSD(item.costMicroText) : '未定价' }),
+            item.unpricedText && intString(item.unpricedText) !== '0'
+              ? el('span', { text: formatInt(item.unpricedText) + ' 条未定价（不是免费）' })
+              : null,
           ]),
         ]),
       ]);
@@ -2715,18 +2748,21 @@
     return String(input.provider || '').trim() !== '' || String(input.auth || '').trim() !== '';
   }
 
-  // 汇总卡片的纯描述：金额/标签/说明都可单测，避免界面误把执行成本、人工补记与请求计数混在一起。
-  // 契约：summary.failed 是失败请求数（failed/canceled/rejected），summary.pending 是未结算请求数
-  // （active+pending），summary.cost_micro_usd 只统计匹配的执行，summary.adjustment_micro_usd 是
-  // 管理员 Resolve 的人工记账，必须单独展示。
+  // 汇总卡片的纯描述：金额是所选日志范围按当前价格即时计算的结果，绝不代表永久账本。
+  // 契约：summary.failed 是失败请求数（failed/canceled/rejected），summary.pending 是
+  // 用量未完整的请求数（active+pending）；cost_micro_usd 是已定价执行小计，可为 null；
+  // unpriced_executions 是未定价执行数，绝不能并入金额或显示为免费。
   function usageSummaryCards(summary, filters) {
     var scoped = hasExecutionScope(filters);
     var requests = summaryValue(summary, 'requests');
     var executions = summaryValue(summary, 'executions');
     var failed = summaryValue(summary, 'failed');
     var pending = summaryValue(summary, 'pending');
-    var cost = summaryValue(summary, 'cost_micro_usd');
-    var adjustment = summaryValue(summary, 'adjustment_micro_usd');
+    var cost = summary.cost_micro_usd;
+    var costKnown = hasCostValue(cost);
+    var unpriced = summaryValue(summary, 'unpriced_executions');
+    var unpricedCount = intString(unpriced);
+    var hasUnpriced = unpricedCount !== '0';
     var completeExecutions = summaryValue(summary, 'complete_executions');
     var tokens = summary.tokens || {};
     var ratio = summary.cache_read_ratio;
@@ -2734,6 +2770,18 @@
     var ratioText = '—';
     if (ratio !== null && ratio !== undefined && typeof ratio === 'number' && isFinite(ratio)) {
       ratioText = (ratio * 100).toFixed(2) + '%';
+    }
+
+    var costSub;
+    if (!costKnown) {
+      costSub = '所选范围内没有可计算金额的执行（未定价不是免费）' +
+        (scoped ? '，且已按 Provider/auth_id 过滤' : '');
+    } else if (hasUnpriced) {
+      costSub = '已定价小计 ' + formatMicroUSD(cost) + '；另有 ' + formatInt(unpriced) +
+        ' 条未定价执行不计入小计（不是免费）' + (scoped ? '，已按 Provider/auth_id 过滤' : '');
+    } else {
+      costSub = formatInt(cost) + ' µUSD　当前价格 × 实际日志；仅匹配范围内的执行' +
+        (scoped ? '，已按 Provider/auth_id 过滤' : '');
     }
 
     return [
@@ -2746,29 +2794,26 @@
         tone: Number(intString(failed)) ? 'danger' : '',
       },
       {
-        label: '未结算请求',
+        label: '用量待完整请求',
         value: formatInt(pending),
         sub: pending
-          ? '进行中或待定：已知用量照常入账，未知部分待核账'
-          : '没有进行中或待定的请求',
+          ? '执行中或真实用量缺失：完整用量与缺价执行仍会正常完成'
+          : '没有执行中或用量待完整的请求',
         tone: Number(intString(pending)) ? 'warn' : '',
       },
       {
-        label: '执行成本',
-        value: formatMicroUSD(cost),
-        sub:
-          formatInt(cost) + ' µUSD　仅匹配范围内的执行计量' + (scoped ? '，已按 Provider/auth_id 过滤' : ''),
+        label: '已定价费用小计',
+        value: costKnown ? formatMicroUSD(cost) : '未定价',
+        sub: costSub,
+        tone: costKnown ? '' : 'warn',
       },
       {
-        label: '人工补记',
-        value: formatMicroUSD(adjustment),
-        sub:
-          formatInt(adjustment) +
-          ' µUSD　管理员 Resolve 记账，不计入执行成本' +
-          (scoped ? '；该金额按请求汇总，不受 Provider/auth_id 过滤' : ''),
-        tone: Number(intString(adjustment)) ? 'warn' : '',
+        label: '未定价执行',
+        value: formatInt(unpriced),
+        sub: '缺价、用量不完整或无法从日志证明计费数量；未定价 ≠ 免费',
+        tone: hasUnpriced ? 'warn' : '',
       },
-      { label: '完整质量执行', value: formatInt(completeExecutions), sub: 'quality = complete' },
+      { label: '完整质量执行', value: formatInt(completeExecutions), sub: 'quality = complete；仅用量质量，不代表价格完整' },
       {
         label: '缓存读占比',
         value: ratioText,
@@ -2783,10 +2828,11 @@
     ];
   }
 
-  // 汇总下方的口径说明：明确哪里是匹配执行、哪里是请求级人工记账。
+  // 汇总下方的口径说明：明确金额是查询派生、随价格与日志范围变化，不存在永久财务余额。
   function usageScopeNote(summary, filters) {
     var executions = summary ? summaryValue(summary, 'executions') : 0;
     var completeExecutions = summary ? summaryValue(summary, 'complete_executions') : 0;
+    var unpriced = summary ? summaryValue(summary, 'unpriced_executions') : 0;
     var coverage = '—';
     var execCount = Number(intString(executions));
     var completeCount = Number(intString(completeExecutions));
@@ -2794,16 +2840,15 @@
       coverage = ((completeCount / execCount) * 100).toFixed(1) + '%';
     }
     var text =
-      '质量覆盖说明：缓存读占比只覆盖质量判定为「完整（complete）」的执行；' +
-      '完整执行占比 = ' + formatInt(completeExecutions) + ' / ' + formatInt(executions) + ' = ' + coverage + '。' +
-      '「部分（partial）」或「未知（unknown）」的执行不计入占比，也不会被当作 0 结算。';
+      '质量覆盖说明：完整执行占比 = ' + formatInt(completeExecutions) + ' / ' + formatInt(executions) +
+      ' = ' + coverage + '；它只反映实际用量质量，不代表价格完整率。' +
+      '「部分（partial）」或「未知（unknown）」执行不计入占比，也不会被当作 0。';
     text +=
-      '口径说明：执行成本与明细只统计当前筛选范围内的执行，人工补记按请求汇总，' +
-      '两者相加仍不等于全 Key 账本支出（账本还包含其它请求与保留策略之外的记录）。';
+      '费用口径：所有金额都是查询时按当前价格 × 实际日志即时计算，只覆盖当前选中的时间范围和保留边界；' +
+      '修改、添加或删除价格后历史金额立即重算，不存在冻结价或永久累计支出。' +
+      '已定价费用小计只汇总可计算执行，未定价执行 ' + formatInt(unpriced) + ' 条不计入小计，也不是免费。';
     if (hasExecutionScope(filters)) {
-      text +=
-        ' 当前已按 Provider/auth_id 过滤：明细只包含匹配的执行，人工补记仍是整笔请求的记账，' +
-        '因此不能把该合计当作全 Key 台账。';
+      text += ' 当前已按 Provider/auth_id 过滤：明细与金额只包含匹配的执行，不代表整个 Key 的全部日志。';
     }
     return text;
   }
@@ -2900,14 +2945,11 @@
   function renderUsageExecutionRow(execution, request) {
     var relation = modelRelation(request.model, execution.model, execution.response_model);
     var statusTone = execution.failed ? 'danger' : 'ok';
-    var settled = execution.cost_micro_usd !== undefined && execution.cost_micro_usd !== null;
-    var costText = settled ? formatMicroUSD(execution.cost_micro_usd) : '未结算';
-    var quality = String(execution.quality == null ? '' : execution.quality).toLowerCase();
-    var costSub = settled
-      ? formatInt(execution.cost_micro_usd) + ' µUSD'
-      : quality === 'partial' || quality === 'unknown'
-        ? '质量非完整（' + quality + '）：服务端未给出结算金额，不是 0'
-        : '服务端未给出结算金额（不是 0）';
+    var priced = hasCostValue(execution.cost_micro_usd);
+    var costText = priced ? formatMicroUSD(execution.cost_micro_usd) : '未定价';
+    var costSub = priced
+      ? formatInt(execution.cost_micro_usd) + ' µUSD（当前价格 × 实际用量）'
+      : '未定价：缺失价格、用量不完整或无法证明计费数量（不是 0）';
 
     var responseCell = el('td', {}, [
       el('div', { class: 'nowrap mono', text: execution.response_model ? String(execution.response_model) : '未上报' }),
@@ -2957,26 +2999,6 @@
     return tableScroll(el('table', { class: 'data data-wide' }, [el('thead', {}, [head]), body]));
   }
 
-  function requestPriceText(request) {
-    if (priceMissing(request.price)) return '无价格记录（拒绝计费，不按 0 计价）';
-    if (request.price.billing_mode === 'per_image') {
-      return '按图计费 ' + formatMicroUSD(request.price.per_image_micro_usd) + '/张 · 请求数量 ' +
-        formatInt(request.image_count || 1) + '；成功计费一次，不按执行次数重复扣费';
-    }
-    var summary = ratesSummaryText(request.price.rates);
-    if (summary) return summary + (request.price_tiers && request.price_tiers.length
-      ? ' · 基础价格含 ' + formatInt(request.price_tiers.length) + ' 个冻结档位，按实际输入与服务等级结算' : '');
-    var rates = request.price.rates || {};
-    var parts = [
-      '输入 ' + formatInt(rates.input) + ' µUSD/1M',
-      '输出 ' + formatInt(rates.output) + ' µUSD/1M',
-      '思考 ' + reasoningRateText(rates),
-      '缓存读 ' + formatInt(rates.cache_read) + ' µUSD/1M',
-      '缓存写 ' + formatInt(rates.cache_write) + ' µUSD/1M',
-    ];
-    return parts.join('　·　') + '　（价格版本 ' + formatInt(request.price.version) + '）';
-  }
-
   function renderUsageRequestCard(request) {
     var executions = request.executions || [];
     var keyLabel = (function () {
@@ -2990,9 +3012,6 @@
       return request.key_id || '—';
     })();
 
-    var adjustmentMicro = request.adjustment_micro_usd === undefined || request.adjustment_micro_usd === null ? 0 : request.adjustment_micro_usd;
-    var adjustmentNonZero = intString(adjustmentMicro) !== '0';
-
     var head = el('div', { class: 'row-title' }, [
       el('span', { class: 'request-model mono', text: request.model || '—' }),
       el('span', { class: 'key-label mono', text: '请求 ' + shortId(request.id), title: String(request.id || '') }),
@@ -3001,20 +3020,26 @@
       el('span', { class: 'pill-note', text: 'Key ' + keyLabel }),
       el('span', { class: 'pill-note', text: '开始 ' + formatDateTime(request.started_at) }),
     ]);
+
     var knownCosts = executions.filter(function (e) {
-      return e.cost_micro_usd !== undefined && e.cost_micro_usd !== null;
+      return hasCostValue(e.cost_micro_usd);
     });
+    var unpricedCount = executions.length - knownCosts.length;
     var executionCost = global.CMNumbers.sumIntTexts(knownCosts.map(function (e) { return e.cost_micro_usd; }));
+    var costText;
+    if (!executions.length) {
+      costText = '费用按实际执行日志计算（当前无执行记录）';
+    } else if (!knownCosts.length) {
+      costText = '已定价小计 未定价（' + formatInt(unpricedCount) + ' 条执行，不是免费）';
+    } else {
+      costText = '已定价小计 ' + formatMicroUSD(executionCost) +
+        (unpricedCount ? '；另有 ' + formatInt(unpricedCount) + ' 条未定价（不是免费）' : '');
+    }
     var costLine = el('div', { class: 'request-totals' }, [
       el('span', { text: '执行 ' + formatInt(executions.length) + ' 次' }),
       el('span', {
-        class: 'mono',
-        text: knownCosts.length ? '执行成本 ' + formatMicroUSD(executionCost) +
-          (knownCosts.length < executions.length ? '（已知部分）' : '') : '执行成本 未结算',
-      }),
-      el('span', {
-        class: adjustmentNonZero ? 'is-warn' : '',
-        text: '人工补记 ' + formatMicroUSD(adjustmentMicro),
+        class: 'mono' + (knownCosts.length ? '' : ' is-warn'),
+        text: costText,
       }),
     ]);
 
@@ -3027,16 +3052,6 @@
           openCaptureDialog(request);
         },
       }),
-      isPendingRequest(request)
-        ? el('button', {
-            class: 'btn btn-small',
-            type: 'button',
-            text: '处理待定',
-            onclick: function () {
-              openResolveDialog(request);
-            },
-          })
-        : null,
     ]);
 
     var relation = modelRelation(
@@ -3061,17 +3076,16 @@
           text: executions.length && executions[0].response_model ? String(executions[0].response_model) : '未上报',
         }),
       ]),
-      el('div', { class: 'kv kv-wide' }, [
-        el('span', { class: 'kv-k', text: '价格' }),
-        el('span', { class: 'kv-v', text: requestPriceText(request) }),
+      el('div', { class: 'kv' }, [
+        el('span', { class: 'kv-k', text: '服务等级' }),
+        el('span', { class: 'kv-v', text: request.service_tier ? String(request.service_tier) : '未上报' }),
       ]),
-      request.pricing_rule_id ? el('div', { class: 'kv kv-wide' }, [
-        el('span', { class: 'kv-k', text: '冻结定价规则' }),
-        el('span', { class: 'kv-v mono', text: request.pricing_rule_id + (request.service_tier ? ' · 请求服务 ' + request.service_tier : '') }),
-      ]) : null,
       el('div', { class: 'kv kv-wide' }, [
-        el('span', { class: 'kv-k', text: '人工补记（adjustment_micro_usd）' }),
-        el('span', { class: 'kv-v', text: formatMicroUSDPair(adjustmentMicro) + '（管理员 Resolve 记账，独立于执行成本）' }),
+        el('span', { class: 'kv-k', text: '费用口径' }),
+        el('span', {
+          class: 'kv-v',
+          text: '按实际执行日志与当前价格查询时计算；请求本身不保存冻结价格或人工金额。修改价格后该请求的历史金额会随之重算。',
+        }),
       ]),
     ]);
 
@@ -3086,8 +3100,8 @@
       executions.length ? executionTable(request) : el('p', {
         class: 'note',
         text: isPendingRequest(request)
-          ? '该请求尚无执行记录，状态为待定：已知用量照常入账，未知部分需要管理员在「处理待定」中释放或扣费。'
-          : '该请求尚无执行记录；进行中的请求按实际用量入账，等执行事件到达后按有效价格扣费。',
+          ? '该请求尚无执行记录，状态为用量待完整：费用只按实际日志与当前价格查询时计算，不需要人工结算。'
+          : '该请求尚无执行记录；执行事件到达后，金额会按实际日志与当前价格查询时计算。',
       }),
     ]);
     return el('div', { class: 'card request-card' }, [
@@ -3097,8 +3111,8 @@
         ? el('p', {
             class: 'note',
             text:
-              '当前按 Provider/auth_id 过滤：下方明细与该卡片的执行相关数字只包含匹配的执行，' +
-              '而人工补记是该请求的全部人工记账，因此两者不能当作全 Key 账本的对账口径。',
+              '当前按 Provider/auth_id 过滤：下方明细与该卡片的金额只包含匹配的执行，' +
+              '不代表该 Key 或全历史的全部支出。',
           })
         : null,
       detail,
@@ -3326,95 +3340,6 @@
     renderView();
   }
 
-  /* ---------------- 待定请求的财务处理 ---------------- */
-
-  function openResolveDialog(request) {
-    var actionSelect = el('select', { id: 'resolve-action' }, [
-      el('option', { value: 'release', text: '释放（release）：不补记扣费，结案该请求' }),
-      el('option', { value: 'charge', text: '扣费（charge）：按填写的金额入账' }),
-    ]);
-    var amount = moneyPairInput({ label: '金额', micro: '0' });
-    var reasonInput = el('input', { type: 'text', id: 'resolve-reason', placeholder: '必填，会写入账本' });
-    var confirmInput = el('input', { type: 'checkbox', id: 'resolve-confirm' });
-    var handle = openDialog({
-      title: '处理待定请求 · ' + shortId(request.id),
-      body: [
-        el('div', { class: 'grid-2' }, [
-          kvRow('请求 ID', request.id || '—'),
-          kvRow('请求模型', request.model || '—'),
-          kvRow('状态', stateLabel(request.state) + ' / ' + outcomeLabel(request.outcome)),
-        ]),
-        el('p', {
-          class: 'hint hint-warn',
-          text:
-            '这是一次财务操作：账本只追加、不会覆盖历史，请确认金额与理由准确。金额以整数微美元提交（1 USD = 1,000,000 微美元），可使用美元输入自动精确换算。',
-        }),
-        el('div', { class: 'form-grid' }, [
-          el('div', { class: 'field' }, [el('label', { for: 'resolve-action', text: '处理方式' }), actionSelect]),
-          el('div', { class: 'field' }, [el('label', { for: 'resolve-reason', text: '理由（必填）' }), reasonInput]),
-          amount.node,
-        ]),
-        el('div', { class: 'field' }, [
-          el('label', { for: 'resolve-confirm', text: '我确认这是一次财务处理，且理由与金额会被永久记录' }),
-          confirmInput,
-        ]),
-      ],
-      footer: [
-        el('button', { class: 'btn', type: 'button', text: '取消', onclick: closeDialog }),
-        el('button', {
-          class: 'btn btn-primary',
-          type: 'button',
-          text: '提交处理',
-          onclick: function () {
-            submitResolve(handle, request, {
-              action: actionSelect.value,
-              amountPair: amount,
-              reason: reasonInput.value,
-              confirmed: confirmInput.checked,
-            });
-          },
-        }),
-      ],
-    });
-    return handle;
-  }
-
-  function submitResolve(handle, request, form) {
-    var errors = [];
-    var reason = String(form.reason || '').trim();
-    if (!reason) errors.push('必须填写处理理由');
-    if (!form.confirmed) errors.push('请先勾选财务处理确认项');
-    var micro = readMoneyInput(form.amountPair, '金额', errors);
-    if (form.action === 'charge' && (micro === '0' || micro === '')) {
-      errors.push('扣费金额必须大于 0');
-    }
-    if (form.action === 'release' && micro !== '0') {
-      errors.push('释放不应对金额扣费，请将金额填为 0');
-    }
-    if (errors.length) {
-      handle.setError(errors.join('；'));
-      return;
-    }
-    handle.setError('');
-    var payload = {
-      id: request.id,
-      action: form.action,
-      amount_micro_usd: intVal(micro),
-      reason: reason,
-    };
-    api.resolve(payload).then(
-      function () {
-        notify('已提交财务处理：' + (form.action === 'release' ? '释放' : '扣费') + ' ' + formatMicroUSD(micro), 'ok');
-        handle.close();
-        loadUsage(true);
-      },
-      function (error) {
-        if (failRequest(error)) return;
-        handle.setError(describeError(error));
-      }
-    );
-  }
-
   /* ================================================================== *
    * 客户端 Key
    * ================================================================== */
@@ -3477,38 +3402,10 @@
 
   function limitLine(label, value) {
     var text = intString(value);
-    if (text === '0') return el('div', { class: 'nowrap', text: label + '：不限' });
+    if (text === '0' || text === '') {
+      return el('div', { class: 'nowrap', text: label + '：未设置' });
+    }
     return el('div', { class: 'nowrap', text: label + '：' + microToUSDText(text) + ' USD · ' + formatInt(text) + ' µUSD' });
-  }
-
-  function quotaProgress(key) {
-    var spec = key.spec || {};
-    var limit = intString(spec.quota_micro_usd);
-    var spent = intString(key.quota_used_micro_usd || 0);
-    if (limit === '0') return el('span', { class: 'pill-note', text: '总额度不限' });
-    var percent = ratioPercent(spent, limit);
-    return el('div', {}, [
-      el('div', { class: 'progress' }, [
-        el('div', {
-          class: 'progress-fill' + (percent !== null && percent >= 90 ? ' danger' : percent !== null && percent >= 70 ? ' warn' : ''),
-          style: 'width:' + (percent === null ? 0 : Math.max(0, Math.min(100, percent))) + '%',
-        }),
-      ]),
-      el('div', { class: 'pill-note', text: '已用 ' + (percent === null ? '—' : percent.toFixed(2) + '%') + '（' + formatMicroUSD(spent) + ' / ' + formatMicroUSD(limit) + '）' }),
-    ]);
-  }
-
-  // 精确百分比（0.01% 精度），避免大整数相除的浮点偏差。
-  function ratioPercent(part, whole) {
-    var a = intString(part);
-    var b = intString(whole);
-    if (!isIntegerText(a) || !isIntegerText(b)) return null;
-    var bigA = BigInt(a);
-    var bigB = BigInt(b);
-    if (bigB === 0n) return null;
-    if (bigA < 0n) bigA = -bigA;
-    if (bigB < 0n) bigB = -bigB;
-    return Number((bigA * 10000n) / bigB) / 100;
   }
 
   function renderKeys() {
@@ -3561,8 +3458,6 @@
         }
       }
 
-      var effectiveSpent = key.quota_used_micro_usd || 0;
-
       return el('tr', { class: 'row-main' + (isDeleted ? ' is-deleted' : '') }, [
         el('td', {}, [
           el('div', { text: spec.label || '（未命名）' }),
@@ -3574,16 +3469,12 @@
         el('td', {}, statusBadges),
         el('td', {}, [el('div', { class: 'key-fingerprint', text: key.fingerprint || '—' })]),
         el('td', {}, [el('div', { class: 'key-principal', text: key.principal || '—' })]),
-        el('td', { class: 'num' }, [
-          el('div', { text: formatMicroUSD(effectiveSpent) }),
-          el('div', { class: 'pill-note', text: '累积 ' + formatMicroUSD(key.spent_micro_usd) }),
-          quotaProgress(key),
-        ]),
         el('td', { class: 'limits' }, [
-          limitLine('总额度', spec.quota_micro_usd),
-          limitLine('日', spec.daily_micro_usd),
-          limitLine('周', spec.weekly_micro_usd),
-          limitLine('月', spec.monthly_micro_usd),
+          el('div', { class: 'pill-note', text: '仅展示，不限制调用' }),
+          limitLine('总额预算', spec.quota_micro_usd),
+          limitLine('日预算', spec.daily_micro_usd),
+          limitLine('周预算', spec.weekly_micro_usd),
+          limitLine('月预算', spec.monthly_micro_usd),
         ]),
         el('td', { class: 'num', text: intString(spec.max_concurrent) === '0' ? '不限' : formatInt(spec.max_concurrent) }),
         el('td', {}, [
@@ -3634,10 +3525,10 @@
             el('button', {
               class: 'btn btn-small',
               type: 'button',
-              text: '重置额度',
+              text: '重置 Token',
               disabled: isDeleted ? true : undefined,
               onclick: function () {
-                openResetSpendDialog(key);
+                openResetTokensDialog(key);
               },
             }),
             el('button', {
@@ -3660,8 +3551,7 @@
       el('th', { text: '状态' }),
       el('th', { text: '指纹' }),
       el('th', { text: 'Principal' }),
-      el('th', { class: 'num', text: '有效已用 / 累积支出' }),
-      el('th', { class: 'num', text: '额度' }),
+      el('th', { class: 'num', text: '预算（仅展示，不限制调用）' }),
       el('th', { class: 'num', text: '并发' }),
       el('th', { text: '允许模型 / token 限额' }),
       el('th', { text: '操作' }),
@@ -3676,10 +3566,10 @@
     var labelInput = el('input', { type: 'text', id: 'key-label', value: spec.label || '' });
     var enabledInput = el('input', { type: 'checkbox', id: 'key-enabled', class: 'switch-input', role: 'switch' });
     enabledInput.checked = creating ? true : spec.enabled === true;
-    var quotaField = moneyPairInput({ label: '总额度', micro: intString(spec.quota_micro_usd || 0) });
-    var dailyField = moneyPairInput({ label: '每日额度', micro: intString(spec.daily_micro_usd || 0) });
-    var weeklyField = moneyPairInput({ label: '每周额度', micro: intString(spec.weekly_micro_usd || 0) });
-    var monthlyField = moneyPairInput({ label: '每月额度', micro: intString(spec.monthly_micro_usd || 0) });
+    var quotaField = moneyPairInput({ label: '总额预算（仅展示，不限制调用）', micro: intString(spec.quota_micro_usd || 0) });
+    var dailyField = moneyPairInput({ label: '每日预算（仅展示）', micro: intString(spec.daily_micro_usd || 0) });
+    var weeklyField = moneyPairInput({ label: '每周预算（仅展示）', micro: intString(spec.weekly_micro_usd || 0) });
+    var monthlyField = moneyPairInput({ label: '每月预算（仅展示）', micro: intString(spec.monthly_micro_usd || 0) });
     var concurrentInput = el('input', { type: 'text', inputmode: 'numeric', id: 'key-concurrent', value: intString(spec.max_concurrent || 0) });
     var allowedInput = el('textarea', { id: 'key-allowed', rows: 4, placeholder: '每行一个精确模型 ID；留空表示允许全部模型' });
     allowedInput.value = (spec.allowed_models || []).join('\n');
@@ -3708,8 +3598,8 @@
       body: [
         errorNode,
         creating ? el('p', {
-          class: 'hint hint-warn',
-          text: '创建 Key 不会自动定价；允许全部模型不等于免费。调用前请在「价格规则」为客户端请求的模型 ID 配置价格，并用「价格预览」确认匹配。',
+          class: 'hint',
+          text: '预算只用于展示，不限制请求；0 表示未设置预算。费用在查询日志时按当前价格与实际用量计算，缺价不会阻止调用。',
         }) : null,
         creating
           ? el('p', {
@@ -3781,10 +3671,10 @@
             var fields = {
               label: labelInput.value,
               enabled: enabledInput.checked,
-              quotaMicroUSD: readMoneyInput(quotaField, '总额度', errors),
-              dailyMicroUSD: readMoneyInput(dailyField, '每日额度', errors),
-              weeklyMicroUSD: readMoneyInput(weeklyField, '每周额度', errors),
-              monthlyMicroUSD: readMoneyInput(monthlyField, '每月额度', errors),
+              quotaMicroUSD: readMoneyInput(quotaField, '总额预算', errors),
+              dailyMicroUSD: readMoneyInput(dailyField, '每日预算', errors),
+              weeklyMicroUSD: readMoneyInput(weeklyField, '每周预算', errors),
+              monthlyMicroUSD: readMoneyInput(monthlyField, '每月预算', errors),
               maxConcurrent: '0',
               allowedModels: splitAllowedModels(allowedInput.value),
             };
@@ -4053,24 +3943,24 @@
     ]);
   }
 
-  function openResetSpendDialog(key) {
+  function openResetTokensDialog(key) {
     var isBatch = !key;
     var reasonInput = el('input', { type: 'text', id: 'reset-reason', placeholder: '例如: 月度账期刷新' });
     var chkTotal = el('input', { type: 'checkbox', checked: true });
     var chkDaily = el('input', { type: 'checkbox', checked: true });
     var chkWeekly = el('input', { type: 'checkbox', checked: true });
     var chkMonthly = el('input', { type: 'checkbox', checked: true });
-    var confirmCheckbox = el('input', { type: 'checkbox' });
+    var confirmCheckbox = el('input', { type: 'checkbox', id: 'reset-tokens-confirm' });
 
     var dialog = openDialog({
-      title: isBatch ? '批量重置额度基线' : ('重置 Key 额度基线 · ' + shortId(key.id)),
+      title: isBatch ? '批量重置 Token 用量基线' : ('重置 Key Token 用量基线 · ' + shortId(key.id)),
       wide: false,
     });
 
     var submitBtn = el('button', {
       class: 'btn btn-primary',
       type: 'button',
-      text: '执行额度重置',
+      text: '执行 Token 重置',
       onclick: function () {
         var reason = reasonInput.value.trim();
         if (!confirmCheckbox.checked) {
@@ -4080,7 +3970,7 @@
         submitBtn.disabled = true;
         dialog.setError('');
         var spec = {
-          reason: reason || '额度周期重置',
+          reason: reason || 'Token 用量基线重置',
           total: chkTotal.checked,
           daily: chkDaily.checked,
           weekly: chkWeekly.checked,
@@ -4092,9 +3982,9 @@
           spec.all = true;
         }
 
-        api.resetSpend(spec).then(
+        api.resetTokens(spec).then(
           function (res) {
-            notify('额度基线已成功重置（影响 ' + (res && res.keys ? res.keys : 1) + ' 个 Key）');
+            notify('Token 用量基线已重置（影响 ' + (res && res.keys ? res.keys : 1) + ' 个 Key；不影响日志、费用或预算）');
             dialog.close();
             loadKeys(true);
           },
@@ -4107,15 +3997,15 @@
     });
 
     dialog.setBody([
-      el('p', { class: 'hint hint-warn', text: '额度重置通过在账本记录新基线快照生效，不会抹除或篡改已入账历史。未结算的待定请求与并发状态不受影响。' }),
+      el('p', { class: 'hint', text: '此操作只重置 Token 有效用量基线，不会删除或修改日志、查询派生费用与美元预算，也不会制造任何手工金额。进行中的请求与并发状态不受影响。' }),
       el('div', { class: 'form-grid' }, [
         el('div', { class: 'field' }, [
-          el('label', { text: '重置周期选择' }),
+          el('label', { text: 'Token 计数周期选择' }),
           el('div', { class: 'checkbox-group' }, [
-            el('label', { class: 'checkbox-label' }, [chkTotal, document.createTextNode(' 总计额度 (total)')]),
-            el('label', { class: 'checkbox-label' }, [chkDaily, document.createTextNode(' 日度周期 (daily)')]),
-            el('label', { class: 'checkbox-label' }, [chkWeekly, document.createTextNode(' 周度周期 (weekly)')]),
-            el('label', { class: 'checkbox-label' }, [chkMonthly, document.createTextNode(' 月度周期 (monthly)')]),
+            el('label', { class: 'checkbox-label' }, [chkTotal, document.createTextNode(' 总计 Token (total)')]),
+            el('label', { class: 'checkbox-label' }, [chkDaily, document.createTextNode(' 日度 Token (daily)')]),
+            el('label', { class: 'checkbox-label' }, [chkWeekly, document.createTextNode(' 周度 Token (weekly)')]),
+            el('label', { class: 'checkbox-label' }, [chkMonthly, document.createTextNode(' 月度 Token (monthly)')]),
           ]),
         ]),
         el('div', { class: 'field' }, [
@@ -4125,7 +4015,7 @@
         el('div', { class: 'field' }, [
           el('label', { class: 'checkbox-label' }, [
             confirmCheckbox,
-            document.createTextNode(' 确认执行额度基线重置'),
+            document.createTextNode(' 确认执行 Token 用量基线重置'),
           ]),
         ]),
       ]),
@@ -4522,7 +4412,7 @@
     setStatusLine(status, '共 ' + formatInt(state.prices.items.length) + ' 条价格（接口：GET ' + MANAGER_BASE + '/api/prices）');
     if (countNode) countNode.textContent = '共 ' + formatInt(state.prices.items.length) + ' 条精确价格';
     if (!state.prices.items.length) {
-      renderEmpty(container, '还没有价格记录。缺失价格的模型会被拒绝计费，不会被当作免费。');
+      renderEmpty(container, '还没有价格记录。缺失当前价格的模型在日志中显示为未定价，不会被当作免费；补价后历史金额会立即重算。');
       return;
     }
     var rows = state.prices.items.map(function (price) {
@@ -5111,10 +5001,10 @@
         loadKeys(true);
       });
     }
-    var batchResetBtn = $('btn-batch-reset-spend');
+    var batchResetBtn = $('btn-batch-reset-tokens');
     if (batchResetBtn) {
       batchResetBtn.addEventListener('click', function () {
-        openResetSpendDialog(null);
+        openResetTokensDialog(null);
       });
     }
     var callersCreate = $('callers-create');

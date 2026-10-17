@@ -299,7 +299,7 @@ async function main() {
     check('登录只请求健康检查、概览与 Key 列表', JSON.stringify(afterLoginApis) === JSON.stringify(['health', 'keys', 'overview']), JSON.stringify(afterLoginApis));
 
     const overviewSummary = await cdp.text('#overview-summary');
-    check('概览卡片包含总请求数与总成本', overviewSummary.includes('总请求数') && overviewSummary.includes('总成本'));
+    check('概览卡片包含总请求数与已定价费用小计', overviewSummary.includes('总请求数') && overviewSummary.includes('已定价费用小计') && overviewSummary.includes('未定价执行'));
     check('概览模型占比卡片存在', await cdp.evaluate("!!document.querySelector('#overview-model-share')"));
     check('概览模型效率排行卡片存在', await cdp.evaluate("!!document.querySelector('#overview-model-rank')"));
     check('概览不显示后端未支持的来源筛选', await cdp.evaluate("document.querySelector('#overview-source') === null"));
@@ -321,12 +321,12 @@ async function main() {
     check('执行成本按微美元精确渲染大整数', summaryText.includes('123456789012.345678 USD'), summaryText.replace(/\n/g, ' ').slice(0, 200));
     const summaryLabels = await cdp.evaluate("[...document.querySelectorAll('#usage-summary .metric-label')].map((n) => n.textContent.trim())");
     check(
-      '汇总卡片标签准确（失败请求/未结算请求/执行成本/人工补记）',
+      '汇总卡片标签准确（失败请求/用量待完整/已定价小计/未定价执行）',
       JSON.stringify(summaryLabels.slice(0, 6)) ===
-        JSON.stringify(['请求数（Request 行）', '执行数（实际执行）', '失败请求', '未结算请求', '执行成本', '人工补记']) &&
+        JSON.stringify(['请求数（Request 行）', '执行数（实际执行）', '失败请求', '用量待完整请求', '已定价费用小计', '未定价执行']) &&
         summaryLabels.indexOf('失败执行') < 0 &&
-        summaryLabels.indexOf('待定请求') < 0 &&
-        summaryLabels.indexOf('成本合计') < 0,
+        summaryLabels.indexOf('未结算') < 0 &&
+        summaryLabels.indexOf('人工补记') < 0,
       JSON.stringify(summaryLabels)
     );
     check(
@@ -335,23 +335,25 @@ async function main() {
       summaryText.replace(/\n/g, ' ').slice(0, 240)
     );
     check(
-      '未结算请求说明已知用量照常入账',
-      summaryText.includes('未结算请求') && summaryText.includes('已知用量照常入账，未知部分待核账') && !summaryText.includes('不计入成本'),
+      '用量待完整请求不再使用结算/扣款语言',
+      summaryText.includes('用量待完整请求') && summaryText.includes('完整用量与缺价执行仍会正常完成') &&
+        !summaryText.includes('未结算') && !summaryText.includes('扣款'),
       summaryText.replace(/\n/g, ' ').slice(0, 240)
     );
     check(
-      '执行成本与人工补记分成两张卡片',
-      summaryText.includes('执行成本') && summaryText.includes('人工补记') && summaryText.includes('不计入执行成本'),
+      '已定价小计与未定价执行分开显示',
+      summaryText.includes('已定价费用小计') && summaryText.includes('另有 2 条未定价执行不计入小计（不是免费）') &&
+        summaryText.includes('未定价执行') && !summaryText.includes('人工补记'),
       summaryText.replace(/\n/g, ' ').slice(0, 240)
     );
-    check('人工补记按微美元精确渲染', summaryText.includes('2.5 USD') && summaryText.includes('2,500,000 µUSD'), summaryText.replace(/\n/g, ' ').slice(0, 240));
     check('汇总包含 token 分桶与缓存占比', summaryText.includes('缓存读占比') && summaryText.includes('tokens 合计'));
     const scopeNote = await cdp.text('#usage-quality-note');
-    check('质量覆盖说明基于 complete 执行', scopeNote.includes('complete'));
+    check('质量覆盖说明基于 complete 执行且不代表价格完整', scopeNote.includes('完整执行占比') && scopeNote.includes('不代表价格完整率'));
     check(
-      '口径说明不把筛选合计当作全 Key 账本',
-      scopeNote.includes('不等于全 Key 账本支出') && scopeNote.includes('人工补记按请求汇总'),
-      scopeNote.slice(0, 240)
+      '口径说明强调查询派生、改价重算且未定价不是免费',
+      scopeNote.includes('当前价格 × 实际日志') && scopeNote.includes('修改、添加或删除价格后历史金额立即重算') &&
+        scopeNote.includes('不存在冻结价或永久累计支出') && scopeNote.includes('未定价执行 2 条不计入小计，也不是免费'),
+      scopeNote.slice(0, 320)
     );
     check('展示保留边界', (await cdp.text('#usage-retention')).includes('2026-07-01'));
     check('全局引入 real ECharts 依赖', (await cdp.evaluate("typeof window.echarts !== 'undefined'")));
@@ -394,7 +396,9 @@ async function main() {
     check('费用趋势图具有真实的 ECharts 实例且具备正尺寸与数据', chartDetails.cst.hasInstance && chartDetails.cst.width > 0 && chartDetails.cst.height > 0 && chartDetails.cst.seriesCount > 0 && chartDetails.cst.dataCount > 0, JSON.stringify(chartDetails.cst));
 
     const costTooltip = await cdp.evaluate("(() => { const cst = window.echarts.getInstanceByDom(document.querySelector('#usage-cost-chart')); return cst ? cst.getOption().tooltip[0].formatter([{ dataIndex: 0 }]) : ''; })()");
-    check('费用趋势图 Tooltip 标注执行成本与人工补记', costTooltip.includes('执行成本') && costTooltip.includes('人工补记'), costTooltip);
+    check('费用趋势图 Tooltip 标注已定价小计与未定价不是免费', costTooltip.includes('已定价费用小计') && costTooltip.includes('费用按当前价格 × 实际日志查询计算'), costTooltip);
+    const costTooltipUnpriced = await cdp.evaluate("(() => { const cst = window.echarts.getInstanceByDom(document.querySelector('#usage-cost-chart')); return cst ? cst.getOption().tooltip[0].formatter([{ dataIndex: 3 }]) : ''; })()");
+    check('费用趋势图 Tooltip 对未定价区间明确不是免费', costTooltipUnpriced.includes('未定价') && costTooltipUnpriced.includes('不是免费'), costTooltipUnpriced);
 
     check('请求明细默认收起', await cdp.evaluate("[...document.querySelectorAll('#usage-items .request-detail')].every(n => !n.open)"));
     const collapsedHeight = await cdp.evaluate("Math.max(...[...document.querySelectorAll('#usage-items > .card')].map(n => n.getBoundingClientRect().height))");
@@ -412,10 +416,10 @@ async function main() {
       };
     })()`);
     const desktopLayout = await requestLayout();
-    check('桌面请求字段保留可读宽度而非逐字竖排', desktopLayout.fields === 30 && desktopLayout.minValueWidth >= 80, JSON.stringify(desktopLayout));
-    check('桌面长价格和人工补记不撑高请求卡片', desktopLayout.maxCardHeight < 600, JSON.stringify(desktopLayout));
+    check('桌面请求字段保留可读宽度而非逐字竖排', desktopLayout.fields === 35 && desktopLayout.minValueWidth >= 80, JSON.stringify(desktopLayout));
+    check('费用口径说明不撑高请求卡片', desktopLayout.maxCardHeight < 600, JSON.stringify(desktopLayout));
     check('命名空间差异仅提示不当作异常', itemsText.includes('仅命名空间前缀不同'), itemsText.slice(0, 200));
-    // 质量非完整（partial/unknown）且服务端未给金额时必须是「未结算」，不能显示 0。
+    // 质量非完整（partial/unknown）且服务端未给金额时必须是「未定价」，不能显示 0。
     const execCosts = await cdp.evaluate(
       "(() => { const cards = [...document.querySelectorAll('#usage-items .card')];" +
         " const pick = (id) => { const card = cards.find((c) => c.innerText.indexOf(id) >= 0); if (!card) return null;" +
@@ -424,36 +428,46 @@ async function main() {
         " return { unknown: pick('req-002'), partial: pick('req-005') }; })()"
     );
     check(
-      '未知质量且无金额时显示未结算而不是 0',
+      '未知质量且无金额时显示未定价而不是 0',
       !!execCosts.unknown &&
         execCosts.unknown[0].quality.indexOf('未知') >= 0 &&
-        execCosts.unknown[0].cost.indexOf('未结算') >= 0 &&
-        execCosts.unknown[0].cost.indexOf('质量非完整（unknown）') >= 0 &&
-        execCosts.unknown[0].cost.indexOf('不是 0') >= 0,
+        execCosts.unknown[0].cost.indexOf('未定价') >= 0 &&
+        execCosts.unknown[0].cost.indexOf('不是 0') >= 0 &&
+        execCosts.unknown[0].cost.indexOf('USD') < 0,
       JSON.stringify(execCosts.unknown)
     );
     check(
-      '非完整质量但有已知金额时照常显示金额',
+      '部分质量且无可靠金额时同样显示未定价',
       !!execCosts.partial &&
         execCosts.partial[0].quality.indexOf('部分') >= 0 &&
-        execCosts.partial[0].cost.indexOf('USD') >= 0 &&
-        execCosts.partial[0].cost.indexOf('未结算') < 0,
+        execCosts.partial[0].cost.indexOf('未定价') >= 0 &&
+        execCosts.partial[0].cost.indexOf('不是 0') >= 0,
       JSON.stringify(execCosts.partial)
     );
-    check('显式全零价格显示免费', itemsText.includes('显式全零：免费'));
-    check('待定请求提供财务处理入口', itemsText.includes('处理待定'));
-    check('只有 pending 请求提供人工处理入口', (await cdp.count('#usage-items button:not([disabled])')) > 0 && (await cdp.evaluate("[...document.querySelectorAll('#usage-items .card')].filter((c) => [...c.querySelectorAll('button')].some((b) => b.textContent.trim() === '处理待定')).length")) === 1);
+    const freeRow = await cdp.evaluate(
+      "(() => { const cards = [...document.querySelectorAll('#usage-items .card')];" +
+        " const card = cards.find((c) => c.innerText.indexOf('req-008') >= 0); if (!card) return null;" +
+        " const row = [...card.querySelectorAll('tbody tr')][0]; const tds = [...row.querySelectorAll('td')];" +
+        " return tds[6] ? tds[6].innerText.replace(/\\n/g, ' ') : ''; })()"
+    );
+    check('显式全零费用显示 0 USD，与未定价明确并列', !!freeRow && freeRow.includes('0 USD') && freeRow.indexOf('未定价') < 0, String(freeRow));
     check(
-      '进行中的请求不显示人工处理入口',
-      await cdp.evaluate("(() => { const cards = [...document.querySelectorAll('#usage-items .card')]; const active = cards.find((c) => c.innerText.includes('req-007')); return !!active && ![...active.querySelectorAll('button')].some((b) => b.textContent.trim() === '处理待定'); })()")
+      '不存在人工财务处理入口',
+      !itemsText.includes('处理待定') && !itemsText.includes('人工补记') && !itemsText.includes('冻结定价'),
+      itemsText.replace(/\n/g, ' ').slice(0, 240)
+    );
+    check(
+      '当前请求范围内没有 Resolve 弹窗或遗留财务按钮',
+      (await cdp.count('.modal #resolve-action')) === 0 &&
+        (await cdp.evaluate("![...document.querySelectorAll('#usage-items button')].some((b) => /处理待定|释放|扣费/.test(b.textContent))")) === true
     );
     check(
       '请求卡片在可见 DOM 中不含持有金额',
       await cdp.evaluate("![...document.querySelectorAll('#usage-items .request-totals span')].some((s) => s.textContent.includes('持有'))")
     );
-    check('请求卡片展示人工补记而不是隐藏', itemsText.includes('人工补记（adjustment_micro_usd）') && itemsText.includes('人工补记 2.5 USD'), itemsText.replace(/\n/g, ' ').slice(0, 240));
+    check('请求卡片展示查询派生费用口径', itemsText.includes('按实际执行日志与当前价格查询时计算') && itemsText.includes('不保存冻结价格或人工金额'), itemsText.replace(/\n/g, ' ').slice(0, 240));
     check('执行行区分质量状态', itemsText.includes('完整') && itemsText.includes('部分') && itemsText.includes('未知'), itemsText.slice(0, 200));
-    check('结果与状态按契约枚举显示为中文', itemsText.includes('成功') && itemsText.includes('失败') && itemsText.includes('拒绝') && itemsText.includes('已结算') && itemsText.includes('待定'), itemsText.slice(0, 200));
+    check('结果与状态按契约枚举显示为中文', itemsText.includes('成功') && itemsText.includes('失败') && itemsText.includes('拒绝') && itemsText.includes('已完成') && itemsText.includes('用量待完整') && itemsText.includes('执行中'), itemsText.slice(0, 240));
     check('服务端返回的 HTML 片段被当作纯文本', itemsText.includes('<img src=x'), itemsText.slice(-200));
     check('服务端数据未被解析为元素', (await cdp.count('#usage-items img')) === 0);
     check('模型字段未触发注入脚本', (await cdp.evaluate('window.__xss === undefined')) === true);
@@ -508,14 +522,15 @@ async function main() {
     const scopedNote = await cdp.text('#usage-quality-note');
     check(
       '按 Provider 过滤时明确只匹配执行且不等于全 Key 台账',
-      scopedNote.includes('已按 Provider/auth_id 过滤') && scopedNote.includes('不能把该合计当作全 Key 台账'),
+      scopedNote.includes('已按 Provider/auth_id 过滤') && scopedNote.includes('明细与金额只包含匹配的执行') && scopedNote.includes('不代表整个 Key 的全部日志'),
       scopedNote.slice(0, 240)
     );
     const scopedSummary = await cdp.text('#usage-summary');
     check(
-      '过滤后执行成本说明匹配范围、人工补记说明不受过滤',
-      scopedSummary.includes('已按 Provider/auth_id 过滤') && scopedSummary.includes('不受 Provider/auth_id 过滤'),
-      scopedSummary.replace(/\n/g, ' ').slice(0, 240)
+      '过滤后已定价小计说明匹配范围且未定价仍单独计数',
+      scopedSummary.includes('已按 Provider/auth_id 过滤') && scopedSummary.includes('另有 2 条未定价执行不计入小计') &&
+        !scopedSummary.includes('人工补记'),
+      scopedSummary.replace(/\n/g, ' ').slice(0, 260)
     );
     check(
       '按 Provider 过滤时请求卡片标注执行维度受限',
@@ -576,51 +591,72 @@ async function main() {
 
     await cdp.evaluate("window.__scroll = null");
 
-    /* --- 5. 财务二次确认 --- */
-    await cdp.clickText('#usage-items .card:nth-child(3) button', '处理待定');
-    await cdp.waitFor("document.querySelector('.modal #resolve-action')", 10000, '财务弹窗');
-    check('财务弹窗警示不可撤销', (await cdp.text('.modal')).includes('财务操作'));
+    /* --- 5. 无人工财务入口；Token 重置只影响 Token 基线 --- */
     check(
-      '财务处理弹窗可见 DOM 中不含持有金额',
-      await cdp.evaluate("![...document.querySelectorAll('.modal .kv-k')].some((k) => k.textContent.includes('持有'))")
+      '请求卡片不存在人工财务入口或退役路由调用',
+      (await cdp.evaluate("![...document.querySelectorAll('#usage-items button')].some((b) => /处理待定|释放|扣费/.test(b.textContent))")) === true &&
+        (await hitsOf('/api/resolve')).length === 0 &&
+        (await hitsOf('/api/reset-spend')).length === 0
+    );
+
+    await cdp.click('#tab-keys');
+    await cdp.waitFor("document.querySelectorAll('#keys-list tbody tr').length === 2", 10000, 'Key 列表');
+    await cdp.click('#btn-batch-reset-tokens');
+    await cdp.waitFor("document.querySelector('.modal #reset-tokens-confirm')", 10000, 'Token 重置弹窗');
+    const resetModalText = await cdp.text('.modal');
+    check(
+      'Token 重置弹窗明确不影响日志、费用与预算',
+      resetModalText.includes('Token 用量基线') && resetModalText.includes('不会删除或修改日志、查询派生费用与美元预算') &&
+        resetModalText.includes('不会制造任何手工金额') && !resetModalText.includes('额度基线'),
+      resetModalText.replace(/\n/g, ' ').slice(0, 260)
     );
     check(
-      '财务处理弹窗选项中不含归还持有金额',
-      await cdp.evaluate("![...document.querySelectorAll('.modal select option')].some((o) => o.textContent.includes('持有'))")
+      'Token 重置弹窗没有财务金额输入',
+      await cdp.evaluate("document.querySelectorAll('.modal input[type=text]').length === 1 && document.querySelector('.modal .money-unit-tag') === null")
     );
-    await cdp.clickText('.modal button', '提交处理');
-    check('缺少理由与确认时拒绝提交', (await cdp.text('.modal .inline-error')).includes('理由'));
-    await cdp.evaluate("document.querySelector('.modal #resolve-action').value='charge'");
-    await cdp.setModalMoney('金额', 'usd', '1.25');
-    check('美元输入精确换算为整数微美元', (await cdp.modalMoney('金额', 'micro')) === '1250000', await cdp.modalMoney('金额', 'micro'));
-    await cdp.setValue('.modal #resolve-reason', '上游超时，按实际用量扣费');
-    await cdp.screenshot('05-resolve-modal.png', { fullPage: true });
-    await cdp.evaluate("document.querySelector('.modal #resolve-confirm').checked = true");
-    await cdp.clickText('.modal button', '提交处理');
-    await cdp.waitFor("!document.querySelector('#modal-root').hidden === false || document.querySelector('.toast')", 10000, '提交完成');
-    await sleep(300);
-    const resolveBody = JSON.parse((await debug('resolve')).body);
+    await cdp.evaluate("document.querySelector('#reset-tokens-confirm').checked = true");
+    await cdp.setValue('.modal #reset-reason', '季度 Token 基线刷新');
+    await cdp.screenshot('05-reset-tokens-modal.png', { fullPage: true });
+    await cdp.clickText('.modal button', '执行 Token 重置');
+    await cdp.waitFor("document.querySelector('.toast')", 10000, 'Token 重置完成');
+    let resetDebug = null;
+    for (let i = 0; i < 30 && !resetDebug; i += 1) {
+      resetDebug = await debug('reset-tokens');
+      if (!resetDebug) await sleep(100);
+    }
+    const resetHits = (await hits()).filter((h) => /reset|resolve/.test(h));
+    check('Token 重置实际调用 /api/reset-tokens', !!resetDebug, 'hits=' + JSON.stringify(resetHits));
+    const resetBody = resetDebug || {};
     check(
-      '财务处理请求体精确且带强制理由',
-      resolveBody.id === 'req-003' && resolveBody.action === 'charge' && resolveBody.amount_micro_usd === 1250000 && resolveBody.reason.length > 0,
-      JSON.stringify(resolveBody)
+      'Token 重置请求体只提交 Token 周期选择',
+      resetBody.all === true && resetBody.total === true && resetBody.daily === true &&
+        resetBody.weekly === true && resetBody.monthly === true && resetBody.reason.includes('Token'),
+      JSON.stringify(resetBody)
     );
+    check(
+      'Token 重置不调用退役路由且不提交金额',
+      (await hitsOf('/api/resolve')).length === 0 && (await hitsOf('/api/reset-spend')).length === 0 &&
+        !('amount_micro_usd' in resetBody) && !('spend' in resetBody),
+      JSON.stringify(resetBody)
+    );
+
     /* --- 6. 客户端 Key --- */
     await cdp.click('#tab-keys');
     await cdp.waitFor("document.querySelectorAll('#keys-list tbody tr').length === 2", 10000, 'Key 列表');
     const keysText = await cdp.text('#keys-list');
-    check('Key 列表展示标签/指纹/额度/并发', keysText.includes('生产主力') && keysText.includes('1daf934d4c6a6818') && keysText.includes('并发'));
+    check('Key 列表展示标签/指纹/预算/并发', keysText.includes('生产主力') && keysText.includes('1daf934d4c6a6818') && keysText.includes('预算') && keysText.includes('并发'));
     check('Key 列表指纹单行不换行', await cdp.evaluate("(() => { const el = document.querySelector('#keys-list .key-fingerprint'); return !!el && window.getComputedStyle(el).whiteSpace === 'nowrap'; })()"));
-    check('Key 列表页面含缺价上手提示', (await cdp.text('#panel-keys')).includes('创建 Key 不会自动定价') && (await cdp.text('#panel-keys')).includes('允许全部模型不等于免费'));
-    check('禁用状态与不限额度如实显示', keysText.includes('已禁用') && keysText.includes('总额度不限'));
+    check('Key 页面说明预算仅展示且缺价不阻止调用', (await cdp.text('#panel-keys')).includes('预算字段只用于展示，不限制调用') && (await cdp.text('#panel-keys')).includes('缺价不会阻止请求'));
+    check('禁用状态与未设置预算如实显示', keysText.includes('已禁用') && keysText.includes('未设置') && !keysText.includes('不限额度') && !keysText.includes('累积'));
     check(
       'Key 列表在可见 DOM 中不含持有金额',
       await cdp.evaluate("![...document.querySelectorAll('#keys-list tbody tr')].some((r) => r.textContent.includes('持有'))")
     );
-    const keysNumText = await cdp.evaluate("document.querySelector('#keys-list tbody tr:first-child td.num')?.innerText || ''");
+    const keysNumText = await cdp.evaluate("document.querySelector('#keys-list tbody tr:first-child td.limits')?.innerText || ''");
     check(
-      'Key 列表在可见 DOM 中展示正向剩余额度进度',
-      keysNumText.includes('已用') && (await cdp.count('#keys-list .progress-fill')) > 0,
+      'Key 列表只展示预算，不再展示永久已用/累计与进度条',
+      keysNumText.includes('仅展示，不限制调用') && keysNumText.includes('总额预算') &&
+        !keysNumText.includes('已用') && !keysNumText.includes('累积') && (await cdp.count('#keys-list .progress-fill')) === 0,
       keysNumText
     );
     check('允许模型与 token 限额可见', keysText.includes('opencode-go/glm-5') && keysText.includes('模型 token 限额'));
@@ -670,18 +706,18 @@ async function main() {
       getComputedStyle(document.querySelector(selector)).transitionDuration === '0s')`));
     await cdp.send('Emulation.setEmulatedMedia', { features: [] });
     const modalText = await cdp.text('.modal');
-    check('新建 Key 弹窗包含缺价上手提示', modalText.includes('创建 Key 不会自动定价') && modalText.includes('允许全部模型不等于免费'));
+    check('新建 Key 弹窗说明预算仅展示、0 为未设置且缺价不阻止调用', modalText.includes('预算只用于展示，不限制请求') && modalText.includes('0 表示未设置预算') && modalText.includes('缺价不会阻止调用'));
     const unitTags = await cdp.evaluate("[...document.querySelectorAll('.modal .money-unit-tag')].map((el) => el.textContent.trim())");
     check('金额输入包含常显单位 µUSD 与 USD', unitTags.includes('µUSD') && unitTags.includes('USD'));
     await cdp.setValue('.modal #key-label', '新Key');
-    await cdp.setModalMoney('总额度', 'micro', '9007199254740993');
-    check('超大整数微美元无损换算为美元', (await cdp.modalMoney('总额度', 'usd')) === '9007199254.740993', await cdp.modalMoney('总额度', 'usd'));
-    await cdp.setModalMoney('总额度', 'usd', '9007199254.740993');
-    check('超大整数美元无损反向换算为微美元', (await cdp.modalMoney('总额度', 'micro')) === '9007199254740993');
-    await cdp.setModalMoney('总额度', 'micro', '1234567');
-    check('微美元输入自动换算美元', (await cdp.modalMoney('总额度', 'usd')) === '1.234567', await cdp.modalMoney('总额度', 'usd'));
-    await cdp.setModalMoney('总额度', 'usd', '2.5');
-    check('美元反向换算回微美元无损', (await cdp.modalMoney('总额度', 'micro')) === '2500000');
+    await cdp.setModalMoney('总额预算', 'micro', '9007199254740993');
+    check('超大整数微美元无损换算为美元', (await cdp.modalMoney('总额预算', 'usd')) === '9007199254.740993', await cdp.modalMoney('总额预算', 'usd'));
+    await cdp.setModalMoney('总额预算', 'usd', '9007199254.740993');
+    check('超大整数美元无损反向换算为微美元', (await cdp.modalMoney('总额预算', 'micro')) === '9007199254740993');
+    await cdp.setModalMoney('总额预算', 'micro', '1234567');
+    check('微美元输入自动换算美元', (await cdp.modalMoney('总额预算', 'usd')) === '1.234567', await cdp.modalMoney('总额预算', 'usd'));
+    await cdp.setModalMoney('总额预算', 'usd', '2.5');
+    check('美元反向换算回微美元无损', (await cdp.modalMoney('总额预算', 'micro')) === '2500000');
     await cdp.clickText('.modal button', '创建');
     await cdp.waitFor("document.querySelector('.modal .secret-box')", 10000, '一次性密钥弹窗');
     const secretText = await cdp.text('.modal .secret-box');
@@ -702,7 +738,7 @@ async function main() {
     check('编辑预填允许模型', (await cdp.evaluate("document.querySelector('.modal #key-allowed').value")).includes('gpt-5'));
     check('编辑预填 token 限额 JSON', (await cdp.evaluate("document.querySelector('.modal #key-limits').value")).includes('gpt-5'));
     await cdp.setValue('.modal #key-label', '生产主力-改');
-    await cdp.setModalMoney('每日额度', 'usd', '2.5');
+    await cdp.setModalMoney('每日预算', 'usd', '2.5');
     await cdp.clickText('.modal button', '保存');
     await cdp.waitFor("document.querySelector('#keys-list')", 5000, '保存完成');
     await sleep(400);
@@ -1095,7 +1131,7 @@ async function main() {
     await cdp.click('#tab-audit');
     await cdp.waitFor("document.querySelectorAll('#audit-list tbody tr').length > 0", 10000, '审计日志列表');
     const auditText = await cdp.text('#audit-list');
-    check('审计日志展示操作记录', auditText.includes('create_key') || auditText.includes('reset_spend'));
+    check('审计日志展示操作记录', auditText.includes('create_key') && auditText.includes('reset'));
 
     /* --- 7e. 实时汇率刷新 --- */
     await cdp.click('#btn-refresh-exchange-rate');
@@ -1304,7 +1340,7 @@ async function main() {
       );
       check(
         '登出清空已渲染的账务内容',
-        renderedBeforeLogout.includes('执行成本') &&
+        renderedBeforeLogout.includes('已定价费用小计') &&
           (await cdp.text('#usage-summary')).trim() === '' &&
           (await cdp.text('#usage-items')).trim() === '',
         renderedBeforeLogout.replace(/\n/g, ' ').slice(0, 60)
@@ -1409,7 +1445,7 @@ async function main() {
             failed: 0,
             pending: 0,
             cost_micro_usd: 0,
-            adjustment_micro_usd: 0,
+            unpriced_executions: 0,
             tokens: { input: 0, cache_read: 0, cache_write: 0, output: 0, reasoning: 0, total: 0 },
             complete_executions: 0,
           },
@@ -1456,7 +1492,7 @@ async function main() {
           failed: 0,
           pending: 0,
           cost_micro_usd: 0,
-          adjustment_micro_usd: 0,
+          unpriced_executions: 0,
           tokens: { input: 0, cache_read: 0, cache_write: 0, output: 0, reasoning: 0, total: 0 },
           complete_executions: 0,
         },
@@ -1520,33 +1556,50 @@ async function main() {
 
     /* --- 14. 金额输入：非法美元输入必须阻止提交 --- */
 
-    await step('财务处理弹窗拒绝非法美元输入', async () => {
-      await loginFresh('财务金额校验');
-      await cdp.clickText('#usage-items .card:nth-child(3) button', '处理待定');
-      await cdp.waitFor("document.querySelector('.modal #resolve-action')", 10000, '财务弹窗');
-      await cdp.evaluate("document.querySelector('.modal #resolve-action').value='charge'");
-      await cdp.setValue('.modal #resolve-reason', '非法美元输入必须被拒绝');
-      await cdp.evaluate("document.querySelector('.modal #resolve-confirm').checked = true");
-      await cdp.setModalMoney('金额', 'usd', '1');
-      check('财务处理弹窗的合法美元输入精确换算', (await cdp.modalMoney('金额', 'micro')) === '1000000', await cdp.modalMoney('金额', 'micro'));
-      await cdp.setModalMoney('金额', 'usd', '0.0000001');
-      const resolveBefore = (await hitsOf('/api/resolve')).length;
-      await cdp.clickText('.modal button', '提交处理');
-      check('非法的美元输入被拒绝并说明原因', (await cdp.text('.modal .inline-error')).includes('美元输入无效'), await cdp.text('.modal .inline-error'));
-      check('非法美元输入不会把旧的微美元残留值提交出去', (await hitsOf('/api/resolve')).length === resolveBefore, 'hits=' + (await hitsOf('/api/resolve')).length);
+    await step('人工财务入口已移除且退役路由不可达', async () => {
+      await loginFresh('退役财务入口');
+      check(
+        '请求列表没有处理待定/释放/扣费入口',
+        (await cdp.evaluate("![...document.querySelectorAll('#usage-items button')].some((b) => /处理待定|释放|扣费/.test(b.textContent))")) === true &&
+          (await cdp.count('.modal #resolve-action')) === 0
+      );
+      const managerBase = origin + '/v0/management/plugins/credit-manager';
+      const post = (endpoint) => fetch(managerBase + endpoint, {
+        method: 'POST',
+        headers: { Authorization: 'Bearer ' + MANAGEMENT_KEY, 'Content-Type': 'application/json' },
+        body: '{}',
+      });
+      const resolveStatus = (await post('/api/resolve')).status;
+      const resetSpendStatus = (await post('/api/reset-spend')).status;
+      check('退役 /api/resolve 与 /api/reset-spend 返回 404', resolveStatus === 404 && resetSpendStatus === 404, 'resolve=' + resolveStatus + ' reset-spend=' + resetSpendStatus);
+      check('退役路由没有留下成功调用记录', (await debug('resolve')) === undefined && (await debug('reset-spend')) === undefined);
     });
 
-    await step('修正后的美元输入按精确微美元提交', async () => {
-      await loginFresh('财务金额修正');
-      await cdp.clickText('#usage-items .card:nth-child(3) button', '处理待定');
-      await cdp.waitFor("document.querySelector('.modal #resolve-action')", 10000, '财务弹窗');
-      await cdp.evaluate("document.querySelector('.modal #resolve-action').value='charge'");
-      await cdp.setValue('.modal #resolve-reason', '修正后按精确金额提交');
-      await cdp.evaluate("document.querySelector('.modal #resolve-confirm').checked = true");
-      await cdp.setModalMoney('金额', 'usd', '2');
-      await cdp.clickText('.modal button', '提交处理');
-      await cdp.waitFor("document.querySelector('.toast')", 10000, '财务处理已提交');
-      check('修正美元输入后按精确微美元提交', JSON.parse((await debug('resolve')).body).amount_micro_usd === 2000000, (await debug('resolve')).body);
+    await step('Token 重置必须先确认且只提交 Token 周期', async () => {
+      await loginFresh('Token 重置确认');
+      await cdp.click('#tab-keys');
+      await cdp.waitFor("document.querySelectorAll('#keys-list tbody tr').length === 2", 10000, 'Key 列表');
+      await cdp.click('#btn-batch-reset-tokens');
+      await cdp.waitFor("document.querySelector('.modal #reset-tokens-confirm')", 10000, 'Token 重置弹窗');
+      const resetBefore = (await hitsOf('/api/reset-tokens')).length;
+      await cdp.clickText('.modal button', '执行 Token 重置');
+      check('未勾选确认时拒绝 Token 重置', (await cdp.text('.modal .inline-error')).includes('勾选'), await cdp.text('.modal .inline-error'));
+      check('未确认前不发送 Token 重置请求', (await hitsOf('/api/reset-tokens')).length === resetBefore);
+      await cdp.evaluate("document.querySelector('#reset-tokens-confirm').checked = true");
+      await cdp.clickText('.modal button', '执行 Token 重置');
+      await cdp.waitFor("document.querySelector('.toast')", 10000, 'Token 重置已提交');
+      let resetDebug = null;
+      for (let i = 0; i < 30 && !resetDebug; i += 1) {
+        resetDebug = await debug('reset-tokens');
+        if (!resetDebug) await sleep(100);
+      }
+      const resetBody = resetDebug || {};
+      check(
+        'Token 重置请求体只包含 Token 周期与原因',
+        resetBody.total === true && resetBody.daily === true && resetBody.weekly === true && resetBody.monthly === true &&
+          !('amount_micro_usd' in resetBody) && !('spend' in resetBody),
+        JSON.stringify(resetBody)
+      );
     });
 
     await step('价格弹窗拒绝非法美元输入并保留可选思考价格的语义', async () => {
@@ -1593,8 +1646,8 @@ async function main() {
       await cdp.clickText('#panel-keys button', '新建 Key');
       await cdp.waitFor("document.querySelector('.modal #key-label')", 10000, '新建 Key 弹窗');
       await cdp.setValue('.modal #key-label', '金额校验');
-      await cdp.setModalMoney('总额度', 'micro', '1234567');
-      await cdp.setModalMoney('总额度', 'usd', 'garbage');
+      await cdp.setModalMoney('总额预算', 'micro', '1234567');
+      await cdp.setModalMoney('总额预算', 'usd', 'garbage');
       const postCount = async () => (await hitsOf('/api/keys')).filter((entry) => entry.startsWith('POST ')).length;
       const postBefore = await postCount();
       await cdp.clickText('.modal button', '创建');

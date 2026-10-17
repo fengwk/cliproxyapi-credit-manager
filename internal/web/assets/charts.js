@@ -10,8 +10,9 @@
  *   CMCharts.render({requests, tokens, cost}, points, options)
  *     - 第一个参数是三个图表容器（DOM 元素）：请求/执行、Token 分解、成本。
  *     - points 是 Report.trend：每项形如
- *         {time, requests, executions, cost_micro_usd, adjustment_micro_usd,
+ *         {time, requests, executions, cost_micro_usd, unpriced_executions,
  *          tokens:{input, output, reasoning, cache_read, cache_write, total}}
+ *       cost_micro_usd 是已定价执行的小计，null 表示该区间存在未定价执行（不是 0/免费）。
  *       超出 Number 精度的整数会被 app.js 表示成 {cmIntText:'...'}，本模块同样接受。
  *     - options = {bucket:'hour'|'day'|'month', tokenUnit:'raw'|'k'|'wan'|'m',
  *                  currency:'USD'|'CNY', rate:number}
@@ -22,7 +23,8 @@
  *     精确整数文本，绝不用浮点做财务换算。
  *   - Token 分解只展示互不重叠的桶（输入、输出、缓存读、缓存写、思考），合计是这五项
  *     之和；reasoning 是独立桶（canonical output 已排除 reasoning），不会重复计入。
- *   - 执行成本与人工补记是两条独立序列，绝不静默相加。
+ *   - 费用只展示“已定价小计”；未定价执行单独计数并在 tooltip 明说“不是免费”，
+ *     绝不把 null 当作 0。
  *   - tooltip 使用 renderMode:'richText' 输出纯文本，不做任何 HTML 拼接。
  *   - 复用容器上的图表实例；空数据时 dispose；resize 观察器/监听器随实例释放，不泄漏。
  *   - 主题由 document/元素上的 data-palette 决定（white|light|dark|auto），并支持
@@ -71,7 +73,7 @@
       colors: {
         requests: '#4c8dff', executions: '#1eb787',
         input: '#1eb787', output: '#7968ee', cacheRead: '#f0a04b', cacheWrite: '#3f9ad6', reasoning: '#e56b8a',
-        cost: '#1eb787', adjustment: '#e5a12d',
+        cost: '#1eb787',
       },
     },
     light: {
@@ -80,7 +82,7 @@
       colors: {
         requests: '#3f7fd6', executions: '#168b63',
         input: '#168b63', output: '#8573bd', cacheRead: '#d97706', cacheWrite: '#3f7fd6', reasoning: '#c65746',
-        cost: '#168b63', adjustment: '#d97706',
+        cost: '#168b63',
       },
     },
     dark: {
@@ -89,7 +91,7 @@
       colors: {
         requests: '#6fb3e0', executions: '#58be91',
         input: '#58be91', output: '#b5a5e9', cacheRead: '#efb860', cacheWrite: '#6fb3e0', reasoning: '#ef8779',
-        cost: '#58be91', adjustment: '#efb860',
+        cost: '#58be91',
       },
     },
   };
@@ -454,14 +456,20 @@
     var list = (models || []).map(function (m) {
       var modelName = m.model || 'unknown';
       var reqText = intText(m.requests || 0);
-      var costMicroText = intText(m.cost_micro_usd || 0);
+      // cost 为 null 表示没有可用的已定价金额；绝不能落成 0（免费）。
+      var costKnown = m.cost_micro_usd !== null && m.cost_micro_usd !== undefined;
+      var costMicroText = costKnown ? intText(m.cost_micro_usd) : '';
       var tokText = intText(m.tokens ? m.tokens.total : 0);
       var completeExecText = intText(m.complete_executions || 0);
       var execText = intText(m.executions || 0);
       var pendingText = intText(m.pending || 0);
+      var unpricedText = intText(m.unpriced_executions || 0);
       var execCount = BigInt(execText);
       var requestCount = BigInt(reqText);
       var isKnown = execCount > 0n && BigInt(completeExecText) === execCount && BigInt(pendingText) === 0n;
+      var unpricedCount = BigInt(isIntText(unpricedText) ? unpricedText : '0');
+      var hasUnpriced = unpricedCount > 0n;
+      var incompleteCost = !costKnown || hasUnpriced;
 
       // TPS 仅使用与实测延迟配对的输出 token，不用全部输出补齐样本。
       var measuredOutText = intText(m.measured_output_tokens || 0);
@@ -477,6 +485,9 @@
         var tokens = BigInt(isIntText(tokText) ? tokText : '0');
         if (!isKnown) {
           display = '—（计量未完整）';
+        } else if (incompleteCost) {
+          // 未定价/部分定价都不是免费，不能给出 ∞ 或把未知计入分母。
+          display = costKnown ? '—（含未定价执行）' : '—（未定价）';
         } else if (costMicro > 0n) {
           rational = { num: tokens * 1000000n, den: costMicro };
           var tokensPerUSD = rational.num / costMicro;
@@ -489,7 +500,7 @@
           display = '—';
         }
       } else if (selectedMetric === 'unit') {
-        if (isKnown && requestCount > 0n) {
+        if (isKnown && requestCount > 0n && !incompleteCost) {
           var costMicroVal = BigInt(isIntText(costMicroText) ? costMicroText : '0');
           rational = { num: costMicroVal, den: requestCount };
           var unitMicro = (costMicroVal + requestCount / 2n) / requestCount;
@@ -498,7 +509,9 @@
             : formatMoneyMicro(unitMicro.toString(), currency, rate) + ' / 请求';
         } else {
           score = null;
-          display = '—（计量未完整）';
+          display = !isKnown ? '—（计量未完整）'
+            : incompleteCost ? (costKnown ? '—（含未定价执行）' : '—（未定价）')
+              : '—';
         }
       } else if (selectedMetric === 'cache') {
         if (m.cache_read_ratio !== undefined && m.cache_read_ratio !== null) {
@@ -531,6 +544,7 @@
         requestsText: reqText,
         tokensText: tokText,
         costMicroText: costMicroText,
+        unpricedText: unpricedText,
         completeExecutionsText: completeExecText,
         executionsText: execText,
         pendingText: pendingText,
@@ -667,8 +681,10 @@
         executions: intOrDefault(source.executions),
         failed: intOrDefault(source.failed),
         pending: intOrDefault(source.pending),
-        costMicro: intOrDefault(source.cost_micro_usd),
-        adjustmentMicro: intOrDefault(source.adjustment_micro_usd),
+        costMicro: source.cost_micro_usd === null || source.cost_micro_usd === undefined
+          ? null
+          : intOrDefault(source.cost_micro_usd),
+        unpricedExecutions: intOrDefault(source.unpriced_executions),
         tokens: {
           input: input,
           output: output,
@@ -787,7 +803,7 @@
       '请求次数：' + formatInt(point.requests),
       '执行次数：' + formatInt(point.executions),
       '失败请求：' + formatInt(point.failed),
-      '未结算请求：' + formatInt(point.pending),
+      '用量待完整请求：' + formatInt(point.pending),
     ].join('\n');
   }
 
@@ -806,12 +822,18 @@
   function costTooltip(model, params) {
     var point = pointAt(model, params);
     if (!point) return '';
-    return [
-      point.timeText,
-      '执行成本：' + formatMoneyMicro(point.costMicro, model.currency, model.rate),
-      // 人工补记保持独立序列，绝不静默并入执行成本。
-      '人工补记：' + formatMoneyMicro(point.adjustmentMicro, model.currency, model.rate) + '（独立记账，不计入执行成本）',
-    ].join('\n');
+    var lines = [point.timeText];
+    if (point.costMicro === null) {
+      lines.push('已定价小计：未定价（不是免费）');
+    } else {
+      lines.push('已定价费用小计：' + formatMoneyMicro(point.costMicro, model.currency, model.rate));
+    }
+    var unpriced = intText(point.unpricedExecutions);
+    if (unpriced !== '' && unpriced !== '0') {
+      lines.push('未定价执行：' + formatInt(unpriced) + ' 条（不计入小计，不是免费）');
+    }
+    lines.push('费用按当前价格 × 实际日志查询计算');
+    return lines.join('\n');
   }
 
   function barSeries(name, color, data) {
@@ -906,30 +928,25 @@
     var theme = model.theme;
     var points = model.points;
     var option = baseOption(theme);
-    option.legend.data = ['执行成本', '人工补记'];
+    option.legend.data = ['已定价费用小计'];
     option.grid.bottom = points.length > MAX_ZOOM_POINTS ? 40 : 10;
-    var costData = points.map(function (p) { return moneyDisplayNumber(p.costMicro, model.currency, model.rate); });
-    var adjustmentData = points.map(function (p) { return moneyDisplayNumber(p.adjustmentMicro, model.currency, model.rate); });
+    // null 必须是断点而不是 0：未知/未定价不能被画成免费。
+    var costData = points.map(function (p) {
+      return p.costMicro === null ? null : moneyDisplayNumber(p.costMicro, model.currency, model.rate);
+    });
     var moneyFormatter = function (value) { return formatMoneyDisplay(value, model.currency); };
     option.xAxis = Object.assign(
       { type: 'category', boundaryGap: false, data: points.map(function (p) { return p.label; }) },
       categoryAxis(theme)
     );
-    option.yAxis = [valueAxis(theme, minOfData(costData.concat(adjustmentData), 0), moneyFormatter)];
+    option.yAxis = [valueAxis(theme, minOfData(costData, 0), moneyFormatter)];
     option.series = [
-      lineSeries('执行成本', theme.colors.cost, costData, {
+      lineSeries('已定价费用小计', theme.colors.cost, costData, {
         theme: theme,
         z: 3,
         smooth: points.length > 6 ? 0.35 : false,
         showSymbol: points.length <= MAX_SYMBOL_POINTS,
         area: true,
-      }),
-      lineSeries('人工补记', theme.colors.adjustment, adjustmentData, {
-        theme: theme,
-        z: 2,
-        dashed: true,
-        smooth: false,
-        showSymbol: points.length <= MAX_SYMBOL_POINTS,
       }),
     ];
     option.dataZoom = dataZoomFor(points.length, theme);

@@ -67,39 +67,43 @@ function alphaData() {
     "allowed_models":["m-alpha"],
     "model_token_limits":[{"model":"m-alpha","total":0,"daily":9007199254740993,"weekly":0,"monthly":1000000},
       {"model":"m-beta","total":2000000,"daily":0,"weekly":0,"monthly":0}],
-    "expires_at":"2026-12-31T00:00:00Z","spent_micro_usd":4503599627370496,
-    "quota_used_micro_usd":2251799813685248,"daily_used_micro_usd":0,"weekly_used_micro_usd":0,"monthly_used_micro_usd":0,
-    "created_at":"2026-01-01T00:00:00Z"},
-  "summary": {"requests":3,"executions":4,"failed":1,"pending":1,"cost_micro_usd":9007199254740993,
-    "adjustment_micro_usd":2500000,
+    "expires_at":"2026-12-31T00:00:00Z","created_at":"2026-01-01T00:00:00Z"},
+  "summary": {"requests":4,"executions":4,"failed":1,"pending":1,"cost_micro_usd":9007199254740993,
+    "unpriced_executions":2,
     "tokens":{"input":9007199254740993,"cache_read":2,"cache_write":3,"output":5,"reasoning":1,"total":9007199254741004},
     "complete_executions":3,"cache_read_ratio":0.25},
   "trend": [
     {"time":"2026-10-01T00:00:00Z","requests":1,"executions":1,"failed":0,"pending":0,
-     "cost_micro_usd":9007199254740993,"adjustment_micro_usd":0,
+     "cost_micro_usd":9007199254740993,"unpriced_executions":0,
      "tokens":{"input":9007199254740993,"cache_read":0,"cache_write":0,"output":0,"reasoning":0,"total":9007199254740993},
      "complete_executions":1},
     {"time":"2026-10-02T00:00:00Z","requests":2,"executions":3,"failed":1,"pending":1,
-     "cost_micro_usd":4503599627370496,"adjustment_micro_usd":2500000,
+     "cost_micro_usd":4503599627370496,"unpriced_executions":2,
      "tokens":{"input":10,"cache_read":2,"cache_write":3,"output":5,"reasoning":1,"total":21},
      "complete_executions":2}
   ],
   "items": [
     {"id":"req-a1","trace_id":"trace-a1","model":"m-alpha","outcome":"succeeded","state":"settled",
      "started_at":"2026-10-02T10:00:00Z","completed_at":"2026-10-02T10:00:01Z",
-     "adjustment_micro_usd":2500000,"price":{"model":"m-alpha","rates":{"input":1,"output":1,"cache_read":0,"cache_write":0}},
      "executions":[
        {"id":"exec-a1","model":"m-alpha","tokens":{"input":9007199254740993,"cache_read":0,"cache_write":0,"output":0,"reasoning":0,"total":9007199254740993},
         "quality":"complete","cost_micro_usd":4503599627370496,"failed":false,"at":"2026-10-02T10:00:01Z"},
        {"id":"exec-a2","model":"m-alpha","tokens":{"input":0,"cache_read":0,"cache_write":0,"output":0,"reasoning":0,"total":9007199254740993},
-        "quality":"complete","cost_micro_usd":1,"failed":false,"at":"2026-10-02T10:00:01Z"}
+        "quality":"partial","cost_micro_usd":null,"failed":false,"at":"2026-10-02T10:00:01Z"}
      ]},
     {"id":"req-a2","trace_id":"trace-a2","model":"m-alpha","outcome":"","state":"pending",
-     "started_at":"2026-10-02T11:00:00Z","adjustment_micro_usd":0,
-     "price":{"model":"m-alpha","rates":{"input":1,"output":1,"cache_read":0,"cache_write":0}},
-     "executions":[]}
+     "started_at":"2026-10-02T11:00:00Z",
+     "executions":[]},
+    {"id":"req-a3","trace_id":"trace-a3","model":"free-model","outcome":"succeeded","state":"settled",
+     "started_at":"2026-10-02T12:00:00Z",
+     "executions":[{"id":"exec-a3","model":"free-model","tokens":{"input":1,"cache_read":0,"cache_write":0,"output":1,"reasoning":0,"total":2},
+       "quality":"complete","cost_micro_usd":0,"failed":false,"at":"2026-10-02T12:00:00Z"}]},
+    {"id":"req-a4","trace_id":"trace-a4","model":"unpriced-model","outcome":"succeeded","state":"settled",
+     "started_at":"2026-10-02T13:00:00Z",
+     "executions":[{"id":"exec-a4","model":"unpriced-model","tokens":{"input":1,"cache_read":0,"cache_write":0,"output":1,"reasoning":0,"total":2},
+       "quality":"complete","cost_micro_usd":null,"failed":false,"at":"2026-10-02T13:00:00Z"}]}
   ],
-  "total": 2, "page": 1, "page_size": 10, "retention_from": "2026-07-01T00:00:00Z"
+  "total": 4, "page": 1, "page_size": 10, "retention_from": "2026-07-01T00:00:00Z"
 }`;
 }
 
@@ -107,25 +111,22 @@ function betaData() {
   return `{
   "key": {"id":"key-beta","label":"beta-key","enabled":true,"quota_micro_usd":0,"daily_micro_usd":0,
     "weekly_micro_usd":0,"monthly_micro_usd":0,"max_concurrent":0,"allowed_models":[],
-    "model_token_limits":[],"spent_micro_usd":7000000,"quota_used_micro_usd":7000000,
-    "daily_used_micro_usd":0,"weekly_used_micro_usd":0,"monthly_used_micro_usd":0,"created_at":"2026-02-01T00:00:00Z"},
+    "model_token_limits":[],"created_at":"2026-02-01T00:00:00Z"},
   "summary": {"requests":7,"executions":7,"failed":0,"pending":0,"cost_micro_usd":7000000,
-    "adjustment_micro_usd":0,
+    "unpriced_executions":0,
     "tokens":{"input":70,"cache_read":0,"cache_write":0,"output":0,"reasoning":0,"total":70},
     "complete_executions":7},
   "trend": [{"time":"2026-10-02T00:00:00Z","requests":7,"executions":7,"failed":0,"pending":0,
-    "cost_micro_usd":7000000,"adjustment_micro_usd":0,
+    "cost_micro_usd":7000000,"unpriced_executions":0,
     "tokens":{"input":70,"cache_read":0,"cache_write":0,"output":0,"reasoning":0,"total":70},
     "complete_executions":7}],
   "items": [
     {"id":"req-b1","trace_id":"trace-b1","model":"m-beta","outcome":"succeeded","state":"settled",
-     "started_at":"2026-10-02T12:00:00Z","adjustment_micro_usd":0,
-     "price":{"model":"m-beta","rates":{"input":1,"output":1,"cache_read":0,"cache_write":0}},
+     "started_at":"2026-10-02T12:00:00Z",
      "executions":[{"id":"exec-b1","model":"m-beta","tokens":{"input":7,"cache_read":0,"cache_write":0,"output":0,"reasoning":0,"total":7},
        "quality":"complete","cost_micro_usd":7000000,"failed":false,"at":"2026-10-02T12:00:00Z"}]},
     {"id":"req-a1","trace_id":"trace-foreign","model":"m-alpha","outcome":"succeeded","state":"settled",
-     "started_at":"2026-10-02T10:00:00Z","adjustment_micro_usd":0,
-     "price":{"model":"m-alpha","rates":{"input":1,"output":1,"cache_read":0,"cache_write":0}},
+     "started_at":"2026-10-02T10:00:00Z",
      "executions":[]}
   ],
   "total": 2, "page": 1, "page_size": 10, "retention_from": "2026-07-01T00:00:00Z"
@@ -136,9 +137,8 @@ function emptyData() {
   return `{
   "key": {"id":"key-empty","label":"empty-key","enabled":true,"quota_micro_usd":0,"daily_micro_usd":0,
     "weekly_micro_usd":0,"monthly_micro_usd":0,"max_concurrent":0,"allowed_models":[],
-    "model_token_limits":[],"spent_micro_usd":0,"quota_used_micro_usd":0,
-    "daily_used_micro_usd":0,"weekly_used_micro_usd":0,"monthly_used_micro_usd":0,"created_at":"2026-03-01T00:00:00Z"},
-  "summary": {"requests":0,"executions":0,"failed":0,"pending":0,"cost_micro_usd":0,"adjustment_micro_usd":0,
+    "model_token_limits":[],"created_at":"2026-03-01T00:00:00Z"},
+  "summary": {"requests":0,"executions":0,"failed":0,"pending":0,"cost_micro_usd":0,"unpriced_executions":0,
     "tokens":{"input":0,"cache_read":0,"cache_write":0,"output":0,"reasoning":0,"total":0},"complete_executions":0},
   "trend": [], "items": [], "total": 0, "page": 1, "page_size": 10, "retention_from": "2026-07-01T00:00:00Z"
 }`;
@@ -436,35 +436,28 @@ async function main() {
     check('密钥状态显示启用与到期', (await cdp.text('#key-state')).includes('已启用') && (await cdp.text('#key-state')).includes('到期'));
 
     const quotas = await cdp.text('#quotas');
-    for (const label of ['已用额度', '总额度', '日额度', '周额度', '月额度', '并发上限', '允许模型']) {
-      check(`额度卡片包含 ${label}`, quotas.includes(label), quotas.slice(0, 120));
+    for (const label of ['总预算（仅展示）', '日预算（仅展示）', '周预算（仅展示）', '月预算（仅展示）', '并发上限', '预算说明', '允许模型']) {
+      check(`预算卡片包含 ${label}`, quotas.includes(label), quotas.slice(0, 160));
     }
-    check('额度卡片已完全移除原有在途预占卡片', await cdp.evaluate("![...document.querySelectorAll('#quotas .card-label')].some((n) => n.textContent.includes('预占') || n.textContent.includes('持有'))"));
-    check('额度卡片文本中不含预占或持有', !quotas.includes('在途预占') && !quotas.includes('预占') && !quotas.includes('持有') && !quotas.includes('held_micro_usd'));
-    const expectedSpent = await cdp.evaluate("window.CMCharts.formatMoneyMicro('2251799813685248','USD',7.2)");
-    const expectedLifetime = await cdp.evaluate("window.CMCharts.formatMoneyMicro('4503599627370496','USD',7.2)");
+    check('预算卡片已完全移除预占/持有/已用/累计财务计数', await cdp.evaluate("![...document.querySelectorAll('#quotas .card-label')].some((n) => /预占|持有|已用|累计消费/.test(n.textContent))") && !quotas.includes('spent_micro_usd') && !quotas.includes('quota_used_micro_usd'));
     const expectedTotal = await cdp.evaluate("window.CMCharts.formatMoneyMicro('9007199254740993','USD',7.2)");
-    const usedCard = await cdp.evaluate("[...document.querySelectorAll('#quotas .card')].find(c => c.querySelector('.card-label')?.textContent === '已用额度')?.textContent");
-    check('已用额度卡片精确渲染重置后的有效用量', usedCard.includes(expectedSpent) && !usedCard.includes(expectedLifetime), usedCard);
-    check('累计消费独立显示原始总账而不当作额度用量', quotas.includes(expectedLifetime), expectedLifetime);
-    check('总额度卡片精确渲染软上限', quotas.includes(expectedTotal), expectedTotal);
-    check(
-      '已用额度小于总额度且无预占，保持正向剩余额度软准入语义',
-      await cdp.evaluate("(() => { const cards = [...document.querySelectorAll('#quotas .card')]; const spentCard = cards.find(c => c.querySelector('.card-label')?.textContent.includes('已用额度')); const totalCard = cards.find(c => c.querySelector('.card-label')?.textContent.includes('总额度')); return !!spentCard && !!totalCard && !cards.some(c => c.textContent.includes('预占')); })()")
-    );
-    check('未设上限的额度显示不限', quotas.includes('不限'));
+    const totalCard = await cdp.evaluate("[...document.querySelectorAll('#quotas .card')].find(c => c.querySelector('.card-label')?.textContent === '总预算（仅展示）')?.textContent");
+    check('总预算卡片精确渲染且明确仅展示', totalCard.includes(expectedTotal) && quotas.includes('不限制调用'), totalCard);
+    check('未设置预算显示未设置而不是不限额度', quotas.includes('未设置') && !quotas.includes('不限额度'));
+    check('Key 页面不再出现永久已用/累计消费字段', !quotas.includes('已用额度') && !quotas.includes('累计消费'));
 
     // 关键回归：>2^53 的微美元必须精确，且与浮点解析的结果明显不同。
     const expectedCost = await cdp.evaluate("window.CMCharts.formatMoneyMicro('9007199254740993','USD',7.2)");
     const lostCost = await cdp.evaluate("window.CMCharts.formatMoneyMicro(9007199254740992,'USD',7.2)");
     check(
-      '执行成本按精确整数渲染（>2^53 不失真）',
+      '已定价费用小计按精确整数渲染（>2^53 不失真）',
       expectedCost !== lostCost && (await cdp.text('#stats')).includes(expectedCost),
       `${expectedCost} vs ${lostCost}`
     );
     const expectedTokens = await cdp.evaluate("window.CMCharts.tokenText('9007199254741004','raw')");
     check('汇总 Token 合计精确渲染', (await cdp.text('#stats')).includes(expectedTokens), expectedTokens);
     check('缓存读取占比按契约展示', (await cdp.text('#stats')).includes('25.0%'));
+    check('汇总区分已定价小计与未定价执行', (await cdp.text('#stats')).includes('已定价费用小计') && (await cdp.text('#stats')).includes('未定价执行') && (await cdp.text('#stats')).includes('2 条'));
 
     const limits = await cdp.text('#token-limits');
     check('模型 Token 限额卡片渲染模型名', limits.includes('m-alpha') && limits.includes('m-beta'), limits.slice(0, 160));
@@ -476,9 +469,10 @@ async function main() {
     const rows = await cdp.text('#recent-body');
     const expectedRowTokens = await cdp.evaluate("window.CMCharts.tokenText('18014398509481986','raw')");
     check('最近请求的 Token 是两次执行的精确合计', rows.includes(expectedRowTokens), expectedRowTokens);
-    const expectedRowCost = await cdp.evaluate("window.CMCharts.formatMoneyMicro('4503599627370497','USD',7.2)");
-    check('最近请求的成本精确合计', rows.includes(expectedRowCost), expectedRowCost);
-    check('请求状态按契约显示结果与结算状态', rows.includes('成功 · 已结算') && rows.includes('待定'), rows.replace(/\n/g, ' ').slice(0, 200));
+    const expectedRowCost = await cdp.evaluate("window.CMCharts.formatMoneyMicro('4503599627370496','USD',7.2)");
+    check('最近请求只合计已定价执行并标出未定价条数', rows.includes(expectedRowCost) && rows.includes('另有 1 条未定价'), rows.replace(/\n/g, ' ').slice(0, 240));
+    check('显式免费 0 与未定价 null 并列可区分', rows.includes('0 USD') && rows.includes('未定价（1 条，不是免费）'), rows.replace(/\n/g, ' ').slice(0, 260));
+    check('请求状态按契约显示结果与用量生命周期', rows.includes('成功 · 已完成') && rows.includes('用量待完整'), rows.replace(/\n/g, ' ').slice(0, 240));
     // 金额必须带且只带一次货币后缀（共享格式化的精确文本）。
     check(
       '金额文本只带一次货币后缀',

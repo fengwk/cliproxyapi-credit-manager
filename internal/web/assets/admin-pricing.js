@@ -687,7 +687,8 @@
 
     var inPerImage = textInputNode('mono', state.perImage, '例如 50000');
     inPerImage.id = 'rule-per-image';
-    addField(form, '单张图片费率 (微USD/张，按图模式必填)', inPerImage);
+    addField(form, '单张图片费率 (微USD/张，按图模式必填)', inPerImage,
+      '按图规则可用于目录/预览；CPA 日志不提供真实图片数量，因此日志金额会显示为未定价，绝不猜测。');
 
     var inInputRate = textInputNode('mono', state.baseRates.input, '必填，如 2000000');
     inInputRate.id = 'rule-input-rate';
@@ -717,7 +718,7 @@
     var chkLabel = document.createElement('label');
     chkLabel.className = 'checkbox-label';
     chkLabel.appendChild(chkEnabled);
-    chkLabel.appendChild(document.createTextNode(' 启用该规则（禁用后命中时直接拒绝计费，绝不伪造零费率）'));
+    chkLabel.appendChild(document.createTextNode(' 启用该规则（禁用只表示不参与定价，不是模型权限黑名单；命中时按未定价展示）'));
     form.appendChild(chkLabel);
 
     /* --- 阶梯编辑器 --- */

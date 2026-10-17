@@ -74,11 +74,6 @@ const KEYS = [
       expires_at: '2026-12-31T00:00:00Z',
       future_policy: 'keep-me',
     },
-    spent_micro_usd: 12345678,
-    quota_used_micro_usd: 2345678,
-    daily_used_micro_usd: 0,
-    weekly_used_micro_usd: 0,
-    monthly_used_micro_usd: 2345678,
     created_at: '2026-01-01T00:00:00Z',
   },
   {
@@ -96,11 +91,6 @@ const KEYS = [
       max_concurrent: 0,
       allowed_models: [],
     },
-    spent_micro_usd: 0,
-    quota_used_micro_usd: 0,
-    daily_used_micro_usd: 0,
-    weekly_used_micro_usd: 0,
-    monthly_used_micro_usd: 0,
     created_at: '2026-02-02T00:00:00Z',
   },
 ];
@@ -133,11 +123,11 @@ const AUDIT_EVENTS = [
   {
     seq: 2,
     at: '2026-10-15T11:00:00Z',
-    action: 'reset_spend',
+    action: 'reset',
     key_id: 'key-1',
     caller_id: 'caller-1',
     reason: '月度周期刷新',
-    detail: '重置月度额度基线',
+    detail: '重置 Token 用量基线（不影响日志、费用或预算）',
   },
 ];
 
@@ -252,7 +242,6 @@ const REQUESTS_PAGE_1 = [
     state: 'settled',
     started_at: '2026-10-15T10:00:00Z',
     completed_at: '2026-10-15T10:00:06Z',
-    price: PRICES[1],
     executions: [
       {
         id: 'exec-001',
@@ -292,7 +281,6 @@ const REQUESTS_PAGE_1 = [
     state: 'settled',
     started_at: '2026-10-15T11:00:00Z',
     completed_at: '2026-10-15T11:00:02Z',
-    price: PRICES[2],
     executions: [
       {
         id: 'exec-002',
@@ -307,6 +295,7 @@ const REQUESTS_PAGE_1 = [
         response_model: 'commandcode/native/claude-sonnet-5',
         tokens: { input: 0, cache_read: 0, cache_write: 0, output: 0, reasoning: 0, total: 0 },
         quality: 'unknown',
+        cost_micro_usd: null,
         failed: true,
         status_code: 429,
         at: '2026-10-15T11:00:02Z',
@@ -322,7 +311,6 @@ const REQUESTS_PAGE_1 = [
     model: 'gpt-5',
     state: 'pending',
     started_at: '2026-10-15T12:00:00Z',
-    price: PRICES[0],
     executions: [],
   },
   {
@@ -334,9 +322,6 @@ const REQUESTS_PAGE_1 = [
     state: 'settled',
     started_at: '2026-10-13T08:00:00Z',
     completed_at: '2026-10-13T08:00:02Z',
-    // 管理员 Resolve 的人工记账必须与执行成本分开显示（契约字段：adjustment_micro_usd）。
-    adjustment_micro_usd: 2500000,
-    price: PRICES[0],
     executions: [
       {
         id: 'exec-005',
@@ -350,7 +335,7 @@ const REQUESTS_PAGE_1 = [
         model: 'gpt-5',
         tokens: { input: 100, cache_read: 0, cache_write: 0, output: 200, reasoning: 0, total: 300 },
         quality: 'partial',
-        cost_micro_usd: 1233500,
+        cost_micro_usd: null,
         failed: false,
         status_code: 200,
         at: '2026-10-13T08:00:02Z',
@@ -369,20 +354,49 @@ const REQUESTS_PAGE_1 = [
     state: 'settled',
     started_at: '2026-10-15T13:00:00Z',
     completed_at: '2026-10-15T13:00:00Z',
-    price: PRICES[0],
     executions: [],
   },
   {
-    // 进行中的请求：仍占用并发槽位，后端 Resolve 只接受 pending，因此不得给出人工处理入口。
+    // 进行中的请求：仍占用并发槽位；状态仅描述用量生命周期，不存在人工财务入口。
     id: 'req-007',
     trace_id: 'trace007',
     key_id: 'key-1',
     model: 'gpt-5',
     state: 'active',
     started_at: '2026-10-15T14:00:00Z',
-    adjustment_micro_usd: 0,
-    price: PRICES[0],
     executions: [],
+  },
+  {
+    // 显式全零价格的完整执行：费用是已定价的 0，和 null（未定价）必须并列可区分。
+    id: 'req-008',
+    trace_id: 'trace008',
+    key_id: 'key-1',
+    model: 'free-model',
+    outcome: 'succeeded',
+    state: 'settled',
+    started_at: '2026-10-15T15:00:00Z',
+    completed_at: '2026-10-15T15:00:01Z',
+    executions: [
+      {
+        id: 'exec-008',
+        request_id: 'req-008',
+        trace_id: 'trace008',
+        key_id: 'key-1',
+        provider: 'free-provider',
+        auth_id: 'auth-free',
+        auth_index: '0',
+        executor: 'free-provider',
+        model: 'free-model',
+        tokens: { input: 10, cache_read: 0, cache_write: 0, output: 20, reasoning: 0, total: 30 },
+        quality: 'complete',
+        cost_micro_usd: 0,
+        failed: false,
+        status_code: 200,
+        at: '2026-10-15T15:00:01Z',
+        latency_ms: 50,
+        ttft_ms: 20,
+      },
+    ],
   },
 ];
 
@@ -396,7 +410,6 @@ const REQUESTS_PAGE_2 = [
     state: 'settled',
     started_at: '2026-10-14T09:00:00Z',
     completed_at: '2026-10-14T09:00:03Z',
-    price: PRICES[0],
     executions: [
       {
         id: 'exec-004',
@@ -695,15 +708,16 @@ function usageReport(query) {
           cost_micro_usd: 0,
           tokens: { input: 0, cache_read: 0, cache_write: 0, output: 0, reasoning: 0, total: 0 },
           complete_executions: 0,
+          unpriced_executions: 0,
         }
       : {
           requests: 6,
           executions: 4,
-          // 契约：failed 是失败请求数（failed/canceled/rejected），pending 是 active+pending 的未结算请求数。
+          // 契约：pending 是用量未完整请求数；cost 是已定价小计，unpriced 单独计数。
           failed: 2,
           pending: 2,
           cost_micro_usd: BIG_COST,
-          adjustment_micro_usd: 2500000,
+          unpriced_executions: 2,
           tokens: { input: 12500, cache_read: 4000, cache_write: 0, output: 8700, reasoning: 3000, total: BIG_TOKENS },
           complete_executions: 2,
           cache_read_ratio: 0.2424,
@@ -711,10 +725,10 @@ function usageReport(query) {
     trend: empty
       ? []
       : [
-          { time: '2026-10-12T00:00:00Z', requests: 3, executions: 5, failed: 0, pending: 0, cost_micro_usd: 1200000, adjustment_micro_usd: 0, tokens: { total: 1000 } },
-          { time: '2026-10-13T00:00:00Z', requests: 7, executions: 9, failed: 2, pending: 1, cost_micro_usd: 5600000, adjustment_micro_usd: 2500000, tokens: { total: 2000 } },
-          { time: '2026-10-14T00:00:00Z', requests: 4, executions: 4, failed: 0, pending: 0, cost_micro_usd: BIG_COST, adjustment_micro_usd: 0, tokens: { total: 3000 } },
-          { time: '2026-10-15T00:00:00Z', requests: 2, executions: 1, failed: 1, pending: 1, cost_micro_usd: 0, adjustment_micro_usd: 0, tokens: { total: 4000 } },
+          { time: '2026-10-12T00:00:00Z', requests: 3, executions: 5, failed: 0, pending: 0, cost_micro_usd: 1200000, unpriced_executions: 0, tokens: { total: 1000 } },
+          { time: '2026-10-13T00:00:00Z', requests: 7, executions: 9, failed: 2, pending: 1, cost_micro_usd: 5600000, unpriced_executions: 1, tokens: { total: 2000 } },
+          { time: '2026-10-14T00:00:00Z', requests: 4, executions: 4, failed: 0, pending: 0, cost_micro_usd: BIG_COST, unpriced_executions: 0, tokens: { total: 3000 } },
+          { time: '2026-10-15T00:00:00Z', requests: 2, executions: 1, failed: 1, pending: 1, cost_micro_usd: null, unpriced_executions: 1, tokens: { total: 4000 } },
         ],
     items: empty ? [] : items,
     total: empty ? 0 : 25,
@@ -810,8 +824,7 @@ async function handle(req, res) {
         json(res, 400, { error: materialError });
         return;
       }
-      json(res, 201, { item: { id: 'key-new', spec: parsed, spent_micro_usd: 0,
-        quota_used_micro_usd: 0, daily_used_micro_usd: 0, weekly_used_micro_usd: 0, monthly_used_micro_usd: 0 },
+      json(res, 201, { item: { id: 'key-new', spec: parsed },
         key: 'sk-mock-onetime-5f3a9c' });
       return;
     }
@@ -895,12 +908,6 @@ async function handle(req, res) {
       json(res, 404, { error: 'capture snapshot not found' });
       return;
     }
-    if (endpoint === '/api/resolve') {
-      const body = await readBody(req);
-      recorded.last['resolve'] = { body };
-      json(res, 200, { ok: true });
-      return;
-    }
     if (endpoint === '/api/overview') {
       recorded.last['overview'] = url.search;
       json(res, 200, {
@@ -909,16 +916,16 @@ async function handle(req, res) {
           executions: 7,
           failed: 1,
           pending: 1,
-          cost_micro_usd: 1250000000000000,
-          adjustment_micro_usd: 500000,
+          cost_micro_usd: 800000000000000,
+          unpriced_executions: 1,
           tokens: { input: 1300000000000000, output: 800000000000000, cache_read: 700000000000000, cache_write: 0, reasoning: 0, total: 2800000000000000 },
           complete_executions: 6,
           cache_read_ratio: 0.35,
         },
         trend: [
-          { bucket: '2026-10-14T00:00:00Z', requests: 2, executions: 2, failed: 0, pending: 0, cost_micro_usd: 800000000000000, adjustment_micro_usd: 0,
+          { bucket: '2026-10-14T00:00:00Z', requests: 2, executions: 2, failed: 0, pending: 0, cost_micro_usd: 800000000000000, unpriced_executions: 0,
             tokens: { input: 800000000000000, output: 500000000000000, cache_read: 500000000000000, cache_write: 0, reasoning: 0, total: 1800000000000000 } },
-          { bucket: '2026-10-15T00:00:00Z', requests: 4, executions: 5, failed: 1, pending: 1, cost_micro_usd: 450000000000000, adjustment_micro_usd: 500000,
+          { bucket: '2026-10-15T00:00:00Z', requests: 4, executions: 5, failed: 1, pending: 1, cost_micro_usd: null, unpriced_executions: 1,
             tokens: { input: 500000000000000, output: 300000000000000, cache_read: 200000000000000, cache_write: 0, reasoning: 0, total: 1000000000000000 } },
         ],
         models: [
@@ -929,7 +936,7 @@ async function handle(req, res) {
             failed: 0,
             pending: 0,
             cost_micro_usd: 800000000000000,
-            adjustment_micro_usd: 0,
+            unpriced_executions: 0,
             tokens: { input: 800000000000000, output: 500000000000000, cache_read: 500000000000000, cache_write: 0, reasoning: 0, total: 1800000000000000 },
             complete_executions: 5,
             cache_read_ratio: 500 / 1300,
@@ -945,11 +952,11 @@ async function handle(req, res) {
             requests: 2,
             executions: 2,
             failed: 1,
-            pending: 1,
-            cost_micro_usd: 450000000000000,
-            adjustment_micro_usd: 500000,
+            pending: 0,
+            cost_micro_usd: null,
+            unpriced_executions: 1,
             tokens: { input: 500000000000000, output: 300000000000000, cache_read: 200000000000000, cache_write: 0, reasoning: 0, total: 1000000000000000 },
-            complete_executions: 1,
+            complete_executions: 2,
             cache_read_ratio: 200 / 700,
             latency_ms: 3500,
             latency_samples: 1,
@@ -957,6 +964,24 @@ async function handle(req, res) {
             ttft_samples: 1,
             output_tokens: 300000000000000,
             measured_output_tokens: 300000000000000,
+          },
+          {
+            model: 'free-model',
+            requests: 1,
+            executions: 1,
+            failed: 0,
+            pending: 0,
+            cost_micro_usd: 0,
+            unpriced_executions: 0,
+            tokens: { input: 10, output: 20, cache_read: 0, cache_write: 0, reasoning: 0, total: 30 },
+            complete_executions: 1,
+            cache_read_ratio: 0,
+            latency_ms: 100,
+            latency_samples: 1,
+            ttft_ms: 50,
+            ttft_samples: 1,
+            output_tokens: 20,
+            measured_output_tokens: 20,
           },
         ],
         retention_from: '2026-07-01T00:00:00Z',
@@ -982,9 +1007,9 @@ async function handle(req, res) {
       json(res, 200, { ok: true });
       return;
     }
-    if (endpoint === '/api/reset-spend' && req.method === 'POST') {
+    if (endpoint === '/api/reset-tokens' && req.method === 'POST') {
       const body = await readBody(req);
-      recorded.last['reset-spend'] = JSON.parse(body || '{}');
+      recorded.last['reset-tokens'] = JSON.parse(body || '{}');
       json(res, 200, { keys: 1, windows: ['daily', 'weekly', 'monthly', 'total'] });
       return;
     }
