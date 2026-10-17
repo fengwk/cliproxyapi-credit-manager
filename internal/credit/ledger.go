@@ -31,18 +31,44 @@ func encodePriceSnapshot(s priceSnapshot) (string, error) {
 	return string(raw), nil
 }
 
-// decodePriceSnapshot returns nil for an empty column, which is how requests
-// that predate the snapshot column are recognized.
-func decodePriceSnapshot(raw string) (*priceSnapshot, error) {
-	raw = strings.TrimSpace(raw)
-	if raw == "" {
-		return nil, nil
-	}
+// decodePriceSnapshot parses and validates the frozen pricing decision of one
+// request. The snapshot column is NOT NULL and it is the only frozen price
+// source, so there is no fallback: an empty, corrupt or incomplete snapshot is
+// refused instead of being billed as a zero price. The stored price is
+// re-validated with the same rules used to write it, which keeps every read
+// path bound to a well formed rate card.
+func decodePriceSnapshot(raw, model string) (priceSnapshot, error) {
 	var s priceSnapshot
-	if err := json.Unmarshal([]byte(raw), &s); err != nil {
-		return nil, fmt.Errorf("%w: decode price snapshot", ErrInvalid)
+	if strings.TrimSpace(raw) == "" {
+		return s, fmt.Errorf("%w: request price snapshot is missing", ErrInvalid)
 	}
-	return &s, nil
+	if err := json.Unmarshal([]byte(raw), &s); err != nil {
+		return s, fmt.Errorf("%w: decode price snapshot", ErrInvalid)
+	}
+	price, err := normalizePriceBody(s.Price)
+	if err != nil {
+		return s, err
+	}
+	if price.Model == "" {
+		return s, fmt.Errorf("%w: price snapshot carries no model", ErrInvalid)
+	}
+	if price.Model != model {
+		return s, fmt.Errorf("%w: price snapshot model %q does not match request model %q",
+			ErrConflict, price.Model, model)
+	}
+	tiers, err := normalizeTiers(s.Tiers)
+	if err != nil {
+		return s, err
+	}
+	// A per-image count is frozen at admission and never defaulted: a corrupted
+	// count must fail settlement instead of being billed as a different number.
+	if price.IsPerImage() && (s.ImageCount < 1 || s.ImageCount > maxImageCount) {
+		return s, fmt.Errorf("%w: per-image snapshot count %d is outside the supported 1..%d range",
+			ErrInvalid, s.ImageCount, maxImageCount)
+	}
+	s.Price = price
+	s.Tiers = tiers
+	return s, nil
 }
 
 type reqRow struct {
@@ -55,47 +81,18 @@ type reqRow struct {
 	statusCode  int
 	startedAt   time.Time
 	completedAt *time.Time
-	price       Price
 	charge      int64
 	resolved    string
-	// snapshot is the frozen pricing decision, nil for a legacy request whose
-	// price is rebuilt from the stored rate columns.
-	snapshot *priceSnapshot
-}
-
-// imageCount is the frozen requested image count of a per-image request. The
-// stored value is authoritative and is never clamped: it was validated at
-// admission, so a corrupted value must fail settlement instead of being
-// silently billed as a different number.
-func (r *reqRow) imageCount() int64 {
-	if r.snapshot == nil {
-		return 1
-	}
-	return r.snapshot.ImageCount
-}
-
-// frozenServiceTier is the normalized service tier frozen at admission, used
-// when a usage record reports none of its own.
-func (r *reqRow) frozenServiceTier() string {
-	if r.snapshot == nil {
-		return ""
-	}
-	return normalizeServiceTier(r.snapshot.ServiceTier)
-}
-
-// tiers is the frozen tier list of the request price.
-func (r *reqRow) tiers() []PriceTier {
-	if r.snapshot == nil {
-		return nil
-	}
-	return r.snapshot.Tiers
+	// snapshot is the frozen pricing decision and the only price source of the
+	// request: it is required, so it is a value and not an optional pointer.
+	snapshot priceSnapshot
 }
 
 func (r *reqRow) toRequest(executions []Usage, adjustment int64) Request {
 	if executions == nil {
 		executions = []Usage{}
 	}
-	out := Request{
+	return Request{
 		ID:                 r.id,
 		TraceID:            r.traceID,
 		KeyID:              r.keyID,
@@ -105,52 +102,36 @@ func (r *reqRow) toRequest(executions []Usage, adjustment int64) Request {
 		StartedAt:          r.startedAt,
 		CompletedAt:        r.completedAt,
 		AdjustmentMicroUSD: adjustment,
-		Price:              r.price,
+		Price:              r.snapshot.Price,
 		Executions:         executions,
+		PricingRuleID:      r.snapshot.RuleID,
+		PriceTiers:         r.snapshot.Tiers,
+		ServiceTier:        r.snapshot.ServiceTier,
+		ImageCount:         r.snapshot.ImageCount,
 	}
-	if r.snapshot != nil {
-		out.PricingRuleID = r.snapshot.RuleID
-		out.PriceTiers = r.snapshot.Tiers
-		out.ServiceTier = r.snapshot.ServiceTier
-		out.ImageCount = r.snapshot.ImageCount
-	}
-	return out
 }
 
 const requestColumns = `id, trace_id, key_id, model, state, outcome, status_code, started_at,
-	completed_at, price_input, price_output, price_reasoning, price_cache_read,
-	price_cache_write, price_version, charge_micro_usd, resolved, price_snapshot`
+	completed_at, charge_micro_usd, resolved, price_snapshot`
 
 func scanRequest(scan func(...any) error) (*reqRow, error) {
 	var (
-		r            reqRow
-		completed    sql.NullInt64
-		reasoning    sql.NullInt64
-		started      int64
-		in, out      int64
-		cr, cw       int64
-		version      int64
-		snapshotJSON sql.NullString
+		r         reqRow
+		completed sql.NullInt64
+		started   int64
+		snapshot  string
 	)
 	if err := scan(&r.id, &r.traceID, &r.keyID, &r.model, &r.state, &r.outcome, &r.statusCode,
-		&started, &completed, &in, &out, &reasoning, &cr, &cw, &version,
-		&r.charge, &r.resolved, &snapshotJSON); err != nil {
+		&started, &completed, &r.charge, &r.resolved, &snapshot); err != nil {
 		return nil, err
 	}
 	r.startedAt = fromUnixNano(started)
 	r.completedAt = scanNano(completed)
-	snapshot, err := decodePriceSnapshot(snapshotJSON.String)
+	decoded, err := decodePriceSnapshot(snapshot, r.model)
 	if err != nil {
 		return nil, err
 	}
-	r.snapshot = snapshot
-	if snapshot != nil {
-		// The frozen snapshot is authoritative; the legacy rate columns only
-		// mirror the same price.
-		r.price = snapshot.Price
-	} else {
-		r.price = priceFromRequestRow(in, out, cr, cw, version, reasoning, r.model)
-	}
+	r.snapshot = decoded
 	return &r, nil
 }
 

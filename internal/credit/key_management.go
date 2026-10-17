@@ -185,10 +185,10 @@ func requireCaller(ctx context.Context, q querier, callerID string) error {
 }
 
 // RevealKey returns the recoverable plaintext material of one key after proving
-// it still matches the stored verifier. A key created before recoverable
-// storage existed has no ciphertext and reports ErrConflict with a rotate
-// requirement; no plaintext is ever fabricated. Every successful disclosure is
-// audited without the material itself.
+// it still matches the stored verifier. The stored blob is authenticated, so a
+// corrupted one is refused instead of being decrypted into a wrong value, and
+// no plaintext is ever fabricated. Every successful disclosure is audited
+// without the material itself.
 func (s *Store) RevealKey(ctx context.Context, id string) (string, error) {
 	if strings.TrimSpace(id) == "" {
 		return "", fmt.Errorf("%w: key id is required", ErrInvalid)
@@ -202,9 +202,6 @@ func (s *Store) RevealKey(ctx context.Context, id string) (string, error) {
 		if key.deletedAt != nil {
 			return fmt.Errorf("%w: key is deleted", ErrConflict)
 		}
-		if len(key.materialEnc) == 0 {
-			return fmt.Errorf("%w: key predates recoverable material; rotate it before revealing", ErrConflict)
-		}
 		plain, err := decryptMaterial(s.pepper, key.materialEnc)
 		if err != nil {
 			return err
@@ -213,6 +210,8 @@ func (s *Store) RevealKey(ctx context.Context, id string) (string, error) {
 			return fmt.Errorf("reveal key: stored material failed verification")
 		}
 		material = plain
+		// The audit row is written only after the ciphertext proved both
+		// openable and consistent, so a corrupt blob leaves no audit trail.
 		return insertAudit(ctx, tx, s.nowUTC(), ActionReveal, key.id, key.callerID, "", "")
 	})
 	if err != nil {

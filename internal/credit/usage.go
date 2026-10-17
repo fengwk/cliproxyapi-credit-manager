@@ -261,7 +261,7 @@ func (s *Store) RecordUsage(ctx context.Context, usage Usage) error {
 		if reported := strings.TrimSpace(usage.ServiceTier); reported != "" {
 			usage.ServiceTier = normalizeServiceTier(reported)
 		} else {
-			usage.ServiceTier = req.frozenServiceTier()
+			usage.ServiceTier = normalizeServiceTier(req.snapshot.ServiceTier)
 		}
 		existing, err := loadUsageByID(ctx, tx, usage.ID)
 		switch {
@@ -283,7 +283,7 @@ func (s *Store) RecordUsage(ctx context.Context, usage Usage) error {
 		}
 		var cost *int64
 		if reliable {
-			if req.price.IsPerImage() {
+			if req.snapshot.Price.IsPerImage() {
 				// A reliable per-image attempt is *known* accounting worth zero:
 				// the frozen requested count is billed once for the whole
 				// successful lifecycle (see bookPerImageOnProvenSuccess), so a
@@ -295,7 +295,7 @@ func (s *Store) RecordUsage(ctx context.Context, usage Usage) error {
 				// Token prices settle from actual usage: the frozen service
 				// tier applies first, and the highest context tier matching the
 				// actual canonical prompt size applies otherwise.
-				v, err := requestCost(req.price, req.tiers(), tokens, usage.ServiceTier)
+				v, err := requestCost(req.snapshot.Price, req.snapshot.Tiers, tokens, usage.ServiceTier)
 				if err != nil {
 					return err
 				}
@@ -323,7 +323,7 @@ func (s *Store) RecordUsage(ctx context.Context, usage Usage) error {
 		// that records it, even while the request stays open, so a later
 		// write-off can never discard a real charge. A per-image attempt has no
 		// per-execution charge: its single lifecycle charge is booked below.
-		if cost != nil && !req.price.IsPerImage() {
+		if cost != nil && !req.snapshot.Price.IsPerImage() {
 			if err := s.applyCharge(ctx, tx, req, usage.ID, *cost); err != nil {
 				return err
 			}
@@ -454,7 +454,7 @@ func (s *Store) Complete(ctx context.Context, c Completion) error {
 // charged usage row is the durable "already booked" marker, so a replay, a late
 // duplicate or a second successful execution can never double charge.
 func (s *Store) bookPerImageOnProvenSuccess(ctx context.Context, tx *sql.Tx, req *reqRow) error {
-	if !req.price.IsPerImage() || req.outcome != OutcomeSucceeded {
+	if !req.snapshot.Price.IsPerImage() || req.outcome != OutcomeSucceeded {
 		return nil
 	}
 	booked, err := counterValue(ctx, tx,
@@ -479,7 +479,7 @@ func (s *Store) bookPerImageOnProvenSuccess(ctx context.Context, tx *sql.Tx, req
 	if err != nil {
 		return fmt.Errorf("load per-image usage: %w", err)
 	}
-	amount, err := perImageCost(req.price, req.imageCount())
+	amount, err := perImageCost(req.snapshot.Price, req.snapshot.ImageCount)
 	if err != nil {
 		return err
 	}

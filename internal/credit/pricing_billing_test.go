@@ -2,11 +2,8 @@ package credit
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"math"
-	"os"
-	"path/filepath"
 	"testing"
 )
 
@@ -222,60 +219,6 @@ func TestUsageServiceTierReplayAndFrozenFallback(t *testing.T) {
 	execs := h.request(req2.ID).Executions
 	if len(execs) != 1 || execs[0].ServiceTier != "flex" {
 		t.Fatalf("persisted tier = %+v, want flex", execs)
-	}
-}
-
-// TestPricingMigrationUpgradesPopulatedBaseStore builds a pre-feature ledger with
-// the base schema only, then opens it with the current code: the additive
-// migration must run and the legacy request, which has no snapshot, must settle
-// from its stored rate columns.
-func TestPricingMigrationUpgradesPopulatedBaseStore(t *testing.T) {
-	dir := t.TempDir()
-	dbPath := filepath.Join(dir, dbFileName)
-	raw, err := sql.Open(driverName, dsnFor(dbPath))
-	if err != nil {
-		t.Fatalf("open legacy db: %v", err)
-	}
-	if _, err := raw.Exec(legacyV1DDL); err != nil {
-		t.Fatalf("base schema: %v", err)
-	}
-	for _, stmt := range []string{
-		`INSERT INTO keys(id,principal,scope,fingerprint,hmac,label,enabled,quota_micro_usd,daily_micro_usd,weekly_micro_usd,monthly_micro_usd,max_concurrent,allowed_models,expires_at,created_at,spent_micro_usd,held_micro_usd)
-		 VALUES('k1','cmk:legacy','scope-legacy','fp','hmac','legacy',1,0,0,0,0,0,'[]',NULL,1000,0,0)`,
-		`INSERT INTO prices(model,input_rate,output_rate,reasoning_rate,cache_read_rate,cache_write_rate,version)
-		 VALUES('m1',1000000,2000000,NULL,0,0,1)`,
-		`INSERT INTO requests(id,trace_id,key_id,model,state,outcome,status_code,started_at,completed_at,held_micro_usd,price_input,price_output,price_reasoning,price_cache_read,price_cache_write,price_version,token_estimate,charge_micro_usd,resolved,initial_hold_micro_usd)
-		 VALUES('legacy-1','legacy-trace','k1','m1','pending','',0,1000,NULL,0,1000000,2000000,NULL,0,0,1,20,0,'',0)`} {
-		if _, err := raw.Exec(stmt); err != nil {
-			t.Fatalf("seed legacy store: %v", err)
-		}
-	}
-	if err := raw.Close(); err != nil {
-		t.Fatalf("close legacy db: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(dir, pepperFileName), make([]byte, pepperLen), 0o600); err != nil {
-		t.Fatalf("write pepper: %v", err)
-	}
-	s, err := Open(Options{DataDir: dir})
-	if err != nil {
-		t.Fatalf("open upgraded store: %v", err)
-	}
-	defer func() { _ = s.Close() }()
-	ctx := context.Background()
-	if err := s.RecordUsage(ctx, Usage{
-		ID: "legacy-usage", TraceID: "legacy-trace", KeyID: "k1", Model: "m1",
-		Tokens: Tokens{Input: 10, Output: 5, Total: 15}, Quality: QualityComplete}); err != nil {
-		t.Fatalf("record legacy usage: %v", err)
-	}
-	if err := s.Complete(ctx, Completion{ID: "legacy-1", TraceID: "legacy-trace", Outcome: OutcomeSucceeded}); err != nil {
-		t.Fatalf("complete legacy request: %v", err)
-	}
-	key, err := s.GetKey(ctx, "k1")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if key.SpentMicroUSD != 20 {
-		t.Fatalf("legacy settle spent=%d, want 20 from the stored rate columns", key.SpentMicroUSD)
 	}
 }
 

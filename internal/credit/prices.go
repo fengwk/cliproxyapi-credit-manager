@@ -469,23 +469,3 @@ func lookupPrice(ctx context.Context, q querier, model string) (Price, error) {
 	}
 	return p, nil
 }
-
-// priceFromRequestRow rebuilds a legacy request price from its stored rate
-// columns when the request predates the additive price snapshot.
-func priceFromRequestRow(input, output, cacheRead, cacheWrite, version int64, reasoning sql.NullInt64, model string) Price {
-	p := Price{
-		Model: model,
-		Rates: Rates{
-			Input:      input,
-			Output:     output,
-			CacheRead:  cacheRead,
-			CacheWrite: cacheWrite,
-		},
-		Version: version,
-	}
-	if reasoning.Valid {
-		v := reasoning.Int64
-		p.Rates.Reasoning = &v
-	}
-	return p
-}
