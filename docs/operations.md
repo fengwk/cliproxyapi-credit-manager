@@ -4,7 +4,7 @@
 更深的设计约束见 [`IMPLEMENTATION.md`](IMPLEMENTATION.md)，接口速查见
 [`../README.md`](../README.md)。
 
-## 1. 安装与升级
+## 1. 安装与启动
 
 ### 目录与 id
 
@@ -18,6 +18,9 @@
 - 客户自助地址：`/v0/resource/plugins/cliproxyapi-credit-manager/lookup.html`
 - **财务 API 前缀是插件自己声明的固定值**：`/v0/management/plugins/credit-manager/api/…`
   （与实例 id 不是同一个字符串，不要混用）
+
+**保留发布文件名，不要重命名。** 插件只接受实例 id `cliproxyapi-credit-manager`。
+其它资源基路径会停止新请求准入，避免执行后丢弃无法归属的用量。
 
 安装步骤（主机上执行）：
 
@@ -42,7 +45,8 @@ plugins:
 sha256sum -c checksums.txt --ignore-missing   # 需要与 zip 同目录
 
 # 2. 解压，只复制动态库
-unzip -o cliproxyapi-credit-manager_0.1.2_linux_amd64.zip cliproxyapi-credit-manager.so
+# VERSION 设为所下载的版本号，不含 v 前缀
+unzip -o "cliproxyapi-credit-manager_${VERSION}_linux_amd64.zip" cliproxyapi-credit-manager.so
 mkdir -p "$CPA_DIR/plugins/linux/amd64"
 cp cliproxyapi-credit-manager.so "$CPA_DIR/plugins/linux/amd64/"
 
@@ -52,11 +56,14 @@ cp cliproxyapi-credit-manager.so "$CPA_DIR/plugins/linux/amd64/"
 > 归档里的 `LICENSE`、`README.md`、`metadata.json` 是发布记录，**不需要**复制到插件目录；
 > 宿主只读取动态库本身。
 
-### 升级
+### 数据格式
 
-1. 停止 CPA，并冷备整个插件数据目录；本版只发布 Linux/macOS 动态库。
-2. 用新版本的库文件覆盖同名文件（路径与文件名保持不变，实例 id 才不变）。
-3. 在同一个 `data_dir` 上启动 CPA，配置与账务、客户端 Key 全部延续。
+首次启动使用空 `data_dir`。插件在一个事务中创建完整账本，最后写入
+`PRAGMA user_version=1`。同格式账本可正常重开；启动不会补列、修补结构或执行迁移。
+其它格式会被拒绝，插件不会转换或静默删除其中的数据。
+
+需要完全重新开始时，停止 CPA，把 `data_dir` 改为新的空目录，再启动并重新创建客户端
+Key、价格和调用方。原目录是否保留由操作人员决定，插件不代替操作人员删除数据。
 
 ### 卸载
 
@@ -81,11 +88,10 @@ cp cliproxyapi-credit-manager.so "$CPA_DIR/plugins/linux/amd64/"
 修改任何一项都需要宿主重新下发配置（重启 CPA，或通过宿主的管理接口触发热重载）。
 `data_dir` 变更会被显式拒绝。
 
-**已移除的旧配置项**：`max_pending_requests`、`warmup.*`（`enabled`/`interval`/`targets`）在本版本
-已随架构移除（准入不再有积压闸门，宿主模型执行回调与后台预热一并删除）。配置里若仍留有这些键，
-插件会**报配置错误并拒绝注册**，而不是静默忽略或继续旧行为。
+仅接受配置表中的插件字段，以及宿主注入的 `priority`、`store` 字段。
+任何未知字段都会报配置错误并拒绝注册，不存在隐藏开关或旧配置转换。
 CPA 的配置保存接口返回 200 只表示保存成功；宿主随后重新加载插件时仍会拒绝这些字段。
-完整重载会卸载原插件，因此不得依赖原配置继续服务。请从配置中删除旧字段后再升级。
+完整重载会卸载原插件，因此不得依赖原配置继续服务。
 
 ## 3. 数据目录与两个数据库
 
@@ -114,17 +120,10 @@ data_dir/
 
 1. **先停止 CPA，再备份**。运行中直接拷走在途状态可能不一致。
 2. **`pepper` 必须与账务库成对保存**，不要分开、不要删除、不要重建。
-   - 库中保存的是 HMAC 校验值，只有同一 `pepper` 才能验证客户端 Key；
-   - 更换或丢失 `pepper` = 所有客户端 Key 立刻失效，且无法找回明文（明文从未落库）。
-3. **恢复时原样还原** `pepper` 与 `credit.db`（含 `-wal`），不要“重新初始化”。
-4. **升级会事务化迁移旧账务库**：若 `credit.db` 来自带预占/估算列的旧版本，插件会在启动时
-   事务化地删除这些已废弃列（`keys.held_micro_usd`，`requests.held_micro_usd`/
-   `initial_hold_micro_usd`/`token_estimate`）。迁移**幂等**，且**完整保留**既有实际扣费、
-   Key、价格、请求、用量、人工调整与重置基线；重新打开旧库**不会**凭空生成任何费用。
-   **升级前必须先冷备整个 `data_dir`**（见第 1 条）。
-5. **不支持降级回旧版本**：没有自动的“v1 回退”，旧版本也不认识新结构。需要回退时只能用
-   升级前的冷备在原路径还原。
-6. 快照库 (`request-captures.db`) 可以不备份；它只是诊断数据。
+   - 库中保存 HMAC 校验值及 AES-GCM 密文，只有同一 `pepper` 才能验证和解密客户端 Key；
+   - 更换或丢失 `pepper` 会令所有客户端 Key 失效，也无法解密已封存的材料。
+3. **只恢复当前格式的配套备份**：原样还原 `pepper` 与 `credit.db`（含 `-wal`），不要重新初始化。
+4. 快照库 (`request-captures.db`) 可以不备份；它只是诊断数据。
 
 建议做法：停机冷备整个目录并带上时间戳；把备份与 `pepper` 一起纳入受控密钥管理；
 定期做一次“还原到空主机”的演练。
@@ -196,18 +195,12 @@ data_dir/
 - 清理/回收依赖 SQLite 检查点；遇到 busy 时会报告错误并在下一次维护重试，**不保证
   立即完成**。
 
-## 8. 已移除的能力（不要按旧文档配置）
+## 8. 插件职责边界
 
-本版本移除了两处旧能力，**不做兼容保留**：
-
-- **账号预热与宿主模型执行回调**：插件不再向宿主发起任何 `host.model.execute` 之类的
-  执行回调，也没有后台预热 worker、没有预热周期、没有相关暂停/排空状态。`warmup.*` 配置项
-  已删除，留用会直接报配置错误。
-- **准入积压闸门**：`max_pending_requests` 及每个 Key 的未决请求上限已删除。未决请求
-  照常可见、可裁决，但**不再阻塞**该 Key 或其它 Key 的后续准入。
-
-这两项都属于“不可见地恢复旧行为”的风险点，因此**没有隐藏开关**：旧键在配置里就是错误。
-准入本身也不再有“预占/估算”概念，真实用量始终足额入账。
+- 插件不发起后台模型请求，不调用宿主模型执行接口，也没有执行器、路由器或调度器。
+- CPA 负责原生重试、失败切换、上游凭据选择和会话亲和。
+- 未决账务可见且可裁决，但不阻塞该 Key 或其它 Key 的后续准入。
+- 准入只检查实际已用额度与显式并发限制，不预估、预留或占用金额；真实用量足额入账。
 
 ## 9. 故障与健康
 
@@ -232,7 +225,8 @@ data_dir/
 | 管理 API 401 | 缺少/错误的 `Authorization: Bearer <管理密钥>` |
 | 管理 API 415 | 非 GET 请求缺少 `Content-Type: application/json` |
 | 管理 API 409 | 冲突：对非 pending 请求裁决、重配置被拒（配置仍为旧值且仍生效） |
-| 配置被拒（启动/重载） | 配置里仍有 `warmup.*`/`max_pending_requests` 等已移除键：删除后重试 |
+| 配置被拒（启动/重载） | 对照配置表和 `config.example.yaml` 检查字段名与取值 |
+| 非当前账本格式 | 配置新的空 `data_dir` 并重新创建 Key 和价格，不期待自动迁移 |
 | 界面要求重新登录 | 正常行为：管理密钥只存在内存中 |
 
 ## 10. 上线前安全核对清单
@@ -240,10 +234,10 @@ data_dir/
 - [ ] 已确认 **CPA 原生 `access.api-keys` 从未分发给调用方**（保持“未分发”状态）。
 - [ ] 原生 Key 列表至少有一把高强度守卫 Key，且其中不包含插件客户 Key；原生列表为空
       不是安全部署，可能在插件缺失时放行匿名请求。
-- [ ] `plugins.enabled: true`，且库文件名与 `plugins.configs` 的键一致。
-- [ ] `data_dir` 位于受控存储，且已纳入包含 `pepper` 的整目录冷备；**升级前已做冷备**，
-      并确认无自动降级回退路径。
-- [ ] 配置中不含已移除的旧键（`warmup.*`、`max_pending_requests`）。
+- [ ] `plugins.enabled: true`，库文件名与配置键均为发布时的 `cliproxyapi-credit-manager`。
+- [ ] 首次运行使用空 `data_dir`；复用的数据仅来自当前格式。
+- [ ] `data_dir` 位于受控存储，且已纳入包含 `pepper` 的整目录冷备。
+- [ ] 配置仅含文档所列字段及宿主注入字段。
 - [ ] 管理密钥为高强度口令，且只通过安全的带外渠道分发给管理员。
 - [ ] 已实测误删/误停插件的后果：在上述守卫前提下，插件缺失时所有客户 Key 都被拒绝，
       上游调用为零；不把插件缺席时的安全错误归因于插件代码仍在执行。

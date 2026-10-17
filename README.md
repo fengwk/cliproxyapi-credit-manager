@@ -16,7 +16,7 @@ CLIProxyAPI v8 的**原生插件**：用插件自建的客户端 Key 做前端�
 | 宿主 | CLIProxyAPI **v8.0.30**（原生插件 ABI 1 / RPC schema 6） |
 | 运行形态 | 原生动态库，由宿主进程内加载；**单实例**：一个数据目录同一时刻只允许一个进程打开 |
 | 构建（仅自行编译时需要） | Go 1.26 + CGO（`-buildmode=c-shared`） |
-| 存储 | 本地 SQLite，无外部数据库、无消息队列 |
+| 存储 | 本地 SQLite，仅支持当前格式；首次运行使用空数据目录，无外部数据库、无消息队列 |
 
 ## 快速开始
 
@@ -51,7 +51,8 @@ cp cliproxyapi-credit-manager.so  "$CPA_DIR/plugins/linux/amd64/"
 ```
 
 文件名决定宿主侧的**实例 id**（此处为 `cliproxyapi-credit-manager`）；`LICENSE`、
-`README.md`、`metadata.json` 是发布记录，不需要复制。
+`README.md`、`metadata.json` 是发布记录，不需要复制。**不要重命名动态库**：插件只接受
+正式发布的实例 id；其它 id 会停止新请求准入，避免执行后无法归属用量。
 
 **3. 配置**：在 CPA 的 `config.yaml` 中加一段实例配置（完整示例见
 [`config.example.yaml`](config.example.yaml)）：
@@ -69,6 +70,10 @@ plugins:
       data_dir: "./data/cliproxyapi-credit-manager"
 ```
 
+**首次运行使用空的 `data_dir`。** 插件一次性创建完整账本，不迁移、补列或转换其它格式。
+同格式数据可正常重开；其它格式会被拒绝，不会被静默清空。重新开始时使用新的空目录，
+并重新创建客户端 Key、价格和调用方。
+
 **必须保留一把从未分发的 CPA 原生守卫 Key。** 不要把插件 Key 写入
 `access.api-keys`；原生 Key 列表为空时，插件缺失可能导致 CPA 放行匿名请求。
 客户端只能使用插件签发的 Key。首次部署要验证“插件禁用 → 客户 Key 被拒绝”。
@@ -82,8 +87,8 @@ http://<cpa-host>:8317/v0/resource/plugins/cliproxyapi-credit-manager/index.html
 ```
 
 用 CPA 的**管理密钥**登录，然后在「客户端 Key」页建第一把 Key。
-新建/轮换时显示明文；新 Key 另有 AES-GCM 密文备份，可通过管理鉴权后的「查看密钥」再次展示并记审计。
-此前仅保存 HMAC 的旧 Key 不能恢复明文，须轮换后才能使用此功能。数据库与 pepper 均须妥善保护。
+每把 Key 都保存 HMAC 校验值和 AES-GCM 密文；新建/轮换时显示明文，也可通过管理鉴权后的
+「查看密钥」再次展示并记审计。数据库与 pepper 均须妥善保护。
 默认在当前标签的 `sessionStorage` 保持登录，刷新无需重输；显式勾选「记住密钥」
 才写入 `localStorage`。不要在共享设备上记住管理密钥。
 
@@ -152,7 +157,7 @@ curl -sS 'http://127.0.0.1:8317/v0/management/plugins/credit-manager/api/usage?f
 
 ## 界面、趋势与客户日志
 
-- 管理界面恢复原版 CM 标识与 CPA `white` / `light` / `dark` / `auto` 主题联动；
+- 管理界面使用 CM 标识，与 CPA `white` / `light` / `dark` / `auto` 主题联动；
   图表使用本地打包的 ECharts，不依赖 CDN。
 - 请求/执行次数、五类互斥 Token、执行费用/人工补记分别展示；支持 UTC 时、日、
   **自然月**聚合。统计与图表来自同一筛选范围，不拿当前页冒充全量趋势。
@@ -164,8 +169,7 @@ curl -sS 'http://127.0.0.1:8317/v0/management/plugins/credit-manager/api/usage?f
 - 快照默认关闭；启用 `request_capture.enabled` 后，管理员在请求详情中查看，
   客户在自助页查看自己请求的 Header/Body。到期或容量淘汰后可能不可用。
 
-与原版的已知差异、未移植能力及验收入口见
-[`docs/restoration.md`](docs/restoration.md)。本项目不是原版所有管理接口/数据库的兼容替身。
+完整功能、计费边界及验收入口见 [`docs/features.md`](docs/features.md)。
 
 ## 计费口径（核心规则）
 
@@ -251,7 +255,8 @@ metadata.json                            # id/name/version/goos/goarch/sdk/commi
 
 | 文档 | 内容 |
 | --- | --- |
-| [`docs/operations.md`](docs/operations.md) | 安装/升级与旧库迁移、配置、备份恢复、保留与清理、快照、故障处理 |
+| [`docs/operations.md`](docs/operations.md) | 全新安装、当前数据格式、配置、备份恢复、保留与清理、快照、故障处理 |
+| [`docs/features.md`](docs/features.md) | 当前管理功能、计费语义与职责边界 |
 | [`docs/release-notes-v0.1.4.md`](docs/release-notes-v0.1.4.md) | v0.1.4 移除预占、软额度准入及管理/定价/分析功能恢复；含升级注意事项 |
 | [`docs/release-notes-v0.1.3.md`](docs/release-notes-v0.1.3.md) | v0.1.3 修复 CPA 插件商店注入 store 配置导致注册失败问题 |
 | [`docs/release-notes-v0.1.2.md`](docs/release-notes-v0.1.2.md) | v0.1.2 计费、快照隐私、边界校验与管理界面修复 |
@@ -261,6 +266,8 @@ metadata.json                            # id/name/version/goos/goarch/sdk/commi
 | [`config.example.yaml`](config.example.yaml) | 可直接套用的 CPA v8 配置示例 |
 | [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) | 第三方许可与改编说明 |
 | [`tests/integration/README.md`](tests/integration/README.md) | 验收工具与用例清单 |
+
+`release-notes-v0.1.*.md` 记录对应已发布版本，不代表当前实现兼容这些版本的数据或接口。
 
 ## 许可
 

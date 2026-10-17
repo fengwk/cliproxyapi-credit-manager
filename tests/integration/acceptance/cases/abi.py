@@ -149,7 +149,7 @@ def abi_probe(ctx):
     # A filename-derived identity outside the one published id must stop
     # admissions, not merely ignore its accounting notifications.
     rc, raw = plugin.call("management.register", {
-        "resource_base_path": "/v0/resource/plugins/credit-manager",
+        "ResourceBasePath": "/v0/resource/plugins/credit-manager",
     })
     refused = json.loads(raw)
     check(not refused.get("ok") and refused.get("error", {}).get("code") == "unsupported_plugin_id",
@@ -158,7 +158,7 @@ def abi_probe(ctx):
     stopped = json.loads(raw)
     check(stopped.get("ok"), f"interceptor must return a termination envelope: {stopped}")
     termination = stopped["result"]
-    check(termination.get("terminate") is True and termination.get("status_code") == 503,
+    check(termination.get("Terminate") is True and termination.get("StatusCode") == 503,
           f"a renamed library must not execute unbillable requests: {stopped}")
 
     plugin.shutdown()

@@ -18,8 +18,8 @@ No compatibility with the prior implementation. No CPA/provider edits.
   `Handle(pluginapi.ManagementRequest) pluginapi.ManagementResponse`.
   `Asset(path string)([]byte,string,bool)` embeds frontend files.
 - `config/`: `Parse([]byte)(Config,error)`, Config has DataDir,
-  RetentionMonths, Capture (capture.Config). The removed `warmup.*` and
-  `max_pending_requests` keys must be a hard parse error (never ignored).
+  RetentionMonths, Capture (capture.Config). Unknown fields are a hard parse
+  error; only the documented configuration is accepted.
 - Frontend writes only `internal/web/assets/` and `internal/web/assets_test.go`.
 
 ## Credit semantics
@@ -39,12 +39,11 @@ uses Output. Integer cost rounds up once over the sum of canonical buckets.
 Raw tokens, normalization quality and price snapshot retained. Unknown accounting
 does not settle as zero. Protect overflow.
 
-`AdmitInput` (renamed from `ReserveInput`; no `InputEstimate`/`OutputEstimate`)
-is idempotent by lifecycle ID, conflicting IDs/traces rejected; it persists
+`AdmitInput` is idempotent by lifecycle ID, conflicting IDs/traces rejected; it persists
 request/key/trace association and the frozen effective price snapshot before
 execution. This is accounting correlation, NOT a reservation: admission never
 estimates, reserves or holds money and never sums in-flight tokens.
-Local admission `Admit` (renamed from `Reserve`/`Backend.Reserve`) checks only
+Local admission `Admit` checks only
 key permissions, the requested-model price, actual-used monetary/token quotas
 and the explicitly configured Key concurrency. Quotas are soft: with a configured
 limit > 0, `actual effective used >= limit` rejects the next request; a positive
@@ -58,8 +57,8 @@ quota. Concurrent/streaming/in-flight requests may exceed quotas; actual usage i
 never capped, guessed, skipped, double-charged, cancelled, retried or rerouted
 for quota reasons. Unknown/failed-zero/no event => pending, never fake zero
 billing, and missing usage never becomes fabricated zero. There is no per-Key
-pending cap and no independent backlog gate (`ErrPending`/`checkBacklog` are
-removed): unresolved accounting never blocks future admission. Restart marks
+pending cap and no independent backlog gate: unresolved accounting never blocks
+future admission. Restart marks
 unfinished execution stopped/pending, not free.
 Administrator Resolve accepts release or charge with a mandatory reason; ledger
 adjustments append, no silent reprice, and the report shows execution cost and
@@ -72,12 +71,13 @@ Only associated requests may accept usage; after retention purge, unknown old
 events cannot resurrect requests. Unresolved requests retain necessary rows.
 Deduplication is limited to retained history; replaying an entire expired
 Admit/Usage/Complete lifecycle is unsupported. No permanent event journal is kept.
-Fresh schema has no hold/estimate columns. Opening an existing SQLite store
-migrates transactionally with a guarded DROP COLUMN for `keys.held_micro_usd` and
-`requests.held_micro_usd`/`initial_hold_micro_usd`/`token_estimate` (pinned
-modernc SQLite). The migration is idempotent and preserves every actual charge,
-key, price, snapshot, request, usage, adjustment and reset; reopening old held
-data must never invent a charge.
+One complete DDL initializes an empty SQLite ledger in a single transaction and
+stamps `PRAGMA user_version=1` last. Same-format ledgers reopen without replaying
+or repairing DDL. A nonempty unmarked ledger or any other version is refused,
+never migrated or silently erased. There is no meta version table, ALTER/DROP
+path, legacy key mode or duplicated request rate columns. Each request requires
+one non-null, validated price snapshot; every key requires encrypted material.
+Missing/corrupt snapshots never become free prices.
 Cleanup default 3 calendar months UTC (clamp day at month end), batch deletes
 closed history, keeps durable counters. incremental_vacuum + WAL TRUNCATE; busy
 must be observable. One DB connection, bounded transactions and no external MQ.
@@ -99,13 +99,15 @@ failure. Tests must check actual DB+WAL shrinking and pressure/busy cases.
 
 ## Native integration
 
-RPC schema6/ABI1. exclusive frontend auth, RequestInterceptor+Lifecycle+Usage,
+RPC schema6/ABI1. A missing/zero/older schema is refused, not negotiated down.
+Exclusive frontend auth, RequestInterceptor+Lifecycle+Usage,
 Management+resource routes only. CPA candidates first valid in native order.
 Caller_scope trusted SDK metadata => internal Key; NEVER reparse Bearer to bill.
 Full TraceID connects lifecycle and usage execution IDs. There is no input/output
 estimate of any kind: the interceptor never sizes the request to admit it -- a
 positive remaining quota admits even a very large declared output limit or body.
-Never modify execution body/headers/selection.
+Never modify execution body/headers/selection. RequestedModel is mandatory;
+the resolved execution Model never substitutes for it.
 Normalize standard SDK tokens; exact commandcode/opencode-go executorAdapter
 cohorts use Observer's strict complete unique normalization (copy with license).
 Usage.APIKey is principal, AccessProvider must belong to plugin. ResponseModel
@@ -116,7 +118,7 @@ fails only on its own validation/storage error (`ErrQuota`/`ErrConcurrency` =>
 block every key after one transient error or malformed/conflicting event. Never
 weaken auth/management/CSRF safeguards.
 No background execution: the plugin registers no executor/router/scheduler and
-issues no outbound host model-execution callback (the removed warmup bridge); the
+issues no outbound host model-execution callback; the
 ABI probe asserts zero host callbacks.
 Advanced pricing is non-invasive: the interceptor only reads the request body
 (service_tier/tier, and n/n_images/num_images/image_count validated in 1..32,
@@ -134,7 +136,10 @@ count is intentionally not an "actual images returned" claim.
 Base `/v0/management/plugins/credit-manager` (the plugin's own fixed, declared
 route segment, distinct from the host plugin instance/library id), all API paths
 management-authenticated.
-Resources `/v0/resource/plugins/<library-id>/` serve an exact embedded-asset
+The only library id is `cliproxyapi-credit-manager`, derived from the published
+filename. A different host resource base stops admissions rather than allowing
+execution with unowned usage notifications. Resources
+`/v0/resource/plugins/cliproxyapi-credit-manager/` serve an exact embedded-asset
 allow list plus GET `lookup/data` and `lookup/capture`. These two read-only
 customer endpoints authenticate an explicit customer Bearer key, force the
 authenticated KeyID, omit operator credential identifiers, and prove request
@@ -145,8 +150,8 @@ Envelope errors `{"error":"safe message"}`.
 - POST `/api/keys` KeySpec => `{"item":Key,"key":"plaintext"}`
 - PUT `/api/keys` `{"id":id,"spec":KeySpec}` => `{"item":Key}`
 - POST `/api/rotate` `{"id":id,"key":"optional custom"}` => item,key
-- POST `/api/reveal` `{"id":id}` => id,key; an audited disclosure of encrypted
-  material. Legacy HMAC-only keys return 409 until rotated.
+- POST `/api/reveal` `{"id":id}` => id,key; an audited disclosure of verified
+  encrypted material. Invalid ciphertext fails without disclosing a key.
 - POST `/api/delete-key` `{"id":id,"reason":"mandatory"}` => ok; permanent soft
   deletion, never a ledger/history deletion or forgiveness of pending charges.
 - POST `/api/reset-spend` `{id|ids|all,total,daily,weekly,monthly,reason}` =>
@@ -201,6 +206,9 @@ private DOM and chart instances; epochs reject late responses from old sessions.
 Static shell never embeds credentials. Key plaintext is shown only in explicit
 create/rotate/reveal dialogs and removed when the dialog or session ends.
 Charts/totals/list share Report; include explicit pending and quality states.
+All clients use the current Tokens object and snake_case fields only. Effective
+quota usage comes from quota_used_micro_usd, never from the lifetime ledger.
+TPS uses measured_output_tokens with paired latency, not all output tokens.
 Hour/day/month buckets are UTC; month means calendar month, not 30 days.
 Token and money display/tooltip values use exact integers/decimal arithmetic;
 only chart geometry may use floats. USD/CNY is display-only at a manual or
