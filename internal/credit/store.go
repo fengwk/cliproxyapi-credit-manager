@@ -472,7 +472,7 @@ func (s *Store) initSchema(ctx context.Context) error {
 		// pre-existing ledger is not.
 		var objects int64
 		if err := tx.QueryRowContext(ctx,
-			`SELECT COUNT(*) FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'`).Scan(&objects); err != nil {
+			`SELECT COUNT(*) FROM sqlite_master WHERE name NOT GLOB 'sqlite_*'`).Scan(&objects); err != nil {
 			return fmt.Errorf("inspect schema: %w", err)
 		}
 		if objects > 0 {

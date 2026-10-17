@@ -82,7 +82,7 @@ func pragmaColumns(t *testing.T, db *sql.DB, table string) map[string]columnInfo
 
 func userTableNames(t *testing.T, db *sql.DB) []string {
 	t.Helper()
-	rows, err := db.Query(`SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'`)
+	rows, err := db.Query(`SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT GLOB 'sqlite_*'`)
 	if err != nil {
 		t.Fatalf("list tables: %v", err)
 	}
@@ -192,6 +192,9 @@ func TestReopenCurrentFormatLeavesSchemaAndRowsUntouched(t *testing.T) {
 	if _, err := h.store.db.Exec(`CREATE TABLE sentinel_probe (id INTEGER)`); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := h.store.db.Exec(`DROP INDEX pricing_rules_resolution`); err != nil {
+		t.Fatal(err)
+	}
 	if err := h.store.Close(); err != nil {
 		t.Fatalf("close: %v", err)
 	}
@@ -205,6 +208,9 @@ func TestReopenCurrentFormatLeavesSchemaAndRowsUntouched(t *testing.T) {
 	}
 	if !userObjectExists(t, reopened.db, "sentinel_probe") {
 		t.Fatal("reopen rewrote the schema instead of opening it as it is")
+	}
+	if userObjectExists(t, reopened.db, "pricing_rules_resolution") {
+		t.Fatal("reopen repaired a missing index instead of opening the current format as it is")
 	}
 	if got, err := reopened.GetKey(context.Background(), key.ID); err != nil || got.ID != key.ID {
 		t.Fatalf("key after reopen = %+v, %v", got, err)
@@ -336,8 +342,21 @@ func TestSchemaInitializationRollsBackOnFailure(t *testing.T) {
 	if _, err := db.ExecContext(ctx, `PRAGMA page_size = 1024`); err != nil {
 		t.Fatalf("shrink page size: %v", err)
 	}
-	if _, err := db.ExecContext(ctx, `PRAGMA max_page_count = 2`); err != nil {
+	if _, err := db.ExecContext(ctx, `PRAGMA max_page_count = 16`); err != nil {
 		t.Fatalf("cap page count: %v", err)
+	}
+	// Prove at least the first complete DDL statement fits. Otherwise a full
+	// disk could fail on the first statement and only test statement rollback.
+	probe, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := probe.ExecContext(ctx, strings.SplitN(schemaDDL, ";", 2)[0]); err != nil {
+		_ = probe.Rollback()
+		t.Fatalf("first schema statement must fit before the full schema fails: %v", err)
+	}
+	if err := probe.Rollback(); err != nil {
+		t.Fatal(err)
 	}
 	s := &Store{db: db}
 	err = s.initSchema(ctx)
@@ -354,5 +373,30 @@ func TestSchemaInitializationRollsBackOnFailure(t *testing.T) {
 	}
 	if got := userTableNames(t, db); len(got) != 0 {
 		t.Fatalf("tables after rollback = %v, want none", got)
+	}
+}
+
+// '_' must be literal in the internal-object prefix: LIKE would hide an
+// ordinary table named sqliteXledger and incorrectly treat this file as empty.
+func TestInitializationRejectsSQLiteLikeUserObject(t *testing.T) {
+	db, err := sql.Open(driverName, dsnFor(filepath.Join(t.TempDir(), dbFileName)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+	if _, err := db.Exec(`CREATE TABLE sqliteXledger (amount INTEGER); INSERT INTO sqliteXledger VALUES (42)`); err != nil {
+		t.Fatal(err)
+	}
+	s := &Store{db: db}
+	if err := s.initSchema(context.Background()); !errors.Is(err, ErrSchemaVersion) {
+		t.Fatalf("nonempty file must be refused, got %v", err)
+	}
+	if got := userTableNames(t, db); !slices.Equal(got, []string{"sqliteXledger"}) {
+		t.Fatalf("refused schema changed: %v", got)
+	}
+	var amount int
+	if err := db.QueryRow(`SELECT amount FROM sqliteXledger`).Scan(&amount); err != nil || amount != 42 {
+		t.Fatalf("refused data changed: %d, %v", amount, err)
 	}
 }
