@@ -123,31 +123,46 @@ func TestKeyMaterialCiphertextAtRestAndPepperIntegrity(t *testing.T) {
 	}
 }
 
-// A key without recoverable material (any pre-existing ledger) must report a
-// conflict and a rotate requirement instead of fabricating a plaintext.
-func TestRevealLegacyKeyConflicts(t *testing.T) {
+// The encrypted material is NOT NULL: a key row can never be written without
+// it, so the ciphertext is guaranteed to exist for every key the store creates.
+func TestKeyMaterialColumnRejectsNull(t *testing.T) {
 	h := newHarness(t)
 	key, _ := h.mustKey(KeySpec{Enabled: true})
-	// Simulates a v1 key row: verifier present, no encrypted material.
-	if _, err := h.store.db.Exec(`UPDATE keys SET key_material_enc = NULL WHERE id = ?`, key.ID); err != nil {
+	if _, err := h.store.db.Exec(`UPDATE keys SET key_material_enc = NULL WHERE id = ?`, key.ID); err == nil {
+		t.Fatal("key_material_enc accepted NULL")
+	}
+}
+
+// A corrupted ciphertext must be refused without fabricating a plaintext and
+// without leaving an audit row behind, so a damaged blob is never disclosed and
+// never recorded as a successful disclosure.
+func TestRevealCorruptMaterialConflictsWithoutAudit(t *testing.T) {
+	h := newHarness(t)
+	key, _ := h.mustKey(KeySpec{Enabled: true, Material: "sk-corrupt-5c1b-secret"})
+	var blob []byte
+	if err := h.store.db.QueryRow(`SELECT key_material_enc FROM keys WHERE id = ?`, key.ID).Scan(&blob); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := h.store.RevealKey(h.ctx(), key.ID); !errors.Is(err, ErrConflict) {
-		t.Fatalf("legacy reveal err = %v, want conflict", err)
-	}
-	// Rotating installs recoverable material and keeps the accepted material.
-	rotated, newMaterial, err := h.store.RotateKey(h.ctx(), key.ID, "")
-	if err != nil {
+	tampered := bytes.Clone(blob)
+	tampered[len(tampered)-1] ^= 0xff
+	if _, err := h.store.db.Exec(`UPDATE keys SET key_material_enc = ? WHERE id = ?`, tampered, key.ID); err != nil {
 		t.Fatal(err)
 	}
-	if rotated.ID != key.ID || rotated.Principal != key.Principal || rotated.Scope != key.Scope {
-		t.Fatalf("rotate changed identity: %+v", rotated)
+	if _, err := h.store.RevealKey(h.ctx(), key.ID); err == nil {
+		t.Fatal("corrupt material was revealed")
 	}
-	if revealed, err := h.store.RevealKey(h.ctx(), key.ID); err != nil || revealed != newMaterial {
-		t.Fatalf("reveal after rotate = %q %v", revealed, err)
+	var audits int64
+	if err := h.store.db.QueryRow(
+		`SELECT COUNT(*) FROM audit_events WHERE key_id = ? AND action = ?`, key.ID, ActionReveal).
+		Scan(&audits); err != nil {
+		t.Fatal(err)
 	}
-	if _, err := h.store.Authenticate(h.ctx(), newMaterial); err != nil {
-		t.Fatalf("rotated material rejected: %v", err)
+	if audits != 0 {
+		t.Fatalf("corrupt reveal wrote %d audit rows, want 0", audits)
+	}
+	// The key stays usable: only disclosure is impossible until it is rotated.
+	if _, err := h.store.Authenticate(h.ctx(), "sk-corrupt-5c1b-secret"); err != nil {
+		t.Fatalf("stored material stopped authenticating: %v", err)
 	}
 }
 

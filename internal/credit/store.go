@@ -51,9 +51,9 @@ const (
 // ErrLocked reports that another process already owns the data directory.
 var ErrLocked = errors.New("data directory is locked")
 
-// ErrSchemaVersion reports that an existing ledger is stamped with a schema
-// version this build does not understand. Opening it would run destructive
-// migrations against a format it cannot reason about, so it is refused instead.
+// ErrSchemaVersion reports that an existing ledger carries a format this build
+// does not own. There is no migration path, so such a ledger is refused instead
+// of being altered, dropped or rebuilt.
 var ErrSchemaVersion = errors.New("unsupported ledger schema version")
 
 const (
@@ -67,18 +67,18 @@ const (
 	cleanupBatch           = 512
 	vacuumPages            = 4096
 	maxPageSize            = 500
-	// schemaVersion is the current on-disk schema marker. Version 2 removed the
-	// estimated admission columns (estimates and money holds); a store carrying
-	// it has no hold/estimate state left.
-	schemaVersion = 2
+	// schemaVersion is the only on-disk format this build understands. It is
+	// stamped into PRAGMA user_version after the whole schema has been created,
+	// so a ledger is either empty or complete. There is no upgrade path from
+	// any other format.
+	schemaVersion = 1
 )
 
+// schemaDDL creates the complete current schema: every table, column and index
+// the ledger uses. It is executed exactly once, inside one transaction, on a
+// ledger that is provably empty, and never re-applied or repaired afterwards.
 const schemaDDL = `
-CREATE TABLE IF NOT EXISTS meta (
-  k TEXT PRIMARY KEY,
-  v TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS keys (
+CREATE TABLE keys (
   id TEXT PRIMARY KEY,
   principal TEXT NOT NULL UNIQUE,
   scope TEXT NOT NULL UNIQUE,
@@ -94,9 +94,12 @@ CREATE TABLE IF NOT EXISTS keys (
   allowed_models TEXT NOT NULL DEFAULT '[]',
   expires_at INTEGER,
   created_at INTEGER NOT NULL,
-  spent_micro_usd INTEGER NOT NULL DEFAULT 0
+  spent_micro_usd INTEGER NOT NULL DEFAULT 0,
+  key_material_enc BLOB NOT NULL,
+  caller_id TEXT NOT NULL DEFAULT '',
+  deleted_at INTEGER
 );
-CREATE TABLE IF NOT EXISTS model_token_limits (
+CREATE TABLE model_token_limits (
   key_id TEXT NOT NULL,
   model TEXT NOT NULL,
   total_tokens INTEGER NOT NULL DEFAULT 0,
@@ -105,16 +108,18 @@ CREATE TABLE IF NOT EXISTS model_token_limits (
   monthly_tokens INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (key_id, model)
 );
-CREATE TABLE IF NOT EXISTS prices (
+CREATE TABLE prices (
   model TEXT PRIMARY KEY,
   input_rate INTEGER NOT NULL,
   output_rate INTEGER NOT NULL,
   reasoning_rate INTEGER,
   cache_read_rate INTEGER NOT NULL,
   cache_write_rate INTEGER NOT NULL,
+  billing_mode TEXT NOT NULL DEFAULT '',
+  per_image_micro_usd INTEGER NOT NULL DEFAULT 0,
   version INTEGER NOT NULL
 );
-CREATE TABLE IF NOT EXISTS requests (
+CREATE TABLE requests (
   id TEXT PRIMARY KEY,
   trace_id TEXT NOT NULL,
   key_id TEXT NOT NULL,
@@ -124,21 +129,16 @@ CREATE TABLE IF NOT EXISTS requests (
   status_code INTEGER NOT NULL DEFAULT 0,
   started_at INTEGER NOT NULL,
   completed_at INTEGER,
-  price_input INTEGER NOT NULL,
-  price_output INTEGER NOT NULL,
-  price_reasoning INTEGER,
-  price_cache_read INTEGER NOT NULL,
-  price_cache_write INTEGER NOT NULL,
-  price_version INTEGER NOT NULL,
   charge_micro_usd INTEGER NOT NULL DEFAULT 0,
-  resolved TEXT NOT NULL DEFAULT ''
+  resolved TEXT NOT NULL DEFAULT '',
+  price_snapshot TEXT NOT NULL
 );
-CREATE UNIQUE INDEX IF NOT EXISTS requests_trace ON requests(trace_id);
-CREATE INDEX IF NOT EXISTS requests_key_state ON requests(key_id, state);
-CREATE INDEX IF NOT EXISTS requests_state_started ON requests(state, started_at);
-CREATE INDEX IF NOT EXISTS requests_started ON requests(started_at);
-CREATE INDEX IF NOT EXISTS requests_key_started ON requests(key_id, started_at);
-CREATE TABLE IF NOT EXISTS usages (
+CREATE UNIQUE INDEX requests_trace ON requests(trace_id);
+CREATE INDEX requests_key_state ON requests(key_id, state);
+CREATE INDEX requests_state_started ON requests(state, started_at);
+CREATE INDEX requests_started ON requests(started_at);
+CREATE INDEX requests_key_started ON requests(key_id, started_at);
+CREATE TABLE usages (
   id TEXT PRIMARY KEY,
   request_id TEXT NOT NULL,
   trace_id TEXT NOT NULL,
@@ -170,21 +170,22 @@ CREATE TABLE IF NOT EXISTS usages (
   reliable INTEGER NOT NULL DEFAULT 0,
   at INTEGER NOT NULL,
   latency_ms INTEGER NOT NULL DEFAULT 0,
-  ttft_ms INTEGER NOT NULL DEFAULT 0
+  ttft_ms INTEGER NOT NULL DEFAULT 0,
+  service_tier TEXT NOT NULL DEFAULT ''
 );
-CREATE INDEX IF NOT EXISTS usages_request ON usages(request_id);
-CREATE INDEX IF NOT EXISTS usages_trace_key ON usages(trace_id, key_id);
-CREATE INDEX IF NOT EXISTS usages_provider ON usages(provider, auth_id);
-CREATE INDEX IF NOT EXISTS usages_request_provider ON usages(request_id, provider, auth_id);
-CREATE TABLE IF NOT EXISTS key_money_counters (
+CREATE INDEX usages_request ON usages(request_id);
+CREATE INDEX usages_trace_key ON usages(trace_id, key_id);
+CREATE INDEX usages_provider ON usages(provider, auth_id);
+CREATE INDEX usages_request_provider ON usages(request_id, provider, auth_id);
+CREATE TABLE key_money_counters (
   key_id TEXT NOT NULL,
   win TEXT NOT NULL,
   period TEXT NOT NULL,
   micro_usd INTEGER NOT NULL,
   PRIMARY KEY (key_id, win, period)
 );
-CREATE INDEX IF NOT EXISTS key_money_counters_window ON key_money_counters(win, period);
-CREATE TABLE IF NOT EXISTS key_token_counters (
+CREATE INDEX key_money_counters_window ON key_money_counters(win, period);
+CREATE TABLE key_token_counters (
   key_id TEXT NOT NULL,
   model TEXT NOT NULL,
   win TEXT NOT NULL,
@@ -192,8 +193,8 @@ CREATE TABLE IF NOT EXISTS key_token_counters (
   tokens INTEGER NOT NULL,
   PRIMARY KEY (key_id, model, win, period)
 );
-CREATE INDEX IF NOT EXISTS key_token_counters_window ON key_token_counters(win, period);
-CREATE TABLE IF NOT EXISTS adjustments (
+CREATE INDEX key_token_counters_window ON key_token_counters(win, period);
+CREATE TABLE adjustments (
   seq INTEGER PRIMARY KEY AUTOINCREMENT,
   request_id TEXT NOT NULL,
   key_id TEXT NOT NULL,
@@ -202,7 +203,56 @@ CREATE TABLE IF NOT EXISTS adjustments (
   reason TEXT NOT NULL,
   at INTEGER NOT NULL
 );
-CREATE INDEX IF NOT EXISTS adjustments_request ON adjustments(request_id);
+CREATE INDEX adjustments_request ON adjustments(request_id);
+CREATE TABLE callers (
+  id TEXT PRIMARY KEY,
+  display_name TEXT NOT NULL DEFAULT '',
+  enabled INTEGER NOT NULL DEFAULT 1,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+CREATE TABLE audit_events (
+  seq INTEGER PRIMARY KEY AUTOINCREMENT,
+  at INTEGER NOT NULL,
+  action TEXT NOT NULL,
+  key_id TEXT NOT NULL DEFAULT '',
+  caller_id TEXT NOT NULL DEFAULT '',
+  reason TEXT NOT NULL DEFAULT '',
+  detail TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX audit_events_key ON audit_events(key_id, seq);
+CREATE INDEX audit_events_caller ON audit_events(caller_id, seq);
+CREATE TABLE key_money_baselines (
+  key_id TEXT NOT NULL,
+  win TEXT NOT NULL,
+  period TEXT NOT NULL,
+  micro_usd INTEGER NOT NULL,
+  PRIMARY KEY (key_id, win, period)
+);
+CREATE TABLE key_token_baselines (
+  key_id TEXT NOT NULL,
+  model TEXT NOT NULL,
+  win TEXT NOT NULL,
+  period TEXT NOT NULL,
+  tokens INTEGER NOT NULL,
+  PRIMARY KEY (key_id, model, win, period)
+);
+CREATE TABLE pricing_rules (
+  id TEXT PRIMARY KEY,
+  match_kind TEXT NOT NULL,
+  pattern TEXT NOT NULL,
+  priority INTEGER NOT NULL DEFAULT 0,
+  enabled INTEGER NOT NULL DEFAULT 1,
+  billing_mode TEXT NOT NULL DEFAULT '',
+  per_image_micro_usd INTEGER NOT NULL DEFAULT 0,
+  input_rate INTEGER NOT NULL DEFAULT 0,
+  output_rate INTEGER NOT NULL DEFAULT 0,
+  reasoning_rate INTEGER,
+  cache_read_rate INTEGER NOT NULL DEFAULT 0,
+  cache_write_rate INTEGER NOT NULL DEFAULT 0,
+  tiers_json TEXT NOT NULL DEFAULT '[]'
+);
+CREATE INDEX pricing_rules_resolution ON pricing_rules(priority DESC, id);
 `
 
 // Store is the SQLite-backed implementation of Backend.
@@ -312,7 +362,7 @@ func Open(opts Options) (*Store, error) {
 	if err := db.PingContext(ctx); err != nil {
 		return fail(fmt.Errorf("connect database: %w", err))
 	}
-	if err := s.migrate(ctx); err != nil {
+	if err := s.initSchema(ctx); err != nil {
 		return fail(err)
 	}
 	if err := s.recoverExecutions(ctx); err != nil {
@@ -398,56 +448,50 @@ func syncDataDir(dir string) error {
 	return errors.Join(errs...)
 }
 
-func (s *Store) migrate(ctx context.Context) error {
+// initSchema establishes the single on-disk format. An empty ledger is created
+// in one transaction that writes the whole schema and stamps the format marker
+// last; a ledger already carrying the current marker is opened exactly as it is.
+// Nothing is altered, dropped or repaired, and any other format is refused
+// before a single DDL statement runs.
+func (s *Store) initSchema(ctx context.Context) error {
 	return s.inTx(ctx, func(tx *sql.Tx) error {
+		var version int
+		if err := tx.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&version); err != nil {
+			return fmt.Errorf("read schema version: %w", err)
+		}
+		if version == schemaVersion {
+			// An existing ledger of the current format is opened as it is:
+			// there is nothing to add, drop or repair.
+			return nil
+		}
+		if version != 0 {
+			return fmt.Errorf("%w: %d", ErrSchemaVersion, version)
+		}
+		// SQLite's own objects (sqlite_sequence and friends) are not user
+		// schema, so a file that was just created is empty while any
+		// pre-existing ledger is not.
+		var objects int64
+		if err := tx.QueryRowContext(ctx,
+			`SELECT COUNT(*) FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'`).Scan(&objects); err != nil {
+			return fmt.Errorf("inspect schema: %w", err)
+		}
+		if objects > 0 {
+			// An unmarked ledger with user schema objects is some other format.
+			// It is refused before any DDL runs, so its schema and rows are
+			// never touched.
+			return fmt.Errorf("%w: unmarked ledger carries user schema objects", ErrSchemaVersion)
+		}
 		if _, err := tx.ExecContext(ctx, schemaDDL); err != nil {
 			return fmt.Errorf("apply schema: %w", err)
 		}
-		// The recorded version is read before any destructive step: a ledger
-		// written by a newer or corrupt version must be refused instead of
-		// having its columns dropped and its marker overwritten.
-		if err := checkSchemaVersion(ctx, tx); err != nil {
-			return err
+		// The marker is stamped last and in the same transaction, so an
+		// interrupted initialization rolls back to a completely empty ledger
+		// instead of leaving a partial schema that claims to be current.
+		if _, err := tx.ExecContext(ctx, `PRAGMA user_version = `+strconv.Itoa(schemaVersion)); err != nil {
+			return fmt.Errorf("stamp schema version: %w", err)
 		}
-		if err := migrateKeyFeatures(ctx, tx); err != nil {
-			return err
-		}
-		if err := migratePricingFeatures(ctx, tx); err != nil {
-			return err
-		}
-		if err := migratePostpaidSchema(ctx, tx); err != nil {
-			return err
-		}
-		// The marker is stamped last so an interrupted migration never claims a
-		// schema the store does not actually carry. It is upserted because a
-		// legacy store already carries version 1.
-		_, err := tx.ExecContext(ctx,
-			`INSERT INTO meta(k, v) VALUES('schema_version', ?)
-			 ON CONFLICT(k) DO UPDATE SET v = excluded.v`,
-			fmt.Sprint(schemaVersion))
-		return err
-	})
-}
-
-// checkSchemaVersion validates the recorded schema marker of an existing
-// ledger. A missing marker is the original v1 store, which the migration
-// upgrades in place; versions 1 through schemaVersion are accepted. Any other
-// value (a future version, zero, or a corrupt string) is refused so the
-// destructive steps never run against a format this build cannot understand.
-func checkSchemaVersion(ctx context.Context, tx *sql.Tx) error {
-	var raw string
-	err := tx.QueryRowContext(ctx, `SELECT v FROM meta WHERE k = 'schema_version'`).Scan(&raw)
-	if errors.Is(err, sql.ErrNoRows) {
 		return nil
-	}
-	if err != nil {
-		return fmt.Errorf("read schema version: %w", err)
-	}
-	version, convErr := strconv.Atoi(strings.TrimSpace(raw))
-	if convErr != nil || version < 1 || version > schemaVersion {
-		return fmt.Errorf("%w: %q", ErrSchemaVersion, raw)
-	}
-	return nil
+	})
 }
 
 // recoverExecutions converts executions interrupted by a restart into pending

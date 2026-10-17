@@ -96,12 +96,10 @@ func (s *Store) Admit(ctx context.Context, in AdmitInput) (Request, error) {
 		}
 		if _, err := tx.ExecContext(ctx, `INSERT INTO requests
 			(id, trace_id, key_id, model, state, outcome, status_code, started_at, completed_at,
-			 price_input, price_output, price_reasoning, price_cache_read,
-			 price_cache_write, price_version, charge_micro_usd, resolved, price_snapshot)
-			VALUES(?,?,?,?,?,'',0,?,NULL,?,?,?,?,?,?,0,'',?)`,
+			 charge_micro_usd, resolved, price_snapshot)
+			VALUES(?,?,?,?,?,'',0,?,NULL,0,'',?)`,
 			in.ID, in.TraceID, in.KeyID, in.RequestedModel, stateActive, unixNano(at),
-			price.Rates.Input, price.Rates.Output, price.Rates.Reasoning, price.Rates.CacheRead,
-			price.Rates.CacheWrite, price.Version, snapshot); err != nil {
+			snapshot); err != nil {
 			return fmt.Errorf("insert request: %w", err)
 		}
 		out = Request{
