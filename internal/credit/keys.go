@@ -21,7 +21,6 @@ type keyRow struct {
 	limits      []ModelTokenLimit
 	createdAt   time.Time
 	spent       int64
-	held        int64
 	// materialEnc is the AES-256-GCM sealed key material. It never leaves the
 	// store except through RevealKey, which decrypts and re-verifies it.
 	materialEnc []byte
@@ -45,7 +44,6 @@ func (k *keyRow) toKey() Key {
 		Fingerprint:         k.fingerprint,
 		Spec:                spec,
 		SpentMicroUSD:       k.spent,
-		HeldMicroUSD:        k.held,
 		QuotaUsedMicroUSD:   k.quotaUsed,
 		DailyUsedMicroUSD:   k.dayUsed,
 		WeeklyUsedMicroUSD:  k.weekUsed,
@@ -63,7 +61,7 @@ type keyColumnQuerier interface {
 
 const keyColumns = `id, principal, scope, fingerprint, hmac, label, enabled, quota_micro_usd,
 	daily_micro_usd, weekly_micro_usd, monthly_micro_usd, max_concurrent, allowed_models,
-	expires_at, created_at, spent_micro_usd, held_micro_usd, key_material_enc, caller_id, deleted_at`
+	expires_at, created_at, spent_micro_usd, key_material_enc, caller_id, deleted_at`
 
 func scanKeyRow(scan func(...any) error) (*keyRow, error) {
 	var (
@@ -78,7 +76,7 @@ func scanKeyRow(scan func(...any) error) (*keyRow, error) {
 	)
 	if err := scan(&k.id, &k.principal, &k.scope, &k.fingerprint, &k.hmac, &label, &enabled,
 		&k.spec.QuotaMicroUSD, &k.spec.DailyMicroUSD, &k.spec.WeeklyMicroUSD, &k.spec.MonthlyMicroUSD,
-		&k.spec.MaxConcurrent, &allowedRaw, &expires, &created, &k.spent, &k.held,
+		&k.spec.MaxConcurrent, &allowedRaw, &expires, &created, &k.spent,
 		&material, &k.callerID, &deleted); err != nil {
 		return nil, err
 	}
@@ -300,9 +298,9 @@ func (s *Store) CreateKey(ctx context.Context, spec KeySpec) (Key, string, error
 		if _, err := tx.ExecContext(ctx, `INSERT INTO keys
 			(id, principal, scope, fingerprint, hmac, label, enabled, quota_micro_usd,
 			 daily_micro_usd, weekly_micro_usd, monthly_micro_usd, max_concurrent,
-			 allowed_models, expires_at, created_at, spent_micro_usd, held_micro_usd,
+			 allowed_models, expires_at, created_at, spent_micro_usd,
 			 key_material_enc, caller_id, deleted_at)
-			VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,0,?,?,NULL)`,
+			VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,?,?,NULL)`,
 			id, principalValue, scope, fingerprintOf(hmac), hmac,
 			norm.Label, boolInt(norm.Enabled), norm.QuotaMicroUSD, norm.DailyMicroUSD, norm.WeeklyMicroUSD,
 			norm.MonthlyMicroUSD, norm.MaxConcurrent, allowed, nullableNano(norm.ExpiresAt), unixNano(now),

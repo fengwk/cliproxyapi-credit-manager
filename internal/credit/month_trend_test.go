@@ -30,12 +30,11 @@ func TestReportTrendUsesCalendarMonths(t *testing.T) {
 		// 2024-03-01T00:30:00+09:00 is 2024-02-29T15:30:00Z: the UTC month, not
 		// the local one, decides the bucket.
 		{"feb-via-offset", time.Date(2024, time.March, 1, 0, 30, 0, 0, east), 8},
-		{"mar-first", time.Date(2024, time.March, 1, 0, 0, 0, 0, time.UTC), 16},
-	}
+		{"mar-first", time.Date(2024, time.March, 1, 0, 0, 0, 0, time.UTC), 16}}
 	for _, s := range samples {
 		h.clock.set(s.at)
-		req := h.mustReserve(ReserveInput{ID: s.id, TraceID: "t-" + s.id, KeyID: key.ID,
-			RequestedModel: "m1", InputEstimate: s.in, At: s.at})
+		req := h.mustAdmit(AdmitInput{ID: s.id, TraceID: "t-" + s.id, KeyID: key.ID,
+			RequestedModel: "m1", At: s.at})
 		h.mustUsage(usageFor("u-"+s.id, req, "m1", tokens(s.in, 0, 0, 0, 0)))
 		h.mustComplete(Completion{ID: req.ID, TraceID: req.TraceID, Outcome: OutcomeSucceeded, At: s.at})
 	}
@@ -52,8 +51,7 @@ func TestReportTrendUsesCalendarMonths(t *testing.T) {
 	wantStarts := []time.Time{
 		time.Date(2024, time.January, 1, 0, 0, 0, 0, time.UTC),
 		time.Date(2024, time.February, 1, 0, 0, 0, 0, time.UTC),
-		time.Date(2024, time.March, 1, 0, 0, 0, 0, time.UTC),
-	}
+		time.Date(2024, time.March, 1, 0, 0, 0, 0, time.UTC)}
 	for i, want := range wantStarts {
 		got := rep.Trend[i].Time
 		if !got.Equal(want) {
@@ -109,8 +107,8 @@ func TestReportTrendMonthReconcilesSummaryWithAdjustments(t *testing.T) {
 
 	record := func(id string, at time.Time, in, out int64) {
 		h.clock.set(at)
-		req := h.mustReserve(ReserveInput{ID: id, TraceID: "t-" + id, KeyID: key.ID,
-			RequestedModel: "m1", InputEstimate: in, OutputEstimate: out, At: at})
+		req := h.mustAdmit(AdmitInput{ID: id, TraceID: "t-" + id, KeyID: key.ID,
+			RequestedModel: "m1", At: at})
 		h.mustUsage(usageFor("u-"+id, req, "m1", tokens(in, 0, 0, out, 0)))
 		h.mustComplete(Completion{ID: req.ID, TraceID: req.TraceID, Outcome: OutcomeSucceeded, At: at})
 	}
@@ -123,8 +121,8 @@ func TestReportTrendMonthReconcilesSummaryWithAdjustments(t *testing.T) {
 	// administrator charges it in a later month.
 	feb25 := time.Date(2024, time.February, 25, 8, 0, 0, 0, time.UTC)
 	h.clock.set(feb25)
-	manual := h.mustReserve(ReserveInput{ID: "manual", TraceID: "t-manual", KeyID: key.ID,
-		RequestedModel: "m1", InputEstimate: 100, At: feb25})
+	manual := h.mustAdmit(AdmitInput{ID: "manual", TraceID: "t-manual", KeyID: key.ID,
+		RequestedModel: "m1", At: feb25})
 	h.mustComplete(Completion{ID: manual.ID, TraceID: manual.TraceID, Outcome: OutcomeFailed, StatusCode: 502, At: feb25})
 	h.clock.set(time.Date(2024, time.March, 20, 8, 0, 0, 0, time.UTC))
 	if err := h.store.Resolve(ctx, "manual", Resolution{Action: ActionCharge,
@@ -134,12 +132,12 @@ func TestReportTrendMonthReconcilesSummaryWithAdjustments(t *testing.T) {
 
 	// An unresolved request started in March must stay visible, never dropped.
 	h.clock.set(time.Date(2024, time.March, 28, 8, 0, 0, 0, time.UTC))
-	h.mustReserve(ReserveInput{ID: "pending", TraceID: "t-pending", KeyID: key.ID,
-		RequestedModel: "m1", InputEstimate: 3, At: time.Date(2024, time.March, 28, 8, 0, 0, 0, time.UTC)})
+	h.mustAdmit(AdmitInput{ID: "pending", TraceID: "t-pending", KeyID: key.ID,
+		RequestedModel: "m1", At: time.Date(2024, time.March, 28, 8, 0, 0, 0, time.UTC)})
 	// A request with no execution at all keeps the January bucket honest.
 	h.clock.set(time.Date(2024, time.January, 20, 8, 0, 0, 0, time.UTC))
-	h.mustReserve(ReserveInput{ID: "noexec", TraceID: "t-noexec", KeyID: key.ID,
-		RequestedModel: "m1", InputEstimate: 1, At: time.Date(2024, time.January, 20, 8, 0, 0, 0, time.UTC)})
+	h.mustAdmit(AdmitInput{ID: "noexec", TraceID: "t-noexec", KeyID: key.ID,
+		RequestedModel: "m1", At: time.Date(2024, time.January, 20, 8, 0, 0, 0, time.UTC)})
 
 	from := time.Date(2024, time.January, 1, 0, 0, 0, 0, time.UTC)
 	to := time.Date(2024, time.April, 1, 0, 0, 0, 0, time.UTC)
@@ -215,12 +213,11 @@ func TestReportTrendBucketNamesAndFallback(t *testing.T) {
 	for i, at := range []time.Time{
 		time.Date(2024, time.February, 1, 0, 0, 0, 0, time.UTC),
 		time.Date(2024, time.February, 29, 12, 0, 0, 0, time.UTC),
-		time.Date(2024, time.March, 1, 0, 0, 0, 0, time.UTC),
-	} {
+		time.Date(2024, time.March, 1, 0, 0, 0, 0, time.UTC)} {
 		id := "r" + itoa(i)
 		h.clock.set(at)
-		req := h.mustReserve(ReserveInput{ID: id, TraceID: "t-" + id, KeyID: key.ID,
-			RequestedModel: "m1", InputEstimate: 1, At: at})
+		req := h.mustAdmit(AdmitInput{ID: id, TraceID: "t-" + id, KeyID: key.ID,
+			RequestedModel: "m1", At: at})
 		h.mustUsage(usageFor("u-"+id, req, "m1", tokens(1, 0, 0, 0, 0)))
 		h.mustComplete(Completion{ID: req.ID, TraceID: req.TraceID, Outcome: OutcomeSucceeded, At: at})
 	}

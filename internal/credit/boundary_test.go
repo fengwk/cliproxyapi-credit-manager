@@ -22,8 +22,7 @@ func TestExpiryRejectsUnrepresentableInstants(t *testing.T) {
 	accepted := []time.Time{
 		time.Date(2026, time.June, 15, 12, 0, 0, 0, time.UTC),
 		time.Date(1678, time.January, 2, 0, 0, 0, 0, time.UTC),
-		time.Date(2262, time.April, 11, 23, 47, 16, 854775807, time.UTC),
-	}
+		time.Date(2262, time.April, 11, 23, 47, 16, 854775807, time.UTC)}
 	for _, want := range accepted {
 		key, _, err := h.store.CreateKey(h.ctx(), KeySpec{Enabled: true, ExpiresAt: &want})
 		if err != nil {
@@ -104,8 +103,7 @@ func TestOpenRejectsWhitespaceDataDir(t *testing.T) {
 		"   ",
 		"\t",
 		filepath.Join(base, "data "),
-		" " + filepath.Join(base, "data"),
-	}
+		" " + filepath.Join(base, "data")}
 	for _, dir := range padded {
 		s, err := Open(Options{DataDir: dir})
 		if s != nil {
@@ -142,7 +140,7 @@ func TestReportRejectsOffsetOverflow(t *testing.T) {
 	h := newHarness(t)
 	h.mustPrice("m1", Rates{Input: million, Output: million})
 	key, _ := h.mustKey(KeySpec{Enabled: true})
-	h.mustReserve(ReserveInput{ID: "r1", TraceID: "t1", KeyID: key.ID, RequestedModel: "m1"})
+	h.mustAdmit(AdmitInput{ID: "r1", TraceID: "t1", KeyID: key.ID, RequestedModel: "m1"})
 	from, to := testEpoch.Add(-time.Hour), testEpoch.Add(time.Hour)
 
 	// (MaxInt64-1)*500 overflows int64; with at least one stored request the
@@ -168,8 +166,7 @@ func TestReportRejectsUnrepresentableRange(t *testing.T) {
 	h := newHarness(t)
 	for _, f := range []Filter{
 		{From: testEpoch, To: time.Date(2500, 1, 1, 0, 0, 0, 0, time.UTC)},
-		{From: time.Date(1500, 1, 1, 0, 0, 0, 0, time.UTC), To: testEpoch},
-	} {
+		{From: time.Date(1500, 1, 1, 0, 0, 0, 0, time.UTC), To: testEpoch}} {
 		if report, err := h.store.Report(h.ctx(), f); !errors.Is(err, ErrInvalid) {
 			t.Errorf("range %s..%s: report=%+v err=%v, want ErrInvalid", f.From, f.To, report, err)
 		}
@@ -177,10 +174,9 @@ func TestReportRejectsUnrepresentableRange(t *testing.T) {
 
 	h.mustPrice("m1", Rates{Input: million})
 	key, _ := h.mustKey(KeySpec{Enabled: true})
-	h.mustReserve(ReserveInput{ID: "range", TraceID: "range", KeyID: key.ID, RequestedModel: "m1"})
+	h.mustAdmit(AdmitInput{ID: "range", TraceID: "range", KeyID: key.ID, RequestedModel: "m1"})
 	report, err := h.store.Report(h.ctx(), Filter{
-		From: time.Unix(0, math.MinInt64), To: time.Unix(0, math.MaxInt64),
-	})
+		From: time.Unix(0, math.MinInt64), To: time.Unix(0, math.MaxInt64)})
 	if err != nil || report.Total != 1 {
 		t.Fatalf("representable range total=%d err=%v", report.Total, err)
 	}

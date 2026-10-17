@@ -21,15 +21,13 @@ const testModel = "m1"
 // touches, so the reset tests can build usage deterministically.
 func chargeKey(h *harness, key Key, model, suffix string, amount int64, at time.Time) {
 	h.t.Helper()
-	req := h.mustReserve(ReserveInput{
+	req := h.mustAdmit(AdmitInput{
 		ID: "req-" + suffix, TraceID: "trace-" + suffix, KeyID: key.ID,
-		RequestedModel: model, InputEstimate: amount, At: at,
-	})
+		RequestedModel: model, At: at})
 	h.mustUsage(Usage{
 		ID: "u-" + suffix, TraceID: req.TraceID, KeyID: key.ID, Model: model,
 		Raw:    pluginapi.UsageDetail{InputTokens: amount, TotalTokens: amount},
-		Tokens: tokens(amount, 0, 0, 0, 0), Quality: QualityComplete, At: at,
-	})
+		Tokens: tokens(amount, 0, 0, 0, 0), Quality: QualityComplete, At: at})
 	h.mustComplete(Completion{ID: req.ID, TraceID: req.TraceID, Outcome: OutcomeSucceeded, At: at})
 }
 
@@ -186,8 +184,8 @@ func TestSoftDeleteRejectsAndSettles(t *testing.T) {
 	key, material := h.mustKey(KeySpec{Enabled: true})
 	// An unresolved execution admitted before deletion must still be able to
 	// settle afterwards.
-	req := h.mustReserve(ReserveInput{ID: "req-inflight", TraceID: "trace-inflight",
-		KeyID: key.ID, RequestedModel: testModel, InputEstimate: 100})
+	req := h.mustAdmit(AdmitInput{ID: "req-inflight", TraceID: "trace-inflight",
+		KeyID: key.ID, RequestedModel: testModel})
 
 	if err := h.store.DeleteKey(h.ctx(), key.ID, "compromised"); err != nil {
 		t.Fatal(err)
@@ -211,8 +209,8 @@ func TestSoftDeleteRejectsAndSettles(t *testing.T) {
 	if _, _, err := h.store.RotateKey(h.ctx(), key.ID, ""); !errors.Is(err, ErrConflict) {
 		t.Fatalf("rotate err = %v, want conflict", err)
 	}
-	if _, err := h.store.Reserve(h.ctx(), ReserveInput{ID: "req-new", TraceID: "trace-new",
-		KeyID: key.ID, RequestedModel: testModel, InputEstimate: 10}); !errors.Is(err, ErrUnauthorized) {
+	if _, err := h.store.Admit(h.ctx(), AdmitInput{ID: "req-new", TraceID: "trace-new",
+		KeyID: key.ID, RequestedModel: testModel}); !errors.Is(err, ErrUnauthorized) {
 		t.Fatalf("admission on deleted key err = %v, want unauthorized", err)
 	}
 	if _, err := h.store.RevealKey(h.ctx(), key.ID); !errors.Is(err, ErrConflict) {
@@ -223,14 +221,13 @@ func TestSoftDeleteRejectsAndSettles(t *testing.T) {
 	if err != nil || byScope.DeletedAt == nil {
 		t.Fatalf("scope lookup of deleted key = %+v %v", byScope, err)
 	}
-	// Settle the in flight request after deletion: the charge counts and the
-	// hold is released.
+	// Settle the in flight request after deletion: the actual charge counts.
 	h.mustUsage(Usage{ID: "u-inflight", TraceID: req.TraceID, KeyID: key.ID, Model: testModel,
 		Raw:    pluginapi.UsageDetail{InputTokens: 100, TotalTokens: 100},
 		Tokens: tokens(100, 0, 0, 0, 0), Quality: QualityComplete})
 	h.mustComplete(Completion{ID: req.ID, TraceID: req.TraceID, Outcome: OutcomeSucceeded})
 	settled := h.key(key.ID)
-	if settled.SpentMicroUSD != 100 || settled.HeldMicroUSD != 0 {
+	if settled.SpentMicroUSD != 100 {
 		t.Fatalf("deleted key ledger not settled: %+v", settled)
 	}
 	keys, err := h.store.ListKeys(h.ctx())
@@ -259,8 +256,8 @@ func TestResetBaselinePeriodRolloverLateUsageCleanup(t *testing.T) {
 		t.Fatalf("after reset = %+v", effective)
 	}
 	// A late charge for work admitted on day1 arrives after day1 rolled over.
-	late := h.mustReserve(ReserveInput{ID: "req-late", TraceID: "trace-late",
-		KeyID: key.ID, RequestedModel: testModel, InputEstimate: 50, At: day1})
+	late := h.mustAdmit(AdmitInput{ID: "req-late", TraceID: "trace-late",
+		KeyID: key.ID, RequestedModel: testModel, At: day1})
 	h.clock.advance(24 * time.Hour)
 	h.mustUsage(Usage{ID: "u-late", TraceID: late.TraceID, KeyID: key.ID, Model: testModel,
 		Raw:    pluginapi.UsageDetail{InputTokens: 50, TotalTokens: 50},
@@ -325,30 +322,35 @@ func TestResetBaselinePeriodRolloverLateUsageCleanup(t *testing.T) {
 	}
 }
 
-// A reset reopens quota headroom but never forgives the holds of unresolved
-// requests, so two concurrent admissions cannot jointly exceed the limit.
-func TestResetBaselineReopensQuotaButKeepsHolds(t *testing.T) {
+// A reset reopens quota headroom on actual usage without erasing the durable
+// counters, so the following admissions gate on real usage again.
+func TestResetBaselineReopensQuotaOnActualUsage(t *testing.T) {
 	h := newHarness(t)
 	h.mustPrice(testModel, Rates{Input: 1_000_000})
 	key, _ := h.mustKey(KeySpec{Enabled: true, QuotaMicroUSD: 100})
 	at := h.clock.now()
 	chargeKey(h, key, testModel, "a", 100, at)
-	if _, err := h.store.Reserve(h.ctx(), ReserveInput{ID: "blocked", TraceID: "blocked",
-		KeyID: key.ID, RequestedModel: testModel, InputEstimate: 100, At: at}); !errors.Is(err, ErrQuota) {
+	if _, err := h.store.Admit(h.ctx(), AdmitInput{ID: "blocked", TraceID: "blocked",
+		KeyID: key.ID, RequestedModel: testModel, At: at}); !errors.Is(err, ErrQuota) {
 		t.Fatalf("quota not enforced: %v", err)
 	}
 	if _, err := h.store.ResetSpend(h.ctx(), ResetSpec{KeyID: key.ID, Total: true, Reason: "reset"}); err != nil {
 		t.Fatal(err)
 	}
-	// Effective usage is now zero, so one hold fits.
-	if _, err := h.store.Reserve(h.ctx(), ReserveInput{ID: "first", TraceID: "first",
-		KeyID: key.ID, RequestedModel: testModel, InputEstimate: 100, At: at}); err != nil {
+	// Effective usage is now zero, so the next admission is admitted.
+	if _, err := h.store.Admit(h.ctx(), AdmitInput{ID: "first", TraceID: "first",
+		KeyID: key.ID, RequestedModel: testModel, At: at}); err != nil {
 		t.Fatalf("reset did not reopen quota: %v", err)
 	}
-	// The hold from the first admission still occupies the budget.
-	if _, err := h.store.Reserve(h.ctx(), ReserveInput{ID: "second", TraceID: "second",
-		KeyID: key.ID, RequestedModel: testModel, InputEstimate: 100, At: at}); !errors.Is(err, ErrQuota) {
-		t.Fatalf("hold not counted after reset: %v", err)
+	// Charging the reopened window back to the limit denies the next one.
+	chargeKey(h, key, testModel, "b", 100, at)
+	if _, err := h.store.Admit(h.ctx(), AdmitInput{ID: "second", TraceID: "second",
+		KeyID: key.ID, RequestedModel: testModel, At: at}); !errors.Is(err, ErrQuota) {
+		t.Fatalf("re-accumulated usage not enforced after reset: %v", err)
+	}
+	// The durable lifetime total still reflects every real charge.
+	if got := h.key(key.ID).SpentMicroUSD; got != 200 {
+		t.Fatalf("lifetime spend = %d, want the durable 200", got)
 	}
 }
 
@@ -360,15 +362,15 @@ func TestResetTokenBudget(t *testing.T) {
 		ModelTokenLimits: []ModelTokenLimit{{Model: testModel, Total: 100}}})
 	at := h.clock.now()
 	chargeKey(h, key, testModel, "a", 100, at)
-	if _, err := h.store.Reserve(h.ctx(), ReserveInput{ID: "blocked", TraceID: "blocked",
-		KeyID: key.ID, RequestedModel: testModel, InputEstimate: 100, At: at}); !errors.Is(err, ErrQuota) {
+	if _, err := h.store.Admit(h.ctx(), AdmitInput{ID: "blocked", TraceID: "blocked",
+		KeyID: key.ID, RequestedModel: testModel, At: at}); !errors.Is(err, ErrQuota) {
 		t.Fatalf("token limit not enforced: %v", err)
 	}
 	if _, err := h.store.ResetSpend(h.ctx(), ResetSpec{KeyID: key.ID, Total: true, Reason: "reset"}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := h.store.Reserve(h.ctx(), ReserveInput{ID: "allowed", TraceID: "allowed",
-		KeyID: key.ID, RequestedModel: testModel, InputEstimate: 100, At: at}); err != nil {
+	if _, err := h.store.Admit(h.ctx(), AdmitInput{ID: "allowed", TraceID: "allowed",
+		KeyID: key.ID, RequestedModel: testModel, At: at}); err != nil {
 		t.Fatalf("token reset did not reopen budget: %v", err)
 	}
 }

@@ -495,7 +495,8 @@ func (s *Store) reportItems(ctx context.Context, q querier, where string, args [
 }
 
 // Resolve closes an unresolved request by administrator decision. Known usage
-// is still charged; the action only decides the remaining hold.
+// is still charged; the action only decides whether the unresolved accounting is
+// released or charged a manual amount.
 func (s *Store) Resolve(ctx context.Context, id string, resolution Resolution) error {
 	if strings.TrimSpace(id) == "" {
 		return fmt.Errorf("%w: request id is required", ErrInvalid)

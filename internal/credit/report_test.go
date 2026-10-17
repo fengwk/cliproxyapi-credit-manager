@@ -22,8 +22,7 @@ func buildDataset(t *testing.T, h *harness) dataset {
 	keys := map[string]Key{"a": a, "b": b}
 
 	settle := func(id, trace string, key Key, model, provider, auth string, tk Tokens) {
-		req := h.mustReserve(ReserveInput{ID: id, TraceID: trace, KeyID: key.ID, RequestedModel: model,
-			InputEstimate: tk.Input, OutputEstimate: tk.Output})
+		req := h.mustAdmit(AdmitInput{ID: id, TraceID: trace, KeyID: key.ID, RequestedModel: model})
 		u := usageFor("u-"+id, req, model, tk)
 		u.Provider = provider
 		u.AuthID = auth
@@ -35,11 +34,11 @@ func buildDataset(t *testing.T, h *harness) dataset {
 	settle("r2", "t2", a, "m2", "openai", "auth-1", tokens(50, 10, 0, 20, 0))
 
 	// A proven rejection settles with no execution.
-	rejected := h.mustReserve(ReserveInput{ID: "r3", TraceID: "t3", KeyID: a.ID, RequestedModel: "m1"})
+	rejected := h.mustAdmit(AdmitInput{ID: "r3", TraceID: "t3", KeyID: a.ID, RequestedModel: "m1"})
 	h.mustComplete(Completion{ID: rejected.ID, TraceID: rejected.TraceID, Outcome: OutcomeRejected, StatusCode: 403})
 
 	// A completed execution without trustworthy usage stays pending.
-	pending := h.mustReserve(ReserveInput{ID: "r4", TraceID: "t4", KeyID: a.ID, RequestedModel: "m1"})
+	pending := h.mustAdmit(AdmitInput{ID: "r4", TraceID: "t4", KeyID: a.ID, RequestedModel: "m1"})
 	h.mustComplete(Completion{ID: pending.ID, TraceID: pending.TraceID, Outcome: OutcomeSucceeded})
 
 	h.clock.set(testEpoch.AddDate(0, 0, 2))
@@ -113,8 +112,7 @@ func TestReportSummaryFiltersAndItems(t *testing.T) {
 		{"by canceled", Filter{Result: OutcomeCanceled}, 0, ""},
 		{"by succeeded", Filter{Result: OutcomeSucceeded}, 3, ""},
 		{"by search", Filter{Search: "r5"}, 1, "r5"},
-		{"by label search", Filter{Search: "beta"}, 1, "r5"},
-	}
+		{"by label search", Filter{Search: "beta"}, 1, "r5"}}
 	for _, tc := range cases {
 		tc.filter.From, tc.filter.To = from, to
 		rep, err := h.store.Report(h.ctx(), tc.filter)
@@ -210,8 +208,7 @@ func TestReportTrendBuckets(t *testing.T) {
 	key, _ := h.mustKey(KeySpec{Enabled: true})
 	record := func(id string, at time.Time) {
 		h.clock.set(at)
-		req := h.mustReserve(ReserveInput{ID: id, TraceID: "t-" + id, KeyID: key.ID, RequestedModel: "m1",
-			InputEstimate: 10})
+		req := h.mustAdmit(AdmitInput{ID: id, TraceID: "t-" + id, KeyID: key.ID, RequestedModel: "m1"})
 		h.mustUsage(usageFor("u-"+id, req, "m1", tokens(10, 0, 0, 0, 0)))
 		h.mustComplete(Completion{ID: req.ID, TraceID: req.TraceID, Outcome: OutcomeSucceeded})
 	}
@@ -288,8 +285,8 @@ func TestReportSnapshotIsConsistentUnderConcurrentWrites(t *testing.T) {
 		defer wg.Done()
 		for i := 0; i < writes; i++ {
 			id := "w-" + itoa(i)
-			req, err := h.store.Reserve(ctx, ReserveInput{ID: id, TraceID: "t-" + id, KeyID: key.ID,
-				RequestedModel: "m1", InputEstimate: 1})
+			req, err := h.store.Admit(ctx, AdmitInput{ID: id, TraceID: "t-" + id, KeyID: key.ID,
+				RequestedModel: "m1"})
 			if err != nil {
 				return
 			}
@@ -371,14 +368,14 @@ func TestReportSeparatesCostFromAdjustments(t *testing.T) {
 	to := testEpoch.AddDate(0, 0, 4)
 
 	// A measured execution: 100 microUSD of real, usage derived cost.
-	measured := h.mustReserve(ReserveInput{ID: "r1", TraceID: "t1", KeyID: key.ID,
-		RequestedModel: "m1", InputEstimate: 100})
+	measured := h.mustAdmit(AdmitInput{ID: "r1", TraceID: "t1", KeyID: key.ID,
+		RequestedModel: "m1"})
 	h.mustUsage(usageFor("u1", measured, "m1", tokens(100, 0, 0, 0, 0)))
 	h.mustComplete(Completion{ID: measured.ID, TraceID: measured.TraceID, Outcome: OutcomeSucceeded})
 
 	// A request with no trustworthy usage, closed by an administrator.
-	manual := h.mustReserve(ReserveInput{ID: "r2", TraceID: "t2", KeyID: key.ID,
-		RequestedModel: "m1", InputEstimate: 500})
+	manual := h.mustAdmit(AdmitInput{ID: "r2", TraceID: "t2", KeyID: key.ID,
+		RequestedModel: "m1"})
 	h.mustComplete(Completion{ID: manual.ID, TraceID: manual.TraceID, Outcome: OutcomeFailed, StatusCode: 502})
 
 	// The adjustment is booked two days after the request itself, so its
@@ -389,17 +386,14 @@ func TestReportSeparatesCostFromAdjustments(t *testing.T) {
 		t.Fatalf("resolve charge: %v", err)
 	}
 	// A third request keeps the later day non-empty in the trend.
-	later := h.mustReserve(ReserveInput{ID: "r3", TraceID: "t3", KeyID: key.ID,
-		RequestedModel: "m1", InputEstimate: 10})
+	later := h.mustAdmit(AdmitInput{ID: "r3", TraceID: "t3", KeyID: key.ID,
+		RequestedModel: "m1"})
 	h.mustUsage(usageFor("u3", later, "m1", tokens(10, 0, 0, 0, 0)))
 	h.mustComplete(Completion{ID: later.ID, TraceID: later.TraceID, Outcome: OutcomeSucceeded})
 
 	ledger := h.key(key.ID)
 	if ledger.SpentMicroUSD != 100+777+10 {
 		t.Fatalf("ledger spent = %d, want 887", ledger.SpentMicroUSD)
-	}
-	if ledger.HeldMicroUSD != 0 {
-		t.Fatalf("ledger held = %d, want 0", ledger.HeldMicroUSD)
 	}
 
 	rep, err := h.store.Report(ctx, Filter{From: from, To: to, Bucket: "day"})
@@ -501,13 +495,13 @@ func TestCacheReadRatioUsesOnlyCompleteExecutions(t *testing.T) {
 	from := testEpoch.AddDate(0, 0, -1)
 	to := testEpoch.AddDate(0, 0, 2)
 
-	trusted := h.mustReserve(ReserveInput{ID: "r1", TraceID: "t1", KeyID: key.ID,
-		RequestedModel: "m1", InputEstimate: 100})
+	trusted := h.mustAdmit(AdmitInput{ID: "r1", TraceID: "t1", KeyID: key.ID,
+		RequestedModel: "m1"})
 	h.mustUsage(usageFor("u1", trusted, "m1", tokens(100, 100, 0, 0, 0))) // quality complete
 	h.mustComplete(Completion{ID: trusted.ID, TraceID: trusted.TraceID, Outcome: OutcomeSucceeded})
 
-	sloppy := h.mustReserve(ReserveInput{ID: "r2", TraceID: "t2", KeyID: key.ID,
-		RequestedModel: "m1", InputEstimate: 100})
+	sloppy := h.mustAdmit(AdmitInput{ID: "r2", TraceID: "t2", KeyID: key.ID,
+		RequestedModel: "m1"})
 	partial := usageFor("u2", sloppy, "m1", tokens(100, 900, 0, 0, 0))
 	partial.Quality = QualityPartial
 	h.mustUsage(partial)
@@ -540,8 +534,8 @@ func TestCacheReadRatioUsesOnlyCompleteExecutions(t *testing.T) {
 	// An execution set without a single complete execution reports no ratio at
 	// all instead of dividing partial counters by themselves.
 	other, _ := h.mustKey(KeySpec{Enabled: true})
-	untrusted := h.mustReserve(ReserveInput{ID: "r3", TraceID: "t3", KeyID: other.ID,
-		RequestedModel: "m1", InputEstimate: 100})
+	untrusted := h.mustAdmit(AdmitInput{ID: "r3", TraceID: "t3", KeyID: other.ID,
+		RequestedModel: "m1"})
 	unknown := usageFor("u3", untrusted, "m1", tokens(100, 900, 0, 0, 0))
 	unknown.Quality = QualityPartial
 	h.mustUsage(unknown)
@@ -571,8 +565,8 @@ func TestReportRejectsAggregateOverflow(t *testing.T) {
 	for i := 0; i < 2; i++ {
 		key, _ := h.mustKey(KeySpec{Label: "big-" + itoa(i), Enabled: true})
 		keys = append(keys, key)
-		req := h.mustReserve(ReserveInput{ID: "r" + itoa(i), TraceID: "t" + itoa(i), KeyID: key.ID,
-			RequestedModel: "big", InputEstimate: tokensNearMax})
+		req := h.mustAdmit(AdmitInput{ID: "r" + itoa(i), TraceID: "t" + itoa(i), KeyID: key.ID,
+			RequestedModel: "big"})
 		h.mustUsage(usageFor("u"+itoa(i), req, "big", tokens(tokensNearMax, 0, 0, 0, 0)))
 		h.mustComplete(Completion{ID: req.ID, TraceID: req.TraceID, Outcome: OutcomeSucceeded})
 	}

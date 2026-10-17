@@ -58,8 +58,8 @@ type CallerSpec struct {
 // A reset never deletes history and never zeroes a durable counter. It stores a
 // baseline snapshot per window/period (money) and per model (tokens) so the
 // effective usage an operator sees and admission enforces becomes
-// max(0, durable - baseline). Holds and unresolved requests are untouched, so
-// late charges still count and unknown obligations are never forgiven.
+// max(0, durable - baseline). Unresolved requests are untouched, so late charges
+// still count and unknown obligations are never forgiven.
 type ResetSpec struct {
 	KeyID   string   `json:"id,omitempty"`
 	IDs     []string `json:"ids,omitempty"`
@@ -251,9 +251,9 @@ func (s *Store) DeleteKey(ctx context.Context, id, reason string) error {
 }
 
 // ResetSpend snapshots reset baselines for the selected keys and windows. It
-// touches neither history nor holds: lifetime and period counters keep their
-// durable value and only the effective usage is reduced, so a later charge
-// counts again and repeated resets can never go negative or refund.
+// touches neither history nor unresolved requests: lifetime and period counters
+// keep their durable value and only the effective usage is reduced, so a later
+// charge counts again and repeated resets can never go negative or refund.
 func (s *Store) ResetSpend(ctx context.Context, spec ResetSpec) (ResetResult, error) {
 	reason := strings.TrimSpace(spec.Reason)
 	if reason == "" {

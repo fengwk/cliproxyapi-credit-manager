@@ -61,6 +61,43 @@ func migratePricingFeatures(ctx context.Context, tx *sql.Tx) error {
 	return nil
 }
 
+// migratePostpaidSchema removes the estimated admission columns of a legacy
+// store. A fresh store never creates them, and an already migrated store no
+// longer has them, so this is a no-op there.
+//
+// The dropped columns are only ever estimates and pre-authorization holds:
+// no actual charge, token counter, price, snapshot, request, usage,
+// adjustment or reset baseline lives in them. Preserving them is therefore
+// unnecessary and reopening the migrated store can never invent a charge.
+// Every DROP is guarded by a column probe because SQLite has no
+// DROP COLUMN IF EXISTS and because an interrupted migration is retried
+// wholesale on the next open.
+func migratePostpaidSchema(ctx context.Context, tx *sql.Tx) error {
+	drops := []struct {
+		table  string
+		column string
+	}{
+		{"keys", "held_micro_usd"},
+		{"requests", "held_micro_usd"},
+		{"requests", "token_estimate"},
+		{"requests", "initial_hold_micro_usd"},
+	}
+	for _, drop := range drops {
+		exists, err := columnExists(ctx, tx, drop.table, drop.column)
+		if err != nil {
+			return err
+		}
+		if !exists {
+			continue
+		}
+		if _, err := tx.ExecContext(ctx,
+			fmt.Sprintf("ALTER TABLE %s DROP COLUMN %s", drop.table, drop.column)); err != nil {
+			return fmt.Errorf("drop %s.%s: %w", drop.table, drop.column, err)
+		}
+	}
+	return nil
+}
+
 // columnExists reports whether a table already carries a column. SQLite has no
 // ADD COLUMN IF NOT EXISTS, so the additive migration must inspect the table
 // first.

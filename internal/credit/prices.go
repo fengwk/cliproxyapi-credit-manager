@@ -23,7 +23,7 @@ const (
 	// priceTierService selects a tier by the request's service tier.
 	priceTierService = "service"
 
-	// maxImageCount caps the requested image count that is held and billed.
+	// maxImageCount caps the requested image count that is frozen and billed.
 	maxImageCount = 32
 	// maxPriceTiers bounds the tier list of one price.
 	maxPriceTiers = 16
@@ -47,7 +47,7 @@ func (p Price) IsPerImage() bool { return resolveBillingMode(p.BillingMode) == b
 // different number, so an unsupported request can never be under- or
 // over-charged. Token prices never call this, so an irrelevant image hint on a
 // token request is not rejected.
-func imageCountFor(in ReserveInput) (int64, error) {
+func imageCountFor(in AdmitInput) (int64, error) {
 	if !in.ImageCountDeclared {
 		return 1, nil
 	}
@@ -236,13 +236,10 @@ func ratesCost(rates Rates, tokens Tokens) (int64, error) {
 	return total.Int64(), nil
 }
 
-// tokenCost prices canonical tokens with an optional tier list.
-//
-// A matching service tier always applies. Context tiers are only consulted when
-// useContext is true, because a reservation estimate is far too coarse to pick
-// a context tier and must not silently over- or under-charge one.
-func tokenCost(price Price, tiers []PriceTier, tokens Tokens, serviceTier string, useContext bool) (int64, error) {
-	rates, err := effectiveRates(price.Rates, tiers, tokens, serviceTier, useContext)
+// tokenCost prices canonical tokens with an optional tier list. A matching
+// service tier wins; otherwise the highest matching context tier applies.
+func tokenCost(price Price, tiers []PriceTier, tokens Tokens, serviceTier string) (int64, error) {
+	rates, err := effectiveRates(price.Rates, tiers, tokens, serviceTier)
 	if err != nil {
 		return 0, err
 	}
@@ -252,18 +249,16 @@ func tokenCost(price Price, tiers []PriceTier, tokens Tokens, serviceTier string
 // effectiveRates selects the rate card for a request. A matching service tier
 // wins over every context tier; otherwise the highest matching context
 // threshold is used; otherwise the base rates.
-func effectiveRates(base Rates, tiers []PriceTier, tokens Tokens, serviceTier string, useContext bool) (Rates, error) {
+func effectiveRates(base Rates, tiers []PriceTier, tokens Tokens, serviceTier string) (Rates, error) {
 	if rates, ok := serviceTierRates(base, tiers, serviceTier); ok {
 		return rates, nil
 	}
-	if useContext {
-		contextTokens, err := contextTokenTotal(tokens)
-		if err != nil {
-			return Rates{}, err
-		}
-		if rates, ok := contextTierRates(base, tiers, contextTokens); ok {
-			return rates, nil
-		}
+	contextTokens, err := contextTokenTotal(tokens)
+	if err != nil {
+		return Rates{}, err
+	}
+	if rates, ok := contextTierRates(base, tiers, contextTokens); ok {
+		return rates, nil
 	}
 	return base, nil
 }
@@ -358,7 +353,7 @@ func perImageCost(price Price, imageCount int64) (int64, error) {
 // request price and its frozen tiers. Per-image prices are priced from the
 // frozen image count elsewhere, so this helper always bills token buckets.
 func requestCost(price Price, tiers []PriceTier, tokens Tokens, serviceTier string) (int64, error) {
-	return tokenCost(price, tiers, tokens, serviceTier, true)
+	return tokenCost(price, tiers, tokens, serviceTier)
 }
 
 func normalizePrice(p Price) (Price, error) {

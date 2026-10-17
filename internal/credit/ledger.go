@@ -46,23 +46,18 @@ func decodePriceSnapshot(raw string) (*priceSnapshot, error) {
 }
 
 type reqRow struct {
-	id            string
-	traceID       string
-	keyID         string
-	model         string
-	state         string
-	outcome       string
-	statusCode    int
-	startedAt     time.Time
-	completedAt   *time.Time
-	held          int64
-	price         Price
-	tokenEstimate int64
-	charge        int64
-	resolved      string
-	// initialHold is the pre-authorization hold taken at admission. It is kept
-	// after settlement so a late unaccounted execution can restore it.
-	initialHold int64
+	id          string
+	traceID     string
+	keyID       string
+	model       string
+	state       string
+	outcome     string
+	statusCode  int
+	startedAt   time.Time
+	completedAt *time.Time
+	price       Price
+	charge      int64
+	resolved    string
 	// snapshot is the frozen pricing decision, nil for a legacy request whose
 	// price is rebuilt from the stored rate columns.
 	snapshot *priceSnapshot
@@ -109,7 +104,6 @@ func (r *reqRow) toRequest(executions []Usage, adjustment int64) Request {
 		State:              r.state,
 		StartedAt:          r.startedAt,
 		CompletedAt:        r.completedAt,
-		HeldMicroUSD:       r.held,
 		AdjustmentMicroUSD: adjustment,
 		Price:              r.price,
 		Executions:         executions,
@@ -124,9 +118,8 @@ func (r *reqRow) toRequest(executions []Usage, adjustment int64) Request {
 }
 
 const requestColumns = `id, trace_id, key_id, model, state, outcome, status_code, started_at,
-	completed_at, held_micro_usd, price_input, price_output, price_reasoning, price_cache_read,
-	price_cache_write, price_version, token_estimate, charge_micro_usd, resolved,
-	initial_hold_micro_usd, price_snapshot`
+	completed_at, price_input, price_output, price_reasoning, price_cache_read,
+	price_cache_write, price_version, charge_micro_usd, resolved, price_snapshot`
 
 func scanRequest(scan func(...any) error) (*reqRow, error) {
 	var (
@@ -140,8 +133,8 @@ func scanRequest(scan func(...any) error) (*reqRow, error) {
 		snapshotJSON sql.NullString
 	)
 	if err := scan(&r.id, &r.traceID, &r.keyID, &r.model, &r.state, &r.outcome, &r.statusCode,
-		&started, &completed, &r.held, &in, &out, &reasoning, &cr, &cw, &version,
-		&r.tokenEstimate, &r.charge, &r.resolved, &r.initialHold, &snapshotJSON); err != nil {
+		&started, &completed, &in, &out, &reasoning, &cr, &cw, &version,
+		&r.charge, &r.resolved, &snapshotJSON); err != nil {
 		return nil, err
 	}
 	r.startedAt = fromUnixNano(started)
@@ -179,28 +172,6 @@ func loadRequestByID(ctx context.Context, q querier, id string) (*reqRow, error)
 
 func loadRequestByTrace(ctx context.Context, q querier, traceID string) (*reqRow, error) {
 	return loadRequest(ctx, q, "trace_id = ?", traceID)
-}
-
-// periodBounds returns the half open UTC range of a counter window that
-// contains at. Every window uses the same concrete range in SQL so admission
-// and accrual always agree on which period a value belongs to.
-func periodBounds(win string, at time.Time) (time.Time, time.Time) {
-	u := at.UTC()
-	switch win {
-	case windowDay:
-		start := time.Date(u.Year(), u.Month(), u.Day(), 0, 0, 0, 0, time.UTC)
-		return start, start.AddDate(0, 0, 1)
-	case windowWeek:
-		day := time.Date(u.Year(), u.Month(), u.Day(), 0, 0, 0, 0, time.UTC)
-		offset := (int(day.Weekday()) + 6) % 7 // Monday starts an ISO week
-		start := day.AddDate(0, 0, -offset)
-		return start, start.AddDate(0, 0, 7)
-	case windowMonth:
-		start := time.Date(u.Year(), u.Month(), 1, 0, 0, 0, 0, time.UTC)
-		return start, start.AddDate(0, 1, 0)
-	default:
-		return time.Time{}, time.Time{}
-	}
 }
 
 // addMoney accrues an amount into the durable total/day/week/month counters of
@@ -323,17 +294,6 @@ func bumpRequestCharge(ctx context.Context, q querier, requestID string, delta i
 	return nil
 }
 
-// periodHold sums the still open holds of unresolved requests admitted inside
-// the window period. Holds never move between periods, so last month's pending
-// work cannot consume this month's budget, while the lifetime window keeps
-// counting every unresolved hold.
-func periodHold(ctx context.Context, q querier, keyID, win string, at time.Time) (int64, error) {
-	start, end := periodBounds(win, at)
-	return counterValue(ctx, q, `SELECT COALESCE(SUM(held_micro_usd),0) FROM requests
-		WHERE key_id = ? AND state IN (?,?) AND started_at >= ? AND started_at < ?`,
-		keyID, stateActive, statePending, unixNano(start), unixNano(end))
-}
-
 func counterValue(ctx context.Context, q querier, query string, args ...any) (int64, error) {
 	var v sql.NullInt64
 	err := q.QueryRowContext(ctx, query, args...).Scan(&v)
@@ -354,21 +314,6 @@ func moneyCounter(ctx context.Context, q querier, keyID, win, period string) (in
 func tokenCounter(ctx context.Context, q querier, keyID, model, win, period string) (int64, error) {
 	return counterValue(ctx, q, `SELECT tokens FROM key_token_counters WHERE key_id=? AND model=? AND win=? AND period=?`,
 		keyID, model, win, period)
-}
-
-// reservedTokens sums admission estimates of unresolved requests for one
-// window. Period windows only count requests admitted inside that period, so a
-// request opened last month does not consume this month's token budget; the
-// lifetime window still counts every unresolved request.
-func reservedTokens(ctx context.Context, q querier, keyID, model, win string, at time.Time) (int64, error) {
-	if win == windowTotal {
-		return counterValue(ctx, q, `SELECT COALESCE(SUM(token_estimate),0) FROM requests
-			WHERE key_id=? AND model=? AND state IN (?,?)`, keyID, model, stateActive, statePending)
-	}
-	start, end := periodBounds(win, at)
-	return counterValue(ctx, q, `SELECT COALESCE(SUM(token_estimate),0) FROM requests
-		WHERE key_id=? AND model=? AND state IN (?,?) AND started_at >= ? AND started_at < ?`,
-		keyID, model, stateActive, statePending, unixNano(start), unixNano(end))
 }
 
 type usageAgg struct {
@@ -425,27 +370,19 @@ func (s *Store) applyCharge(ctx context.Context, tx *sql.Tx, req *reqRow, usageI
 	return nil
 }
 
-// settleRequest closes an unresolved request and releases its remaining hold.
-// Known usage was already charged when it was recorded, so nothing is written
-// off twice and unknown accounting simply stays unknown.
+// settleRequest closes an unresolved request. Known usage was already charged
+// when it was recorded, so nothing is written off twice and unknown accounting
+// simply stays unknown. No money is released: admission never held any.
 func (s *Store) settleRequest(ctx context.Context, tx *sql.Tx, req *reqRow, at time.Time, resolved string) error {
 	if req.state == stateSettled {
 		return nil
-	}
-	if req.held != 0 {
-		// A negative result would mean the request released more than the key
-		// ever held, so bumpKeyColumn fails instead of corrupting the ledger.
-		if err := bumpKeyColumn(ctx, tx, req.keyID, "held_micro_usd", -req.held); err != nil {
-			return fmt.Errorf("release hold: %w", err)
-		}
-		req.held = 0
 	}
 	completed := req.completedAt
 	if completed == nil {
 		completed = &at
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE requests SET state = ?, resolved = ?, completed_at = ?,
-		held_micro_usd = 0 WHERE id = ?`,
+	if _, err := tx.ExecContext(ctx, `UPDATE requests SET state = ?, resolved = ?, completed_at = ?
+		WHERE id = ?`,
 		stateSettled, resolved, unixNano(*completed), req.id); err != nil {
 		return fmt.Errorf("close request: %w", err)
 	}
@@ -456,12 +393,12 @@ func (s *Store) settleRequest(ctx context.Context, tx *sql.Tx, req *reqRow, at t
 }
 
 // evaluateSettle closes a completed request only when its accounting is
-// trustworthy; otherwise the request stays pending with its hold intact.
+// trustworthy; otherwise the request stays pending.
 //
 // A rejection is the only outcome that may close without any execution event.
 // Anything else needs a trustworthy usage record, and a single unknown
-// execution keeps the request (and the remaining hold) open so leaked charges
-// cannot be written off silently.
+// execution keeps the request open so leaked charges cannot be written off
+// silently.
 func (s *Store) evaluateSettle(ctx context.Context, tx *sql.Tx, req *reqRow, at time.Time) error {
 	if req.state == stateSettled || req.outcome == "" {
 		return nil
@@ -493,23 +430,17 @@ func (s *Store) evaluateSettle(ctx context.Context, tx *sql.Tx, req *reqRow, at 
 	return s.settleRequest(ctx, tx, req, at, resolvedAuto)
 }
 
-// reopenRequest returns an automatically closed request to pending, restoring
-// the pre-authorization hold it originally took. It is used when a late
-// execution with untrustworthy accounting arrives: the outstanding work must be
-// visible again instead of being written off silently.
+// reopenRequest returns an automatically closed request to pending. It is used
+// when a late execution with untrustworthy accounting arrives: the outstanding
+// work must be visible again instead of being written off silently. It moves no
+// money, because admission never held any.
 func (s *Store) reopenRequest(ctx context.Context, tx *sql.Tx, req *reqRow) error {
-	if req.initialHold != 0 {
-		if err := bumpKeyColumn(ctx, tx, req.keyID, "held_micro_usd", req.initialHold); err != nil {
-			return fmt.Errorf("restore hold: %w", err)
-		}
-	}
-	if _, err := tx.ExecContext(ctx, `UPDATE requests SET state = ?, resolved = '', held_micro_usd = ?
-		WHERE id = ?`, statePending, req.initialHold, req.id); err != nil {
+	if _, err := tx.ExecContext(ctx, `UPDATE requests SET state = ?, resolved = '' WHERE id = ?`,
+		statePending, req.id); err != nil {
 		return fmt.Errorf("reopen request: %w", err)
 	}
 	req.state = statePending
 	req.resolved = ""
-	req.held = req.initialHold
 	return nil
 }
 
@@ -570,7 +501,7 @@ func effectiveToken(ctx context.Context, q querier, keyID, model, win, period st
 // hydrateEffectiveUsage fills the effective (post reset) usage view of a key
 // row: the lifetime total from the durable spent column plus the current day,
 // week and month money counters. It is used by the management read paths only;
-// admission reads the same values with the store clock at reservation time.
+// admission reads the same values with the store clock at admission time.
 func (s *Store) hydrateEffectiveUsage(ctx context.Context, q querier, k *keyRow) error {
 	now := s.nowUTC()
 	base, err := baselineMoney(ctx, q, k.id, windowTotal, periodOf(windowTotal, now))

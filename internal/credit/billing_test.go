@@ -25,11 +25,11 @@ func billingHarness(t *testing.T, opts ...func(*Options)) (*harness, Key) {
 	return h, key
 }
 
-func TestReserveAdmissionRules(t *testing.T) {
+func TestAdmitValidatesKeyAndInput(t *testing.T) {
 	h, key := billingHarness(t)
 	ctx := h.ctx()
 	// Unknown model has no price: absence denies, it never means free.
-	_, err := h.store.Reserve(ctx, ReserveInput{ID: "r1", TraceID: "t1", KeyID: key.ID, RequestedModel: "unknown"})
+	_, err := h.store.Admit(ctx, AdmitInput{ID: "r1", TraceID: "t1", KeyID: key.ID, RequestedModel: "unknown"})
 	if !errors.Is(err, ErrUnpriced) {
 		t.Fatalf("unpriced err = %v, want ErrUnpriced", err)
 	}
@@ -39,15 +39,15 @@ func TestReserveAdmissionRules(t *testing.T) {
 	if _, err := h.store.UpdateKey(ctx, key.ID, spec); err != nil {
 		t.Fatalf("update key: %v", err)
 	}
-	h.mustReserve(ReserveInput{ID: "r1", TraceID: "t1", KeyID: key.ID, RequestedModel: "m1"})
-	if _, err := h.store.Reserve(ctx, ReserveInput{ID: "r2", TraceID: "t2", KeyID: key.ID, RequestedModel: "m1"}); err != nil {
+	h.mustAdmit(AdmitInput{ID: "r1", TraceID: "t1", KeyID: key.ID, RequestedModel: "m1"})
+	if _, err := h.store.Admit(ctx, AdmitInput{ID: "r2", TraceID: "t2", KeyID: key.ID, RequestedModel: "m1"}); err != nil {
 		t.Fatalf("allowed model: %v", err)
 	}
 	spec.AllowedModels = []string{"m2"}
 	if _, err := h.store.UpdateKey(ctx, key.ID, spec); err != nil {
 		t.Fatalf("update key: %v", err)
 	}
-	_, err = h.store.Reserve(ctx, ReserveInput{ID: "r3", TraceID: "t3", KeyID: key.ID, RequestedModel: "m1"})
+	_, err = h.store.Admit(ctx, AdmitInput{ID: "r3", TraceID: "t3", KeyID: key.ID, RequestedModel: "m1"})
 	if !errors.Is(err, ErrDenied) {
 		t.Fatalf("disallowed model err = %v, want ErrDenied", err)
 	}
@@ -57,7 +57,7 @@ func TestReserveAdmissionRules(t *testing.T) {
 	if _, err := h.store.UpdateKey(ctx, key.ID, spec); err != nil {
 		t.Fatalf("update key: %v", err)
 	}
-	_, err = h.store.Reserve(ctx, ReserveInput{ID: "r4", TraceID: "t4", KeyID: key.ID, RequestedModel: "m1"})
+	_, err = h.store.Admit(ctx, AdmitInput{ID: "r4", TraceID: "t4", KeyID: key.ID, RequestedModel: "m1"})
 	if !errors.Is(err, ErrUnauthorized) {
 		t.Fatalf("disabled err = %v, want ErrUnauthorized", err)
 	}
@@ -67,89 +67,121 @@ func TestReserveAdmissionRules(t *testing.T) {
 	if _, err := h.store.UpdateKey(ctx, key.ID, spec); err != nil {
 		t.Fatalf("update key: %v", err)
 	}
-	_, err = h.store.Reserve(ctx, ReserveInput{ID: "r5", TraceID: "t5", KeyID: key.ID, RequestedModel: "m1"})
+	_, err = h.store.Admit(ctx, AdmitInput{ID: "r5", TraceID: "t5", KeyID: key.ID, RequestedModel: "m1"})
 	if !errors.Is(err, ErrUnauthorized) {
 		t.Fatalf("expired err = %v, want ErrUnauthorized", err)
 	}
 	// Invalid input is rejected before touching state.
-	if _, err := h.store.Reserve(ctx, ReserveInput{ID: "", TraceID: "t", KeyID: key.ID, RequestedModel: "m1"}); !errors.Is(err, ErrInvalid) {
+	if _, err := h.store.Admit(ctx, AdmitInput{ID: "", TraceID: "t", KeyID: key.ID, RequestedModel: "m1"}); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("empty id err = %v, want ErrInvalid", err)
 	}
-	if _, err := h.store.Reserve(ctx, ReserveInput{ID: "x", TraceID: "t", KeyID: key.ID, RequestedModel: "m1",
-		InputEstimate: -1}); !errors.Is(err, ErrInvalid) {
-		t.Fatalf("negative estimate err = %v, want ErrInvalid", err)
+	if _, err := h.store.Admit(ctx, AdmitInput{ID: "x", TraceID: "t", KeyID: key.ID}); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("missing model err = %v, want ErrInvalid", err)
 	}
 }
 
-func TestReserveIdempotentAndConflicting(t *testing.T) {
+func TestAdmitIdempotentAndConflicting(t *testing.T) {
 	h, key := billingHarness(t)
-	in := ReserveInput{ID: "req-1", TraceID: "trace-1", KeyID: key.ID, RequestedModel: "m1",
-		InputEstimate: 10, OutputEstimate: 10}
-	first := h.mustReserve(in)
-	second := h.mustReserve(in)
-	if first.ID != second.ID || first.HeldMicroUSD != second.HeldMicroUSD {
-		t.Fatalf("idempotent reserve mismatch: %+v vs %+v", first, second)
+	in := AdmitInput{ID: "req-1", TraceID: "trace-1", KeyID: key.ID, RequestedModel: "m1"}
+	first := h.mustAdmit(in)
+	second := h.mustAdmit(in)
+	if first.ID != second.ID || first.TraceID != second.TraceID {
+		t.Fatalf("idempotent admission mismatch: %+v vs %+v", first, second)
 	}
-	// The hold must not be double counted.
-	if got := h.key(key.ID).HeldMicroUSD; got != first.HeldMicroUSD {
-		t.Fatalf("held = %d, want %d", got, first.HeldMicroUSD)
+	// A repeated admission is the same request and moves no money.
+	if got := h.key(key.ID); got.SpentMicroUSD != 0 || got.QuotaUsedMicroUSD != 0 {
+		t.Fatalf("repeated admission changed the ledger: %+v", got)
 	}
 	conflict := in
 	conflict.TraceID = "other-trace"
-	if _, err := h.store.Reserve(h.ctx(), conflict); !errors.Is(err, ErrConflict) {
+	if _, err := h.store.Admit(h.ctx(), conflict); !errors.Is(err, ErrConflict) {
 		t.Fatalf("conflicting id err = %v, want ErrConflict", err)
 	}
 	conflict = in
 	conflict.RequestedModel = "m2"
-	if _, err := h.store.Reserve(h.ctx(), conflict); !errors.Is(err, ErrConflict) {
+	if _, err := h.store.Admit(h.ctx(), conflict); !errors.Is(err, ErrConflict) {
 		t.Fatalf("conflicting model err = %v, want ErrConflict", err)
 	}
 	// A trace may not be reused by another lifecycle id.
 	other := in
 	other.ID = "req-2"
-	if _, err := h.store.Reserve(h.ctx(), other); !errors.Is(err, ErrConflict) {
+	if _, err := h.store.Admit(h.ctx(), other); !errors.Is(err, ErrConflict) {
 		t.Fatalf("reused trace err = %v, want ErrConflict", err)
 	}
 }
 
-func TestReserveQuotaConcurrencyBacklog(t *testing.T) {
-	h := newHarness(t, func(o *Options) { o.MaxPendingRequests = 2 })
+func TestAdmitQuotaGatesOnEffectiveUsage(t *testing.T) {
+	h := newHarness(t)
 	h.mustPrice("m1", Rates{Input: million, Output: million})
-	key, _ := h.mustKey(KeySpec{Enabled: true, QuotaMicroUSD: 10, MaxConcurrent: 1})
+	key, _ := h.mustKey(KeySpec{Enabled: true, QuotaMicroUSD: 10})
 	ctx := h.ctx()
-	// Estimate of 10 tokens = 20 microUSD > quota.
-	_, err := h.store.Reserve(ctx, ReserveInput{ID: "q1", TraceID: "tq1", KeyID: key.ID, RequestedModel: "m1",
-		InputEstimate: 10, OutputEstimate: 10})
-	if !errors.Is(err, ErrQuota) {
-		t.Fatalf("quota err = %v, want ErrQuota", err)
+
+	// Effective usage is zero, so the first request is admitted even though a
+	// coarse estimate of its cost would exceed the quota: no estimate exists.
+	first := h.mustAdmit(AdmitInput{ID: "q1", TraceID: "tq1", KeyID: key.ID, RequestedModel: "m1"})
+	h.mustUsage(usageFor("u-q1", first, "m1", tokens(9, 0, 0, 0, 0)))
+	h.mustComplete(Completion{ID: first.ID, TraceID: first.TraceID, Outcome: OutcomeSucceeded})
+	if got := h.key(key.ID).SpentMicroUSD; got != 9 {
+		t.Fatalf("spent = %d, want 9", got)
 	}
-	// Exactly at quota is admitted (limits are exceeded only when over).
-	admitted := h.mustReserve(ReserveInput{ID: "q2", TraceID: "tq2", KeyID: key.ID, RequestedModel: "m1",
-		InputEstimate: 5, OutputEstimate: 5})
-	if admitted.HeldMicroUSD != 10 {
-		t.Fatalf("held = %d, want 10", admitted.HeldMicroUSD)
-	}
-	// The same key is now at its concurrency limit.
-	_, err = h.store.Reserve(ctx, ReserveInput{ID: "q3", TraceID: "tq3", KeyID: key.ID, RequestedModel: "m1"})
-	if !errors.Is(err, ErrConcurrency) {
-		t.Fatalf("concurrency err = %v, want ErrConcurrency", err)
-	}
-	// A key without a concurrency limit is still bounded by unresolved backlog.
-	backlogKey, _ := h.mustKey(KeySpec{Enabled: true})
-	h.mustReserve(ReserveInput{ID: "b1", TraceID: "tb1", KeyID: backlogKey.ID, RequestedModel: "m1"})
-	h.mustComplete(Completion{ID: "b1", TraceID: "tb1", Outcome: OutcomeFailed, StatusCode: 500})
-	h.mustReserve(ReserveInput{ID: "b2", TraceID: "tb2", KeyID: backlogKey.ID, RequestedModel: "m1"})
-	_, err = h.store.Reserve(ctx, ReserveInput{ID: "b3", TraceID: "tb3", KeyID: backlogKey.ID, RequestedModel: "m1"})
-	if !errors.Is(err, ErrPending) {
-		t.Fatalf("backlog err = %v, want ErrPending", err)
+	// 9 < 10: a positive remainder still admits another request.
+	h.mustAdmit(AdmitInput{ID: "q2", TraceID: "tq2", KeyID: key.ID, RequestedModel: "m1"})
+	second := h.mustAdmit(AdmitInput{ID: "q3", TraceID: "tq3", KeyID: key.ID, RequestedModel: "m1"})
+	// Charging the last microUSD makes effective usage equal the limit, which
+	// now denies the next admission.
+	h.mustUsage(usageFor("u-q3", second, "m1", tokens(1, 0, 0, 0, 0)))
+	h.mustComplete(Completion{ID: second.ID, TraceID: second.TraceID, Outcome: OutcomeSucceeded})
+	if _, err := h.store.Admit(ctx, AdmitInput{ID: "q4", TraceID: "tq4", KeyID: key.ID, RequestedModel: "m1"}); !errors.Is(err, ErrQuota) {
+		t.Fatalf("used == limit err = %v, want ErrQuota", err)
 	}
 }
 
-func TestReserveReleasesConcurrencyOnlyOnce(t *testing.T) {
+func TestAdmitConcurrencyAndOverage(t *testing.T) {
+	h := newHarness(t)
+	h.mustPrice("m1", Rates{Input: million})
+	key, _ := h.mustKey(KeySpec{Enabled: true, QuotaMicroUSD: 10, MaxConcurrent: 1})
+	ctx := h.ctx()
+
+	active := h.mustAdmit(AdmitInput{ID: "a", TraceID: "ta", KeyID: key.ID, RequestedModel: "m1"})
+	if _, err := h.store.Admit(ctx, AdmitInput{ID: "b", TraceID: "tb", KeyID: key.ID, RequestedModel: "m1"}); !errors.Is(err, ErrConcurrency) {
+		t.Fatalf("concurrency err = %v, want ErrConcurrency", err)
+	}
+	// The actual charge exceeds the quota: it is booked in full, never capped.
+	h.mustUsage(usageFor("u-a", active, "m1", tokens(25, 0, 0, 0, 0)))
+	h.mustComplete(Completion{ID: active.ID, TraceID: active.TraceID, Outcome: OutcomeSucceeded})
+	if got := h.key(key.ID).SpentMicroUSD; got != 25 {
+		t.Fatalf("overage spent = %d, want the full 25", got)
+	}
+	// Completion released the concurrency slot; the exhausted quota denies.
+	if _, err := h.store.Admit(ctx, AdmitInput{ID: "c", TraceID: "tc", KeyID: key.ID, RequestedModel: "m1"}); !errors.Is(err, ErrQuota) {
+		t.Fatalf("post-overage err = %v, want ErrQuota", err)
+	}
+}
+
+// TestUnresolvedAccountingDoesNotBlockAdmission pins that unknown or unresolved
+// accounting never becomes a backlog gate: later requests on the same key are
+// still admitted while an earlier one is unresolved.
+func TestUnresolvedAccountingDoesNotBlockAdmission(t *testing.T) {
 	h, key := billingHarness(t)
-	req := h.mustReserve(ReserveInput{ID: "r1", TraceID: "t1", KeyID: key.ID, RequestedModel: "m1"})
+	pending := h.mustAdmit(AdmitInput{ID: "p1", TraceID: "tp1", KeyID: key.ID, RequestedModel: "m1"})
+	unknown := usageFor("u-unknown", pending, "m1", Tokens{})
+	unknown.Quality = QualityUnknown
+	h.mustUsage(unknown)
+	h.mustComplete(Completion{ID: pending.ID, TraceID: pending.TraceID, Outcome: OutcomeFailed, StatusCode: 500})
+	if got := h.request(pending.ID); got.State != statePending {
+		t.Fatalf("state = %q, want pending", got.State)
+	}
+	// Many unresolved requests must not stop the next admission.
+	for i := 0; i < 32; i++ {
+		h.mustAdmit(AdmitInput{ID: "later-" + itoa(i), TraceID: "tl-" + itoa(i), KeyID: key.ID, RequestedModel: "m1"})
+	}
+}
+
+func TestAdmitReleasesConcurrencyOnlyOnce(t *testing.T) {
+	h, key := billingHarness(t)
+	req := h.mustAdmit(AdmitInput{ID: "r1", TraceID: "t1", KeyID: key.ID, RequestedModel: "m1"})
 	h.mustComplete(Completion{ID: req.ID, TraceID: req.TraceID, Outcome: OutcomeSucceeded})
-	// Idempotent completion keeps the pending state and the hold.
+	// Idempotent completion keeps the pending state.
 	h.mustComplete(Completion{ID: req.ID, TraceID: req.TraceID, Outcome: OutcomeSucceeded})
 	got := h.request(req.ID)
 	if got.State != statePending {
@@ -171,25 +203,17 @@ func TestReserveReleasesConcurrencyOnlyOnce(t *testing.T) {
 
 func TestUsageBeforeCompletionIsChargedOnce(t *testing.T) {
 	h, key := billingHarness(t)
-	req := h.mustReserve(ReserveInput{ID: "r1", TraceID: "t1", KeyID: key.ID, RequestedModel: "m1",
-		InputEstimate: 100, OutputEstimate: 100})
-	if req.HeldMicroUSD != 300 {
-		t.Fatalf("hold = %d, want 300", req.HeldMicroUSD)
-	}
+	req := h.mustAdmit(AdmitInput{ID: "r1", TraceID: "t1", KeyID: key.ID, RequestedModel: "m1"})
 	// Usage arrives first, while the execution is still active. A trustworthy
-	// charge is booked immediately; only the hold waits for completion.
+	// charge is booked immediately, well before completion and never estimated.
 	h.mustUsage(usageFor("u1", req, "m1", tokens(100, 0, 0, 100, 0)))
-	if got := h.key(key.ID); got.SpentMicroUSD != 300 || got.HeldMicroUSD != 300 {
-		t.Fatalf("active accounting = spent %d held %d, want 300/300", got.SpentMicroUSD, got.HeldMicroUSD)
+	if got := h.key(key.ID); got.SpentMicroUSD != 300 {
+		t.Fatalf("active accounting = spent %d, want 300", got.SpentMicroUSD)
 	}
 	h.mustComplete(Completion{ID: req.ID, TraceID: req.TraceID, Outcome: OutcomeSucceeded})
 	got := h.key(key.ID)
-	if got.SpentMicroUSD != 300 || got.HeldMicroUSD != 0 {
-		t.Fatalf("settled accounting = spent %d held %d, want 300/0", got.SpentMicroUSD, got.HeldMicroUSD)
-	}
-	// A closed request no longer reports a hold.
-	if settled := h.request(req.ID); settled.HeldMicroUSD != 0 {
-		t.Fatalf("settled request hold = %d, want 0", settled.HeldMicroUSD)
+	if got.SpentMicroUSD != 300 {
+		t.Fatalf("settled accounting = spent %d, want 300", got.SpentMicroUSD)
 	}
 	// A duplicate event must not bill twice.
 	h.mustUsage(usageFor("u1", req, "m1", tokens(100, 0, 0, 100, 0)))
@@ -206,18 +230,14 @@ func TestUsageBeforeCompletionIsChargedOnce(t *testing.T) {
 }
 
 // TestUnknownExecutionBlocksClosureButStillCharges proves that an unreliable
-// execution keeps the request (and its remaining hold) open while every
+// execution keeps the request open while every
 // trustworthy charge is booked immediately and never written off twice.
 func TestUnknownExecutionBlocksClosureButStillCharges(t *testing.T) {
 	h, key := billingHarness(t)
-	req := h.mustReserve(ReserveInput{ID: "r1", TraceID: "t1", KeyID: key.ID, RequestedModel: "m1",
-		InputEstimate: 100, OutputEstimate: 100})
+	req := h.mustAdmit(AdmitInput{ID: "r1", TraceID: "t1", KeyID: key.ID, RequestedModel: "m1"})
 	h.mustComplete(Completion{ID: req.ID, TraceID: req.TraceID, Outcome: OutcomeSucceeded})
 	if got := h.request(req.ID); got.State != statePending {
 		t.Fatalf("state without usage = %q, want pending", got.State)
-	}
-	if held := h.key(key.ID).HeldMicroUSD; held != 300 {
-		t.Fatalf("hold after completion without usage = %d, want 300", held)
 	}
 	// Unknown accounting is recorded but never billed as a zero.
 	unknown := usageFor("u-unknown", req, "m1", Tokens{})
@@ -230,7 +250,7 @@ func TestUnknownExecutionBlocksClosureButStillCharges(t *testing.T) {
 		t.Fatalf("unknown usage charged %d, want 0", got)
 	}
 	// A trustworthy usage charges immediately but the unknown sibling still
-	// blocks closure, so the remaining hold is kept instead of written off.
+	// blocks closure.
 	h.mustUsage(usageFor("u-known", req, "m1", tokens(100, 0, 0, 100, 0)))
 	got := h.request(req.ID)
 	if got.State != statePending {
@@ -238,9 +258,6 @@ func TestUnknownExecutionBlocksClosureButStillCharges(t *testing.T) {
 	}
 	if spent := h.key(key.ID).SpentMicroUSD; spent != 300 {
 		t.Fatalf("spent = %d, want the immediate 300", spent)
-	}
-	if held := h.key(key.ID).HeldMicroUSD; held != 300 {
-		t.Fatalf("hold with unknown execution = %d, want 300 retained", held)
 	}
 	// A repeated completion must not change anything while the request is
 	// unresolved, but it is still checked for agreement.
@@ -267,8 +284,8 @@ func TestUnknownExecutionBlocksClosureButStillCharges(t *testing.T) {
 	if err := h.store.Resolve(h.ctx(), req.ID, Resolution{Action: ActionRelease, Reason: "unknown accounting"}); err != nil {
 		t.Fatalf("resolve: %v", err)
 	}
-	if k := h.key(key.ID); k.SpentMicroUSD != 300 || k.HeldMicroUSD != 0 {
-		t.Fatalf("after resolve spent %d held %d, want 300/0", k.SpentMicroUSD, k.HeldMicroUSD)
+	if k := h.key(key.ID); k.SpentMicroUSD != 300 {
+		t.Fatalf("after resolve spent %d, want 300", k.SpentMicroUSD)
 	}
 }
 
@@ -278,8 +295,7 @@ func TestUnknownExecutionOrderingAndIdempotency(t *testing.T) {
 	h, key := billingHarness(t)
 	ctx := h.ctx()
 	reserve := func(id string) Request {
-		return h.mustReserve(ReserveInput{ID: id, TraceID: "t-" + id, KeyID: key.ID, RequestedModel: "m1",
-			InputEstimate: 100, OutputEstimate: 100})
+		return h.mustAdmit(AdmitInput{ID: id, TraceID: "t-" + id, KeyID: key.ID, RequestedModel: "m1"})
 	}
 	// Order A: unknown first, completion second, trustworthy usage last.
 	a := reserve("a")
@@ -330,8 +346,7 @@ func TestCompletionOutcomes(t *testing.T) {
 	h, key := billingHarness(t)
 	ctx := h.ctx()
 	reserve := func(id string) Request {
-		return h.mustReserve(ReserveInput{ID: id, TraceID: "t-" + id, KeyID: key.ID, RequestedModel: "m1",
-			InputEstimate: 10, OutputEstimate: 10})
+		return h.mustAdmit(AdmitInput{ID: id, TraceID: "t-" + id, KeyID: key.ID, RequestedModel: "m1"})
 	}
 	closeOrNot := func(id, outcome string, status int, wantState string) Request {
 		req := reserve(id)
@@ -410,7 +425,7 @@ func TestCompletionOutcomes(t *testing.T) {
 // that disagrees with what was already recorded.
 func TestCompleteValidatesRepeatedOutcomeAndStatus(t *testing.T) {
 	h, key := billingHarness(t)
-	req := h.mustReserve(ReserveInput{ID: "r1", TraceID: "t1", KeyID: key.ID, RequestedModel: "m1"})
+	req := h.mustAdmit(AdmitInput{ID: "r1", TraceID: "t1", KeyID: key.ID, RequestedModel: "m1"})
 	h.mustComplete(Completion{ID: req.ID, TraceID: req.TraceID, Outcome: OutcomeFailed, StatusCode: 502})
 	h.mustComplete(Completion{ID: req.ID, TraceID: req.TraceID, Outcome: OutcomeFailed, StatusCode: 502})
 	if err := h.store.Complete(h.ctx(), Completion{ID: req.ID, TraceID: req.TraceID,
@@ -430,7 +445,7 @@ func TestCompleteValidatesRepeatedOutcomeAndStatus(t *testing.T) {
 // the core always derives the cost from the request price snapshot.
 func TestUsageRejectsCallerSuppliedCost(t *testing.T) {
 	h, key := billingHarness(t)
-	req := h.mustReserve(ReserveInput{ID: "r1", TraceID: "t1", KeyID: key.ID, RequestedModel: "m1"})
+	req := h.mustAdmit(AdmitInput{ID: "r1", TraceID: "t1", KeyID: key.ID, RequestedModel: "m1"})
 	u := usageFor("u1", req, "m1", tokens(10, 0, 0, 10, 0))
 	cost := int64(1)
 	u.CostMicroUSD = &cost
@@ -444,7 +459,7 @@ func TestUsageRejectsCallerSuppliedCost(t *testing.T) {
 
 func TestUsageMatchingRules(t *testing.T) {
 	h, key := billingHarness(t)
-	req := h.mustReserve(ReserveInput{ID: "r1", TraceID: "t1", KeyID: key.ID, RequestedModel: "m1"})
+	req := h.mustAdmit(AdmitInput{ID: "r1", TraceID: "t1", KeyID: key.ID, RequestedModel: "m1"})
 	ctx := h.ctx()
 	// Unknown trace must never create a request.
 	orphan := usageFor("u-orphan", req, "m1", tokens(1, 0, 0, 1, 0))
@@ -484,8 +499,7 @@ func TestUsageMatchingRules(t *testing.T) {
 func TestResolveReleaseAndCharge(t *testing.T) {
 	h, key := billingHarness(t)
 	ctx := h.ctx()
-	release := h.mustReserve(ReserveInput{ID: "r1", TraceID: "t1", KeyID: key.ID, RequestedModel: "m1",
-		InputEstimate: 100, OutputEstimate: 100})
+	release := h.mustAdmit(AdmitInput{ID: "r1", TraceID: "t1", KeyID: key.ID, RequestedModel: "m1"})
 	if err := h.store.Resolve(ctx, release.ID, Resolution{Action: ActionRelease, Reason: ""}); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("missing reason err = %v, want ErrInvalid", err)
 	}
@@ -497,10 +511,6 @@ func TestResolveReleaseAndCharge(t *testing.T) {
 	if err := h.store.Resolve(ctx, release.ID, Resolution{Action: ActionRelease, Reason: "too early"}); !errors.Is(err, ErrConflict) {
 		t.Fatalf("resolving an active request err = %v, want ErrConflict", err)
 	}
-	// 100 input + 100 output at the harness rates.
-	if k := h.key(key.ID); k.HeldMicroUSD != 300 {
-		t.Fatalf("hold after refused resolve = %d, want 300", k.HeldMicroUSD)
-	}
 	// A failed lifecycle without a trustworthy execution is what an
 	// administrator actually has to rule on.
 	h.mustComplete(Completion{ID: release.ID, TraceID: release.TraceID, Outcome: OutcomeFailed, StatusCode: 502})
@@ -511,21 +521,20 @@ func TestResolveReleaseAndCharge(t *testing.T) {
 	if got.State != stateSettled {
 		t.Fatalf("state = %q, want settled", got.State)
 	}
-	if k := h.key(key.ID); k.SpentMicroUSD != 0 || k.HeldMicroUSD != 0 {
-		t.Fatalf("after release spent %d held %d, want 0/0", k.SpentMicroUSD, k.HeldMicroUSD)
+	if k := h.key(key.ID); k.SpentMicroUSD != 0 {
+		t.Fatalf("after release spent %d, want 0", k.SpentMicroUSD)
 	}
 	// A second resolve on a closed request is a conflict, not a silent reprice.
 	if err := h.store.Resolve(ctx, release.ID, Resolution{Action: ActionRelease, Reason: "again"}); !errors.Is(err, ErrConflict) {
 		t.Fatalf("repeat resolve err = %v, want ErrConflict", err)
 	}
-	charge := h.mustReserve(ReserveInput{ID: "r2", TraceID: "t2", KeyID: key.ID, RequestedModel: "m1",
-		InputEstimate: 10, OutputEstimate: 10})
+	charge := h.mustAdmit(AdmitInput{ID: "r2", TraceID: "t2", KeyID: key.ID, RequestedModel: "m1"})
 	h.mustComplete(Completion{ID: charge.ID, TraceID: charge.TraceID, Outcome: OutcomeFailed, StatusCode: 502})
 	if err := h.store.Resolve(ctx, charge.ID, Resolution{Action: ActionCharge, AmountMicroUSD: 777, Reason: "manual"}); err != nil {
 		t.Fatalf("charge: %v", err)
 	}
-	if k := h.key(key.ID); k.SpentMicroUSD != 777 || k.HeldMicroUSD != 0 {
-		t.Fatalf("after charge spent %d held %d, want 777/0", k.SpentMicroUSD, k.HeldMicroUSD)
+	if k := h.key(key.ID); k.SpentMicroUSD != 777 {
+		t.Fatalf("after charge spent %d, want 777", k.SpentMicroUSD)
 	}
 	var count int
 	if err := h.store.db.QueryRow(`SELECT COUNT(*) FROM adjustments WHERE request_id = ?`, charge.ID).Scan(&count); err != nil {
@@ -535,7 +544,7 @@ func TestResolveReleaseAndCharge(t *testing.T) {
 		t.Fatalf("adjustments = %d, want 1", count)
 	}
 	// A released request that already reported usage still charges that usage.
-	partial := h.mustReserve(ReserveInput{ID: "r3", TraceID: "t3", KeyID: key.ID, RequestedModel: "m1"})
+	partial := h.mustAdmit(AdmitInput{ID: "r3", TraceID: "t3", KeyID: key.ID, RequestedModel: "m1"})
 	h.mustUsage(usageFor("u3", partial, "m1", tokens(100, 0, 0, 0, 0)))
 	// The unaccounted execution keeps the request pending, which is the only
 	// state an administrator may still rule on.
@@ -555,8 +564,8 @@ func TestResolveReleaseAndCharge(t *testing.T) {
 // period, not the time the late event arrived.
 func TestLateUsageChargesAdmissionPeriod(t *testing.T) {
 	h, key := billingHarness(t)
-	req := h.mustReserve(ReserveInput{ID: "r1", TraceID: "t1", KeyID: key.ID, RequestedModel: "m1",
-		At: testEpoch, InputEstimate: 10, OutputEstimate: 10})
+	req := h.mustAdmit(AdmitInput{ID: "r1", TraceID: "t1", KeyID: key.ID, RequestedModel: "m1",
+		At: testEpoch})
 	// The event arrives in the next month.
 	h.clock.set(testEpoch.AddDate(0, 1, 0))
 	h.mustUsage(usageFor("u1", req, "m1", tokens(100, 0, 0, 0, 0)))
@@ -605,8 +614,8 @@ func TestPeriodLimitsResetAcrossPeriods(t *testing.T) {
 	key, _ := h.mustKey(KeySpec{Enabled: true, DailyMicroUSD: 100})
 	ctx := h.ctx()
 	spend := func(id, trace string, amount int64) error {
-		req, err := h.store.Reserve(ctx, ReserveInput{ID: id, TraceID: trace, KeyID: key.ID,
-			RequestedModel: "m1", InputEstimate: amount, OutputEstimate: 0})
+		req, err := h.store.Admit(ctx, AdmitInput{ID: id, TraceID: trace, KeyID: key.ID,
+			RequestedModel: "m1"})
 		if err != nil {
 			return err
 		}
@@ -637,22 +646,18 @@ func TestModelTokenLimits(t *testing.T) {
 	h.mustPrice("m2", Rates{Input: million})
 	key, _ := h.mustKey(KeySpec{
 		Enabled:          true,
-		ModelTokenLimits: []ModelTokenLimit{{Model: "m1", Daily: 150}},
-	})
+		ModelTokenLimits: []ModelTokenLimit{{Model: "m1", Daily: 150}}})
 	ctx := h.ctx()
-	req := h.mustReserve(ReserveInput{ID: "r1", TraceID: "t1", KeyID: key.ID, RequestedModel: "m1",
-		InputEstimate: 100, OutputEstimate: 0})
-	// The admission estimate consumes budget before any usage is reported.
-	_, err := h.store.Reserve(ctx, ReserveInput{ID: "r2", TraceID: "t2", KeyID: key.ID, RequestedModel: "m1",
-		InputEstimate: 100, OutputEstimate: 0})
-	if !errors.Is(err, ErrQuota) {
-		t.Fatalf("estimate over limit err = %v, want ErrQuota", err)
+	req := h.mustAdmit(AdmitInput{ID: "r1", TraceID: "t1", KeyID: key.ID, RequestedModel: "m1"})
+	// A second m1 admission still fits: nothing has been consumed yet.
+	if _, err := h.store.Admit(ctx, AdmitInput{ID: "r2", TraceID: "t2", KeyID: key.ID, RequestedModel: "m1"}); err != nil {
+		t.Fatalf("m1 within the token limit: %v", err)
 	}
 	// Another model is unaffected.
-	if _, err := h.store.Reserve(ctx, ReserveInput{ID: "r3", TraceID: "t3", KeyID: key.ID, RequestedModel: "m2"}); err != nil {
+	if _, err := h.store.Admit(ctx, AdmitInput{ID: "r3", TraceID: "t3", KeyID: key.ID, RequestedModel: "m2"}); err != nil {
 		t.Fatalf("other model: %v", err)
 	}
-	// Reported usage moves the estimate into durable counters.
+	// Reported usage moves into durable counters.
 	h.mustUsage(usageFor("u1", req, "m1", tokens(150, 0, 0, 0, 0)))
 	h.mustComplete(Completion{ID: req.ID, TraceID: req.TraceID, Outcome: OutcomeSucceeded})
 	used, err := tokenCounter(ctx, h.store.db, key.ID, "m1", windowDay, dayPeriod(testEpoch))
@@ -662,20 +667,18 @@ func TestModelTokenLimits(t *testing.T) {
 	if used != 150 {
 		t.Fatalf("token counter = %d, want 150", used)
 	}
-	_, err = h.store.Reserve(ctx, ReserveInput{ID: "r4", TraceID: "t4", KeyID: key.ID, RequestedModel: "m1",
-		InputEstimate: 1, OutputEstimate: 0})
-	if !errors.Is(err, ErrQuota) {
-		t.Fatalf("consumed over limit err = %v, want ErrQuota", err)
+	// The actual usage has reached the limit, so the next m1 admission denies.
+	if _, err := h.store.Admit(ctx, AdmitInput{ID: "r4", TraceID: "t4", KeyID: key.ID, RequestedModel: "m1"}); !errors.Is(err, ErrQuota) {
+		t.Fatalf("used == limit err = %v, want ErrQuota", err)
 	}
 	// The next day is a new window.
 	h.clock.set(testEpoch.AddDate(0, 0, 1))
-	if _, err := h.store.Reserve(ctx, ReserveInput{ID: "r5", TraceID: "t5", KeyID: key.ID, RequestedModel: "m1",
-		InputEstimate: 100, OutputEstimate: 0}); err != nil {
+	if _, err := h.store.Admit(ctx, AdmitInput{ID: "r5", TraceID: "t5", KeyID: key.ID, RequestedModel: "m1"}); err != nil {
 		t.Fatalf("next day reserve: %v", err)
 	}
 }
 
-func TestConcurrentReserveHonoursConcurrencyLimit(t *testing.T) {
+func TestConcurrentAdmitHonoursConcurrencyLimit(t *testing.T) {
 	h := newHarness(t)
 	h.mustPrice("m1", Rates{Input: million})
 	key, _ := h.mustKey(KeySpec{Enabled: true, MaxConcurrent: 2})
@@ -686,12 +689,11 @@ func TestConcurrentReserveHonoursConcurrencyLimit(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			_, err := h.store.Reserve(context.Background(), ReserveInput{
+			_, err := h.store.Admit(context.Background(), AdmitInput{
 				ID:             "req-" + itoa(i),
 				TraceID:        "trace-" + itoa(i),
 				KeyID:          key.ID,
-				RequestedModel: "m1",
-			})
+				RequestedModel: "m1"})
 			results[i] = err
 		}(i)
 	}
@@ -730,8 +732,7 @@ func itoa(i int) string {
 // for billing: a later price change must not silently reprice in-flight work.
 func TestRepricingDoesNotReBillHistory(t *testing.T) {
 	h, key := billingHarness(t)
-	req := h.mustReserve(ReserveInput{ID: "r1", TraceID: "t1", KeyID: key.ID, RequestedModel: "m1",
-		InputEstimate: 100, OutputEstimate: 100})
+	req := h.mustAdmit(AdmitInput{ID: "r1", TraceID: "t1", KeyID: key.ID, RequestedModel: "m1"})
 	h.mustPrice("m1", Rates{Input: 50 * million, Output: 60 * million})
 	h.mustUsage(usageFor("u1", req, "m1", tokens(100, 0, 0, 100, 0)))
 	h.mustComplete(Completion{ID: req.ID, TraceID: req.TraceID, Outcome: OutcomeSucceeded})
@@ -766,7 +767,7 @@ func TestBusyDatabaseIsObservable(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
 	defer cancel()
-	_, err = h.store.Reserve(ctx, ReserveInput{ID: "busy", TraceID: "t-busy", KeyID: key.ID, RequestedModel: "m1"})
+	_, err = h.store.Admit(ctx, AdmitInput{ID: "busy", TraceID: "t-busy", KeyID: key.ID, RequestedModel: "m1"})
 	if err == nil {
 		t.Fatal("reserve succeeded against a locked database")
 	}
@@ -782,7 +783,7 @@ func TestBusyDatabaseIsObservable(t *testing.T) {
 // the caller never learned the request id.
 func TestUsageReplayWithEmptyRequestID(t *testing.T) {
 	h, key := billingHarness(t)
-	req := h.mustReserve(ReserveInput{ID: "r1", TraceID: "t1", KeyID: key.ID, RequestedModel: "m1"})
+	req := h.mustAdmit(AdmitInput{ID: "r1", TraceID: "t1", KeyID: key.ID, RequestedModel: "m1"})
 	u := usageFor("u1", req, "m1", tokens(10, 0, 0, 10, 0))
 	u.RequestID = ""
 	h.mustUsage(u)
@@ -815,7 +816,7 @@ func TestHasActive(t *testing.T) {
 	if err != nil || active {
 		t.Fatalf("initial HasActive = %v, %v", active, err)
 	}
-	req := h.mustReserve(ReserveInput{ID: "r1", TraceID: "t1", KeyID: key.ID, RequestedModel: "m1"})
+	req := h.mustAdmit(AdmitInput{ID: "r1", TraceID: "t1", KeyID: key.ID, RequestedModel: "m1"})
 	if active, err = h.store.HasActive(h.ctx()); err != nil || !active {
 		t.Fatalf("HasActive during execution = %v, %v", active, err)
 	}
@@ -831,7 +832,7 @@ func TestSecondInstanceCannotOwnLockedDirectory(t *testing.T) {
 	h := newHarness(t)
 	h.mustPrice("m1", Rates{Input: million})
 	key, _ := h.mustKey(KeySpec{Enabled: true})
-	h.mustReserve(ReserveInput{ID: "live", TraceID: "t-live", KeyID: key.ID, RequestedModel: "m1"})
+	h.mustAdmit(AdmitInput{ID: "live", TraceID: "t-live", KeyID: key.ID, RequestedModel: "m1"})
 
 	second, err := Open(Options{DataDir: h.dir, Now: h.clock.now})
 	if !errors.Is(err, ErrLocked) {
@@ -873,11 +874,7 @@ func TestZeroRatePriceStillRequiresUsage(t *testing.T) {
 	h := newHarness(t)
 	h.mustPrice("free", Rates{})
 	key, _ := h.mustKey(KeySpec{Enabled: true})
-	req := h.mustReserve(ReserveInput{ID: "r1", TraceID: "t1", KeyID: key.ID, RequestedModel: "free",
-		InputEstimate: 100, OutputEstimate: 100})
-	if req.HeldMicroUSD != 0 {
-		t.Fatalf("free model hold = %d, want 0", req.HeldMicroUSD)
-	}
+	req := h.mustAdmit(AdmitInput{ID: "r1", TraceID: "t1", KeyID: key.ID, RequestedModel: "free"})
 	h.mustComplete(Completion{ID: req.ID, TraceID: req.TraceID, Outcome: OutcomeSucceeded})
 	if got := h.request(req.ID).State; got != statePending {
 		t.Fatalf("free success without usage state = %q, want pending", got)
@@ -898,15 +895,17 @@ func TestZeroRatePriceStillRequiresUsage(t *testing.T) {
 // admitted in the current period blocks further admissions, so two concurrent
 // requests cannot jointly exceed a daily/weekly/monthly monetary limit while
 // neither has been charged yet.
-func TestPeriodLimitsCountUnresolvedHolds(t *testing.T) {
+// TestPeriodLimitsGateOnActualUsage proves that a period money limit is a soft
+// admission gate on already-charged usage: a fresh window admits, and once the
+// window's actual usage has reached the limit the next admission is refused.
+func TestPeriodLimitsGateOnActualUsage(t *testing.T) {
 	cases := []struct {
 		name  string
 		apply func(*KeySpec)
 	}{
 		{"daily", func(s *KeySpec) { s.DailyMicroUSD = 100 }},
 		{"weekly", func(s *KeySpec) { s.WeeklyMicroUSD = 100 }},
-		{"monthly", func(s *KeySpec) { s.MonthlyMicroUSD = 100 }},
-	}
+		{"monthly", func(s *KeySpec) { s.MonthlyMicroUSD = 100 }}}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			h := newHarness(t)
@@ -916,30 +915,19 @@ func TestPeriodLimitsCountUnresolvedHolds(t *testing.T) {
 			key, _ := h.mustKey(spec)
 			ctx := h.ctx()
 
-			first := h.mustReserve(ReserveInput{ID: "r1", TraceID: "t1", KeyID: key.ID,
-				RequestedModel: "m1", InputEstimate: 60})
-			if first.HeldMicroUSD != 60 {
-				t.Fatalf("hold = %d, want 60", first.HeldMicroUSD)
+			first := h.mustAdmit(AdmitInput{ID: "r1", TraceID: "t1", KeyID: key.ID,
+				RequestedModel: "m1"})
+			// Nothing charged yet: several concurrent admissions are allowed.
+			if _, err := h.store.Admit(ctx, AdmitInput{ID: "r2", TraceID: "t2", KeyID: key.ID,
+				RequestedModel: "m1"}); err != nil {
+				t.Fatalf("concurrent admission in a fresh window: %v", err)
 			}
-			// Nothing has been charged yet, yet the window is already occupied.
-			_, err := h.store.Reserve(ctx, ReserveInput{ID: "r2", TraceID: "t2", KeyID: key.ID,
-				RequestedModel: "m1", InputEstimate: 60})
-			if !errors.Is(err, ErrQuota) {
-				t.Fatalf("second hold err = %v, want ErrQuota", err)
-			}
-			// An admission that still fits exactly is admitted.
-			if _, err := h.store.Reserve(ctx, ReserveInput{ID: "r3", TraceID: "t3", KeyID: key.ID,
-				RequestedModel: "m1", InputEstimate: 40}); err != nil {
-				t.Fatalf("hold exactly at the limit: %v", err)
-			}
-			// Closing the first request releases its hold in the same period.
-			h.mustComplete(Completion{ID: first.ID, TraceID: first.TraceID, Outcome: OutcomeRejected})
-			if k := h.key(key.ID); k.HeldMicroUSD != 40 {
-				t.Fatalf("hold after release = %d, want 40", k.HeldMicroUSD)
-			}
-			if _, err := h.store.Reserve(ctx, ReserveInput{ID: "r4", TraceID: "t4", KeyID: key.ID,
-				RequestedModel: "m1", InputEstimate: 60}); err != nil {
-				t.Fatalf("hold after release should fit: %v", err)
+			// The actual charge consumes the window; used == limit denies.
+			h.mustUsage(usageFor("u1", first, "m1", tokens(100, 0, 0, 0, 0)))
+			h.mustComplete(Completion{ID: first.ID, TraceID: first.TraceID, Outcome: OutcomeSucceeded})
+			if _, err := h.store.Admit(ctx, AdmitInput{ID: "r3", TraceID: "t3", KeyID: key.ID,
+				RequestedModel: "m1"}); !errors.Is(err, ErrQuota) {
+				t.Fatalf("used == limit err = %v, want ErrQuota", err)
 			}
 		})
 	}
@@ -948,67 +936,82 @@ func TestPeriodLimitsCountUnresolvedHolds(t *testing.T) {
 // TestPeriodLimitsIgnoreHoldsFromOtherPeriods keeps the same-period rule from
 // overcorrecting: work admitted in an earlier period keeps its hold, but it
 // does not occupy the next period's monetary window.
-func TestPeriodLimitsIgnoreHoldsFromOtherPeriods(t *testing.T) {
+// TestPeriodLimitsUseTheirOwnWindow keeps windows independent: usage charged in
+// January must not occupy February's monthly window.
+func TestPeriodLimitsUseTheirOwnWindow(t *testing.T) {
 	h := newHarness(t)
 	h.mustPrice("m1", Rates{Input: million})
 	key, _ := h.mustKey(KeySpec{Enabled: true, MonthlyMicroUSD: 100})
 	jan := time.Date(2026, time.January, 10, 12, 0, 0, 0, time.UTC)
 	h.clock.set(jan)
-	if _, err := h.store.Reserve(h.ctx(), ReserveInput{ID: "r1", TraceID: "t1", KeyID: key.ID,
-		RequestedModel: "m1", InputEstimate: 100, At: jan}); err != nil {
-		t.Fatalf("january reserve: %v", err)
+	first := h.mustAdmit(AdmitInput{ID: "r1", TraceID: "t1", KeyID: key.ID,
+		RequestedModel: "m1", At: jan})
+	h.mustUsage(usageFor("u1", first, "m1", tokens(100, 0, 0, 0, 0)))
+	h.mustComplete(Completion{ID: first.ID, TraceID: first.TraceID, Outcome: OutcomeSucceeded})
+	if _, err := h.store.Admit(h.ctx(), AdmitInput{ID: "r1b", TraceID: "t1b", KeyID: key.ID,
+		RequestedModel: "m1", At: jan}); !errors.Is(err, ErrQuota) {
+		t.Fatalf("same month err = %v, want ErrQuota", err)
 	}
+	// February is a fresh window even though January usage stays durable.
 	feb := time.Date(2026, time.February, 3, 9, 0, 0, 0, time.UTC)
 	h.clock.set(feb)
-	if _, err := h.store.Reserve(h.ctx(), ReserveInput{ID: "r2", TraceID: "t2", KeyID: key.ID,
-		RequestedModel: "m1", InputEstimate: 100, At: feb}); err != nil {
-		t.Fatalf("february reserve: %v", err)
+	if _, err := h.store.Admit(h.ctx(), AdmitInput{ID: "r2", TraceID: "t2", KeyID: key.ID,
+		RequestedModel: "m1", At: feb}); err != nil {
+		t.Fatalf("february admission: %v", err)
 	}
-	// The old hold is still unresolved and still counted by the lifetime window.
-	if k := h.key(key.ID); k.HeldMicroUSD != 200 {
-		t.Fatalf("held = %d, want both holds retained", k.HeldMicroUSD)
+	if got := h.key(key.ID).SpentMicroUSD; got != 100 {
+		t.Fatalf("lifetime spend = %d, want the January charge preserved", got)
 	}
 }
 
 // TestTokenEstimatesArePeriodScoped makes sure an unresolved request only
 // consumes the token window it was admitted in, while the lifetime window keeps
 // counting it.
-func TestTokenEstimatesArePeriodScoped(t *testing.T) {
+// TestTokenLimitsUseTheirOwnWindow proves token limits gate on actual token
+// usage per window: a reached window denies, the next window admits, and the
+// lifetime limit keeps counting usage from every period.
+func TestTokenLimitsUseTheirOwnWindow(t *testing.T) {
 	h := newHarness(t)
 	h.mustPrice("m1", Rates{Input: million})
 	ctx := h.ctx()
 	jan := time.Date(2026, time.January, 10, 12, 0, 0, 0, time.UTC)
 	feb := time.Date(2026, time.February, 3, 9, 0, 0, 0, time.UTC)
+	spend := func(key Key, id, trace string, at time.Time, amount int64) error {
+		req, err := h.store.Admit(ctx, AdmitInput{ID: id, TraceID: trace, KeyID: key.ID,
+			RequestedModel: "m1", At: at})
+		if err != nil {
+			return err
+		}
+		h.mustUsage(usageFor("u-"+id, req, "m1", tokens(amount, 0, 0, 0, 0)))
+		h.mustComplete(Completion{ID: req.ID, TraceID: trace, Outcome: OutcomeSucceeded})
+		return nil
+	}
 
-	// Period window: the January estimate must not starve February.
+	// Period windows: consuming January's monthly budget must not starve
+	// February, but must deny the rest of January.
 	h.clock.set(jan)
 	scoped, _ := h.mustKey(KeySpec{Enabled: true,
 		ModelTokenLimits: []ModelTokenLimit{{Model: "m1", Total: 400, Monthly: 200}}})
-	if _, err := h.store.Reserve(ctx, ReserveInput{ID: "s1", TraceID: "ts1", KeyID: scoped.ID,
-		RequestedModel: "m1", InputEstimate: 200, At: jan}); err != nil {
-		t.Fatalf("january reserve: %v", err)
+	if err := spend(scoped, "s1", "ts1", jan, 200); err != nil {
+		t.Fatalf("january spend: %v", err)
 	}
-	if _, err := h.store.Reserve(ctx, ReserveInput{ID: "s2", TraceID: "ts2", KeyID: scoped.ID,
-		RequestedModel: "m1", InputEstimate: 1, At: jan}); !errors.Is(err, ErrQuota) {
+	if err := spend(scoped, "s2", "ts2", jan, 1); !errors.Is(err, ErrQuota) {
 		t.Fatalf("same month err = %v, want ErrQuota", err)
 	}
 	h.clock.set(feb)
-	if _, err := h.store.Reserve(ctx, ReserveInput{ID: "s3", TraceID: "ts3", KeyID: scoped.ID,
-		RequestedModel: "m1", InputEstimate: 200, At: feb}); err != nil {
+	if err := spend(scoped, "s3", "ts3", feb, 200); err != nil {
 		t.Fatalf("next month must have its own window: %v", err)
 	}
 
-	// Lifetime window: a stale unresolved estimate still counts against total.
+	// Lifetime window: usage from every period counts against total.
 	lifetime, _ := h.mustKey(KeySpec{Enabled: true,
 		ModelTokenLimits: []ModelTokenLimit{{Model: "m1", Total: 300}}})
 	h.clock.set(jan)
-	if _, err := h.store.Reserve(ctx, ReserveInput{ID: "l1", TraceID: "tl1", KeyID: lifetime.ID,
-		RequestedModel: "m1", InputEstimate: 200, At: jan}); err != nil {
-		t.Fatalf("lifetime january reserve: %v", err)
+	if err := spend(lifetime, "l1", "tl1", jan, 300); err != nil {
+		t.Fatalf("lifetime january spend: %v", err)
 	}
 	h.clock.set(feb)
-	if _, err := h.store.Reserve(ctx, ReserveInput{ID: "l2", TraceID: "tl2", KeyID: lifetime.ID,
-		RequestedModel: "m1", InputEstimate: 200, At: feb}); !errors.Is(err, ErrQuota) {
+	if err := spend(lifetime, "l2", "tl2", feb, 1); !errors.Is(err, ErrQuota) {
 		t.Fatalf("lifetime err = %v, want ErrQuota", err)
 	}
 }
@@ -1029,11 +1032,10 @@ func TestLedgerArithmeticDoesNotOverflowToReal(t *testing.T) {
 			query string
 			args  []any
 		}{
-			{"key money", `SELECT COUNT(*) FROM keys WHERE id = ? AND (typeof(spent_micro_usd) <> 'integer' OR typeof(held_micro_usd) <> 'integer')`, []any{keyID}},
+			{"key money", `SELECT COUNT(*) FROM keys WHERE id = ? AND typeof(spent_micro_usd) <> 'integer'`, []any{keyID}},
 			{"money counters", `SELECT COUNT(*) FROM key_money_counters WHERE key_id = ? AND typeof(micro_usd) <> 'integer'`, []any{keyID}},
 			{"token counters", `SELECT COUNT(*) FROM key_token_counters WHERE key_id = ? AND typeof(tokens) <> 'integer'`, []any{keyID}},
-			{"request charge", `SELECT COUNT(*) FROM requests WHERE id = ? AND typeof(charge_micro_usd) <> 'integer'`, []any{requestID}},
-		}
+			{"request charge", `SELECT COUNT(*) FROM requests WHERE id = ? AND typeof(charge_micro_usd) <> 'integer'`, []any{requestID}}}
 		for _, c := range checks {
 			bad, err := counterValue(context.Background(), h.store.db, c.query, c.args...)
 			if err != nil {
@@ -1049,8 +1051,8 @@ func TestLedgerArithmeticDoesNotOverflowToReal(t *testing.T) {
 		h := newHarness(t)
 		h.mustPrice("big", Rates{Input: rate})
 		key, _ := h.mustKey(KeySpec{Enabled: true})
-		req := h.mustReserve(ReserveInput{ID: "r1", TraceID: "t1", KeyID: key.ID,
-			RequestedModel: "big", InputEstimate: tokensNearMax})
+		req := h.mustAdmit(AdmitInput{ID: "r1", TraceID: "t1", KeyID: key.ID,
+			RequestedModel: "big"})
 		h.mustUsage(usageFor("u1", req, "big", tokens(tokensNearMax, 0, 0, 0, 0)))
 		before := h.key(key.ID)
 		if before.SpentMicroUSD < math.MaxInt64/2 {
@@ -1065,7 +1067,7 @@ func TestLedgerArithmeticDoesNotOverflowToReal(t *testing.T) {
 			t.Fatalf("second charge err = %v, want ErrInvalid", err)
 		}
 		after := h.key(key.ID)
-		if after.SpentMicroUSD != before.SpentMicroUSD || after.HeldMicroUSD != before.HeldMicroUSD {
+		if after.SpentMicroUSD != before.SpentMicroUSD {
 			t.Fatalf("ledger moved after a rejected charge: %+v -> %+v", before, after)
 		}
 		if n, err := counterValue(h.ctx(), h.store.db,
@@ -1074,21 +1076,12 @@ func TestLedgerArithmeticDoesNotOverflowToReal(t *testing.T) {
 		}
 		assertExactIntegers(t, h, key.ID, req.ID)
 
-		// The hold accumulator is guarded the same way.
-		_, err = h.store.Reserve(h.ctx(), ReserveInput{ID: "r2", TraceID: "t2", KeyID: key.ID,
-			RequestedModel: "big", InputEstimate: tokensNearMax})
-		if err == nil || !errors.Is(err, ErrInvalid) {
-			t.Fatalf("hold overflow err = %v, want ErrInvalid", err)
-		}
-		if n, err := counterValue(h.ctx(), h.store.db,
-			`SELECT COUNT(*) FROM requests WHERE id = ?`, "r2"); err != nil || n != 0 {
-			t.Fatalf("rejected reservation was kept: %d (%v)", n, err)
-		}
-		// Releasing is still exact and the charged spend survives.
+		// Completing the request keeps the charged spend exact: no hold is
+		// released and nothing is written off.
 		h.mustComplete(Completion{ID: req.ID, TraceID: req.TraceID, Outcome: OutcomeSucceeded})
 		final := h.key(key.ID)
-		if final.HeldMicroUSD != 0 || final.SpentMicroUSD != before.SpentMicroUSD {
-			t.Fatalf("after release spent %d held %d, want %d/0", final.SpentMicroUSD, final.HeldMicroUSD, before.SpentMicroUSD)
+		if final.SpentMicroUSD != before.SpentMicroUSD {
+			t.Fatalf("after completion spent %d, want %d preserved", final.SpentMicroUSD, before.SpentMicroUSD)
 		}
 		assertExactIntegers(t, h, key.ID, req.ID)
 	})
@@ -1098,8 +1091,8 @@ func TestLedgerArithmeticDoesNotOverflowToReal(t *testing.T) {
 		h.mustPrice("t", Rates{Input: 1}) // cheap money, huge token counts
 		key, _ := h.mustKey(KeySpec{Enabled: true})
 		const huge = int64(9_000_000_000_000_000_000)
-		req := h.mustReserve(ReserveInput{ID: "r1", TraceID: "t1", KeyID: key.ID,
-			RequestedModel: "t", InputEstimate: 1})
+		req := h.mustAdmit(AdmitInput{ID: "r1", TraceID: "t1", KeyID: key.ID,
+			RequestedModel: "t"})
 		// Raw counters are left empty: this case is about the durable token
 		// counters, not about an inconsistent provider payload.
 		first := usageFor("u1", req, "t", tokens(huge, 0, 0, 0, 0))
@@ -1122,28 +1115,25 @@ func TestLedgerArithmeticDoesNotOverflowToReal(t *testing.T) {
 }
 
 // TestResolveRequiresPendingRequest verifies the state machine: an active
-// execution owns a concurrency slot and a hold, so only an administrator
-// decision on an already pending request may close it.
+// execution owns a concurrency slot, so only an administrator decision on an
+// already pending request may close it.
 func TestResolveRequiresPendingRequest(t *testing.T) {
 	h := newHarness(t)
 	h.mustPrice("m1", Rates{Input: million})
 	key, _ := h.mustKey(KeySpec{Enabled: true, MaxConcurrent: 1})
 	ctx := h.ctx()
 
-	active := h.mustReserve(ReserveInput{ID: "a", TraceID: "ta", KeyID: key.ID,
-		RequestedModel: "m1", InputEstimate: 5})
+	active := h.mustAdmit(AdmitInput{ID: "a", TraceID: "ta", KeyID: key.ID,
+		RequestedModel: "m1"})
 	if err := h.store.Resolve(ctx, active.ID, Resolution{Action: ActionRelease, Reason: "sneaky"}); !errors.Is(err, ErrConflict) {
 		t.Fatalf("resolve active err = %v, want ErrConflict", err)
-	}
-	if k := h.key(key.ID); k.HeldMicroUSD != 5 {
-		t.Fatalf("held = %d, want the hold untouched", k.HeldMicroUSD)
 	}
 	if has, err := h.store.HasActive(ctx); err != nil || !has {
 		t.Fatalf("HasActive = %v/%v, want true", has, err)
 	}
 	// The concurrency slot is still owned by the active execution.
-	if _, err := h.store.Reserve(ctx, ReserveInput{ID: "b", TraceID: "tb", KeyID: key.ID,
-		RequestedModel: "m1", InputEstimate: 5}); !errors.Is(err, ErrConcurrency) {
+	if _, err := h.store.Admit(ctx, AdmitInput{ID: "b", TraceID: "tb", KeyID: key.ID,
+		RequestedModel: "m1"}); !errors.Is(err, ErrConcurrency) {
 		t.Fatalf("second reserve err = %v, want ErrConcurrency", err)
 	}
 
@@ -1153,29 +1143,26 @@ func TestResolveRequiresPendingRequest(t *testing.T) {
 	if err := h.store.Resolve(ctx, active.ID, Resolution{Action: ActionRelease, Reason: "manual"}); err != nil {
 		t.Fatalf("resolve pending: %v", err)
 	}
-	if k := h.key(key.ID); k.HeldMicroUSD != 0 {
-		t.Fatalf("held = %d, want released", k.HeldMicroUSD)
-	}
 	if has, err := h.store.HasActive(ctx); err != nil || has {
 		t.Fatalf("HasActive = %v/%v, want false", has, err)
 	}
-	if _, err := h.store.Reserve(ctx, ReserveInput{ID: "b", TraceID: "tb", KeyID: key.ID,
-		RequestedModel: "m1", InputEstimate: 5}); err != nil {
+	if _, err := h.store.Admit(ctx, AdmitInput{ID: "b", TraceID: "tb", KeyID: key.ID,
+		RequestedModel: "m1"}); err != nil {
 		t.Fatalf("slot after resolve: %v", err)
 	}
 }
 
 // TestLateCompletionAfterManualResolve proves a completion that arrives after
 // an administrator closed a restarted request only records its metadata: the
-// settlement, the released hold and the booked money stay untouched.
+// settlement and the booked money stay untouched.
 func TestLateCompletionAfterManualResolve(t *testing.T) {
 	h := newHarness(t)
 	h.mustPrice("m1", Rates{Input: million})
 	key, _ := h.mustKey(KeySpec{Enabled: true})
 	ctx := h.ctx()
 
-	req := h.mustReserve(ReserveInput{ID: "r1", TraceID: "t1", KeyID: key.ID,
-		RequestedModel: "m1", InputEstimate: 7})
+	req := h.mustAdmit(AdmitInput{ID: "r1", TraceID: "t1", KeyID: key.ID,
+		RequestedModel: "m1"})
 	// A restart turns the in flight execution into pending without an outcome,
 	// which is exactly what an administrator then has to decide about.
 	if err := h.store.Close(); err != nil {
@@ -1204,8 +1191,8 @@ func TestLateCompletionAfterManualResolve(t *testing.T) {
 	if after.State != stateSettled || after.Outcome != OutcomeSucceeded {
 		t.Fatalf("late completion = %+v, want settled with the outcome recorded", after)
 	}
-	if k := h.key(key.ID); k.SpentMicroUSD != spent || k.HeldMicroUSD != 0 {
-		t.Fatalf("late completion changed money: spent %d held %d, want %d/0", k.SpentMicroUSD, k.HeldMicroUSD, spent)
+	if k := h.key(key.ID); k.SpentMicroUSD != spent {
+		t.Fatalf("late completion changed money: spent %d, want %d", k.SpentMicroUSD, spent)
 	}
 	var resolved string
 	if err := h.store.db.QueryRow(`SELECT resolved FROM requests WHERE id = ?`, req.ID).Scan(&resolved); err != nil {
@@ -1225,39 +1212,28 @@ func TestLateCompletionAfterManualResolve(t *testing.T) {
 		Outcome: OutcomeFailed, StatusCode: 500}); !errors.Is(err, ErrConflict) {
 		t.Fatalf("conflicting completion err = %v, want ErrConflict", err)
 	}
-	if k := h.key(key.ID); k.HeldMicroUSD != 0 || k.SpentMicroUSD != spent {
+	if k := h.key(key.ID); k.SpentMicroUSD != spent {
 		t.Fatalf("refused completions changed money: %+v", k)
 	}
 }
 
 // TestLateUnaccountedExecutionReopensSettledRequest covers the asynchronous
 // case: a closed request receives an execution whose accounting is unknown, so
-// it must become pending again with its original hold restored instead of
-// silently absorbing the leak.
+// it must become pending again instead of silently absorbing the leak.
 func TestLateUnaccountedExecutionReopensSettledRequest(t *testing.T) {
 	h := newHarness(t)
 	h.mustPrice("m1", Rates{Input: million})
 	key, _ := h.mustKey(KeySpec{Enabled: true})
 	ctx := h.ctx()
 
-	req := h.mustReserve(ReserveInput{ID: "r1", TraceID: "t1", KeyID: key.ID,
-		RequestedModel: "m1", InputEstimate: 9})
+	req := h.mustAdmit(AdmitInput{ID: "r1", TraceID: "t1", KeyID: key.ID,
+		RequestedModel: "m1"})
 	h.mustUsage(usageFor("u1", req, "m1", tokens(9, 0, 0, 0, 0)))
 	h.mustComplete(Completion{ID: req.ID, TraceID: req.TraceID, Outcome: OutcomeSucceeded})
 	if got := h.request(req.ID); got.State != stateSettled {
 		t.Fatalf("state = %q, want settled", got.State)
 	}
 	spent := h.key(key.ID).SpentMicroUSD
-	if k := h.key(key.ID); k.HeldMicroUSD != 0 {
-		t.Fatalf("held = %d, want released", k.HeldMicroUSD)
-	}
-	var initial int64
-	if err := h.store.db.QueryRow(`SELECT initial_hold_micro_usd FROM requests WHERE id = ?`, req.ID).Scan(&initial); err != nil {
-		t.Fatalf("read initial hold: %v", err)
-	}
-	if initial != 9 {
-		t.Fatalf("initial hold = %d, want 9", initial)
-	}
 
 	late := usageFor("u2", req, "m1", Tokens{})
 	late.Quality = QualityUnknown
@@ -1266,18 +1242,15 @@ func TestLateUnaccountedExecutionReopensSettledRequest(t *testing.T) {
 	if got.State != statePending {
 		t.Fatalf("state = %q, want pending after a late unaccounted execution", got.State)
 	}
-	if got.HeldMicroUSD != 9 {
-		t.Fatalf("held = %d, want the pre-authorization restored", got.HeldMicroUSD)
+	if k := h.key(key.ID); k.SpentMicroUSD != spent {
+		t.Fatalf("reopening moved money: %+v, want spent %d", k, spent)
 	}
-	if k := h.key(key.ID); k.HeldMicroUSD != 9 || k.SpentMicroUSD != spent {
-		t.Fatalf("key after reopen = %+v, want held 9 and spent %d", k, spent)
-	}
-	// A second unknown event must not restore the hold twice.
+	// A second unknown event is idempotent and moves nothing.
 	second := usageFor("u3", req, "m1", Tokens{})
 	second.Quality = QualityUnknown
 	h.mustUsage(second)
-	if k := h.key(key.ID); k.HeldMicroUSD != 9 {
-		t.Fatalf("held = %d, want 9 after a second unknown event", k.HeldMicroUSD)
+	if k := h.key(key.ID); k.SpentMicroUSD != spent {
+		t.Fatalf("second unknown event moved money: %+v, want spent %d", k, spent)
 	}
 	// Only an administrator can close it again.
 	if has, err := h.store.HasActive(ctx); err != nil || has {
@@ -1287,20 +1260,20 @@ func TestLateUnaccountedExecutionReopensSettledRequest(t *testing.T) {
 		Reason: "unaccounted execution"}); err != nil {
 		t.Fatalf("resolve: %v", err)
 	}
-	if k := h.key(key.ID); k.HeldMicroUSD != 0 || k.SpentMicroUSD != spent+30 {
-		t.Fatalf("after resolution = %+v, want held 0 and spent %d", k, spent+30)
+	if k := h.key(key.ID); k.SpentMicroUSD != spent+30 {
+		t.Fatalf("after resolution = %+v, want spent %d", k, spent+30)
 	}
 
 	// A late known execution is charged without reopening anything, and a
 	// manually resolved request is never reopened behind the administrator.
-	lateKnown := h.mustReserve(ReserveInput{ID: "r2", TraceID: "t2", KeyID: key.ID,
-		RequestedModel: "m1", InputEstimate: 4})
+	lateKnown := h.mustAdmit(AdmitInput{ID: "r2", TraceID: "t2", KeyID: key.ID,
+		RequestedModel: "m1"})
 	h.mustUsage(usageFor("u4", lateKnown, "m1", tokens(4, 0, 0, 0, 0)))
 	if k := h.key(key.ID); k.SpentMicroUSD != spent+30+4 {
 		t.Fatalf("late known execution was not charged: %+v", k)
 	}
-	manual := h.mustReserve(ReserveInput{ID: "r3", TraceID: "t3", KeyID: key.ID,
-		RequestedModel: "m1", InputEstimate: 6})
+	manual := h.mustAdmit(AdmitInput{ID: "r3", TraceID: "t3", KeyID: key.ID,
+		RequestedModel: "m1"})
 	h.mustComplete(Completion{ID: manual.ID, TraceID: manual.TraceID, Outcome: OutcomeFailed, StatusCode: 502})
 	if err := h.store.Resolve(ctx, manual.ID, Resolution{Action: ActionCharge, AmountMicroUSD: 11, Reason: "manual"}); err != nil {
 		t.Fatalf("resolve manual: %v", err)
@@ -1309,13 +1282,12 @@ func TestLateUnaccountedExecutionReopensSettledRequest(t *testing.T) {
 	unknownForManual := usageFor("u5", manual, "m1", Tokens{})
 	unknownForManual.Quality = QualityUnknown
 	h.mustUsage(unknownForManual)
-	if got := h.request(manual.ID); got.State != stateSettled || got.HeldMicroUSD != 0 {
+	if got := h.request(manual.ID); got.State != stateSettled {
 		t.Fatalf("manual resolution was reopened: %+v", got)
 	}
-	// The active r2 still owns its own hold; only the manual request must not
-	// have come back to life.
-	if k := h.key(key.ID); k.HeldMicroUSD != 4 || k.SpentMicroUSD != afterManual {
-		t.Fatalf("manual resolution changed the ledger: %+v, want held 4 and spent %d", k, afterManual)
+	// Only the manual request must not have come back to life.
+	if k := h.key(key.ID); k.SpentMicroUSD != afterManual {
+		t.Fatalf("manual resolution changed the ledger: %+v, want spent %d", k, afterManual)
 	}
 }
 
@@ -1327,17 +1299,14 @@ func TestFailedExecutionDoesNotProveSuccess(t *testing.T) {
 	h.mustPrice("m1", Rates{Input: million})
 	key, _ := h.mustKey(KeySpec{Enabled: true})
 
-	req := h.mustReserve(ReserveInput{ID: "r1", TraceID: "t1", KeyID: key.ID,
-		RequestedModel: "m1", InputEstimate: 10})
+	req := h.mustAdmit(AdmitInput{ID: "r1", TraceID: "t1", KeyID: key.ID,
+		RequestedModel: "m1"})
 	failed := usageFor("u1", req, "m1", tokens(10, 0, 0, 0, 0))
 	failed.Failed = true
 	h.mustUsage(failed)
 	h.mustComplete(Completion{ID: req.ID, TraceID: req.TraceID, Outcome: OutcomeSucceeded})
 	if got := h.request(req.ID); got.State != statePending {
 		t.Fatalf("state = %q, want pending: a failed execution cannot prove success", got.State)
-	}
-	if k := h.key(key.ID); k.HeldMicroUSD != 10 {
-		t.Fatalf("held = %d, want the hold retained", k.HeldMicroUSD)
 	}
 	// A reliable successful execution then closes it.
 	h.mustUsage(usageFor("u2", req, "m1", tokens(10, 0, 0, 0, 0)))
@@ -1346,8 +1315,8 @@ func TestFailedExecutionDoesNotProveSuccess(t *testing.T) {
 	}
 
 	// A failed lifecycle with accounted executions is already terminal.
-	other := h.mustReserve(ReserveInput{ID: "r2", TraceID: "t2", KeyID: key.ID,
-		RequestedModel: "m1", InputEstimate: 10})
+	other := h.mustAdmit(AdmitInput{ID: "r2", TraceID: "t2", KeyID: key.ID,
+		RequestedModel: "m1"})
 	broken := usageFor("u3", other, "m1", tokens(10, 0, 0, 0, 0))
 	broken.Failed = true
 	h.mustUsage(broken)
@@ -1362,8 +1331,8 @@ func TestFailedExecutionDoesNotProveSuccess(t *testing.T) {
 func TestUsageReplayWithoutTimestamp(t *testing.T) {
 	h, key := billingHarness(t)
 	ctx := h.ctx()
-	req := h.mustReserve(ReserveInput{ID: "r1", TraceID: "t1", KeyID: key.ID,
-		RequestedModel: "m1", InputEstimate: 10})
+	req := h.mustAdmit(AdmitInput{ID: "r1", TraceID: "t1", KeyID: key.ID,
+		RequestedModel: "m1"})
 
 	first := usageFor("u1", req, "m1", tokens(10, 0, 0, 0, 0))
 	if !first.At.IsZero() {
@@ -1400,8 +1369,8 @@ func TestCompletionAfterManualResolveKeepsRecordedOutcome(t *testing.T) {
 	h.mustPrice("m1", Rates{Input: million})
 	key, _ := h.mustKey(KeySpec{Enabled: true})
 	ctx := h.ctx()
-	req := h.mustReserve(ReserveInput{ID: "r1", TraceID: "t1", KeyID: key.ID,
-		RequestedModel: "m1", InputEstimate: 5})
+	req := h.mustAdmit(AdmitInput{ID: "r1", TraceID: "t1", KeyID: key.ID,
+		RequestedModel: "m1"})
 
 	h.mustComplete(Completion{ID: req.ID, TraceID: req.TraceID, Outcome: OutcomeFailed, StatusCode: 502})
 	// An unresolved request repeats its outcome idempotently.
@@ -1433,7 +1402,7 @@ func TestCompletionAfterManualResolveKeepsRecordedOutcome(t *testing.T) {
 	if got.State != stateSettled || got.Outcome != OutcomeFailed {
 		t.Fatalf("request = %+v, want the recorded failure kept", got)
 	}
-	if k := h.key(key.ID); k.HeldMicroUSD != 0 || k.SpentMicroUSD != 0 {
+	if k := h.key(key.ID); k.SpentMicroUSD != 0 {
 		t.Fatalf("money changed: %+v", k)
 	}
 }

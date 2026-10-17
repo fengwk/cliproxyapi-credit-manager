@@ -70,12 +70,12 @@ func (h *harness) mustPrice(model string, rates Rates) {
 	}
 }
 
-func (h *harness) mustReserve(in ReserveInput) Request {
+func (h *harness) mustAdmit(in AdmitInput) Request {
 	h.t.Helper()
 	if in.At.IsZero() {
 		in.At = h.clock.now()
 	}
-	req, err := h.store.Reserve(h.ctx(), in)
+	req, err := h.store.Admit(h.ctx(), in)
 	if err != nil {
 		h.t.Fatalf("reserve %s: %v", in.ID, err)
 	}
@@ -130,8 +130,7 @@ func (h *harness) report(keyID string) Report {
 		From:     testEpoch.AddDate(-1, 0, 0),
 		To:       h.clock.now().Add(time.Hour),
 		Page:     1,
-		PageSize: 200,
-	})
+		PageSize: 200})
 	if err != nil {
 		h.t.Fatalf("report: %v", err)
 	}
@@ -145,8 +144,7 @@ func tokens(in, cr, cw, out, reasoning int64) Tokens {
 		CacheWrite: cw,
 		Output:     out,
 		Reasoning:  reasoning,
-		Total:      in + cr + cw + out + reasoning,
-	}
+		Total:      in + cr + cw + out + reasoning}
 }
 
 // usageFor builds a plausible complete execution event.
@@ -161,8 +159,7 @@ func usageFor(id string, req Request, model string, tk Tokens) Usage {
 		Model:     model,
 		Raw:       pluginapi.UsageDetail{InputTokens: tk.Input, OutputTokens: tk.Output, TotalTokens: tk.Total},
 		Tokens:    tk,
-		Quality:   QualityComplete,
-	}
+		Quality:   QualityComplete}
 }
 
 func TestOpenCreatesDatabaseAndPepper(t *testing.T) {
@@ -207,14 +204,13 @@ func TestOpenCreatesDatabaseAndPepper(t *testing.T) {
 	}
 }
 
-// TestRestartMarksActivePending verifies a restart neither frees holds nor
+// TestRestartMarksActivePending verifies a restart neither invents a charge nor
 // silently settles interrupted executions.
 func TestRestartMarksActivePending(t *testing.T) {
 	h := newHarness(t)
 	h.mustPrice("m1", Rates{Input: 1_000_000, Output: 2_000_000})
 	key, _ := h.mustKey(KeySpec{Enabled: true})
-	h.mustReserve(ReserveInput{ID: "req-1", TraceID: "trace-1", KeyID: key.ID, RequestedModel: "m1",
-		InputEstimate: 100, OutputEstimate: 100})
+	h.mustAdmit(AdmitInput{ID: "req-1", TraceID: "trace-1", KeyID: key.ID, RequestedModel: "m1"})
 
 	if err := h.store.Close(); err != nil {
 		t.Fatalf("close: %v", err)
@@ -244,12 +240,11 @@ func TestRestartMarksActivePending(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get key: %v", err)
 	}
-	// The hold survives a restart; interrupted work is never free.
-	if k.HeldMicroUSD != req.HeldMicroUSD || k.HeldMicroUSD == 0 {
-		t.Fatalf("held after restart = %d, request hold = %d", k.HeldMicroUSD, req.HeldMicroUSD)
-	}
-	if k.SpentMicroUSD != 0 {
-		t.Fatalf("spent after restart = %d, want 0", k.SpentMicroUSD)
+	// Admission never held money and a restart must not invent any: the
+	// interrupted request stays pending with an untouched ledger.
+	if k.SpentMicroUSD != 0 || k.QuotaUsedMicroUSD != 0 {
+		t.Fatalf("ledger after restart = spent %d effective %d, want 0/0",
+			k.SpentMicroUSD, k.QuotaUsedMicroUSD)
 	}
 	// A late usage can still close the restarted request.
 	h2 := &harness{t: t, clock: h.clock, store: reopened, dir: h.dir}
@@ -378,9 +373,7 @@ func TestListKeysIncludesLimits(t *testing.T) {
 		Enabled:       true,
 		AllowedModels: []string{"m1"},
 		ModelTokenLimits: []ModelTokenLimit{
-			{Model: "m1", Total: 1000, Daily: 10},
-		},
-	})
+			{Model: "m1", Total: 1000, Daily: 10}}})
 	keys, err := h.store.ListKeys(h.ctx())
 	if err != nil {
 		t.Fatalf("list keys: %v", err)
@@ -405,8 +398,7 @@ func TestNormalizeSpecRejectsInvalid(t *testing.T) {
 		{MaxConcurrent: -1},
 		{AllowedModels: []string{"*"}},
 		{ModelTokenLimits: []ModelTokenLimit{{Model: "m", Total: -5}}},
-		{ModelTokenLimits: []ModelTokenLimit{{Model: "m"}, {Model: "m"}}},
-	}
+		{ModelTokenLimits: []ModelTokenLimit{{Model: "m"}, {Model: "m"}}}}
 	for i, spec := range cases {
 		if _, err := normalizeSpec(spec); !errors.Is(err, ErrInvalid) {
 			t.Fatalf("case %d err = %v, want ErrInvalid", i, err)
@@ -539,8 +531,7 @@ var callerScopeVectors = []struct {
 	scope     string
 }{
 	{"cmk:11111111-2222-4333-8444-555555555555", "0924e47f31032f9fe4db5e1962c74e5dce602db2a9bc0cc7ce21c5b3937a8e64"},
-	{"cmk:abcdefab-1234-4567-89ab-cdefabcdefab", "4ea269ea8219a15517aa8eaed744ed8dc2db213a21588efa1eea9c94d45bb40a"},
-}
+	{"cmk:abcdefab-1234-4567-89ab-cdefabcdefab", "4ea269ea8219a15517aa8eaed744ed8dc2db213a21588efa1eea9c94d45bb40a"}}
 
 // TestCallerScopeMatchesHostContract verifies the scope against external
 // vectors so a local mistake cannot be masked by using the same code twice.
@@ -693,8 +684,7 @@ func TestKeyMaterialValidationMatrix(t *testing.T) {
 		{"delete", "1234\x7f5678"},
 		{"invalid utf8", "1234\xff5678"},
 		{"blank", "   "},
-		{"whitespace only", "\t\n"},
-	}
+		{"whitespace only", "\t\n"}}
 	// validMaterials keeps the boundary values (minimum and maximum length)
 	// while staying unique per phase, because rotating onto material that is
 	// already registered is a conflict.
@@ -704,8 +694,7 @@ func TestKeyMaterialValidationMatrix(t *testing.T) {
 			"sk-" + strings.Repeat("A", materialMaxLen-3-len(tag)) + tag,
 			"密钥-" + tag + "-abcdefgh",
 			"material " + tag + " with inner spaces",
-			"sk-" + tag + "_base32_LIKE_but_charset_is_free",
-		}
+			"sk-" + tag + "_base32_LIKE_but_charset_is_free"}
 	}
 	valid := validMaterials("c")
 	h := newHarness(t)

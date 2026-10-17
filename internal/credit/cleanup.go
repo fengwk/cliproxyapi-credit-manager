@@ -188,8 +188,7 @@ func placeholders(n int) string {
 // cleanupBatch removes one bounded batch of expired settled history and returns
 // how many requests actually disappeared. Selection and deletion share a single
 // write transaction: with a separate read a late unaccounted execution could
-// reopen a settled request in between, and deleting its row would leave the
-// hold it just restored dangling in the key ledger.
+// reopen a settled request in between and the deletion would race with it.
 func (s *Store) cleanupBatch(ctx context.Context, cutoff time.Time) (int64, error) {
 	var deleted int64
 	err := s.inTx(ctx, func(tx *sql.Tx) error {
@@ -236,8 +235,7 @@ func expiredRequestIDs(ctx context.Context, q querier, cutoff time.Time) ([]stri
 // deleteHistory removes the history of the given candidates, but only for the
 // requests that are still settled and still past the retention window. The
 // check runs inside the same write transaction as the delete, so a request that
-// was reopened by a late execution keeps its row, its executions and the hold
-// that was restored with it.
+// was reopened by a late execution keeps its row and its executions.
 func deleteHistory(ctx context.Context, tx *sql.Tx, ids []string, cutoff time.Time) (int64, error) {
 	args := make([]any, 0, len(ids)+2)
 	for _, id := range ids {

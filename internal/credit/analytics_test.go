@@ -91,7 +91,7 @@ func buildOverviewDataset(t *testing.T, h *harness) (k1, k2 Key) {
 
 	// r1: one client model, two executions, one under a provider alias.
 	h.clock.set(testEpoch)
-	r1 := h.mustReserve(ReserveInput{ID: "r1", TraceID: "t1", KeyID: k1.ID, RequestedModel: "m1", InputEstimate: 1})
+	r1 := h.mustAdmit(AdmitInput{ID: "r1", TraceID: "t1", KeyID: k1.ID, RequestedModel: "m1"})
 	alias := usageFor("u1a", r1, "m1-fallback-alias", tokens(10, 0, 0, 5, 0))
 	alias.LatencyMS, alias.TTFTMS = 1000, 100
 	h.mustUsage(alias)
@@ -102,7 +102,7 @@ func buildOverviewDataset(t *testing.T, h *harness) (k1, k2 Key) {
 
 	// r2: a second model on another provider, with cache read and reasoning.
 	h.clock.set(testEpoch.Add(time.Hour))
-	r2 := h.mustReserve(ReserveInput{ID: "r2", TraceID: "t2", KeyID: k2.ID, RequestedModel: "m2", InputEstimate: 1})
+	r2 := h.mustAdmit(AdmitInput{ID: "r2", TraceID: "t2", KeyID: k2.ID, RequestedModel: "m2"})
 	second := usageFor("u2", r2, "m2", tokens(50, 10, 0, 20, 5))
 	second.Provider, second.AuthID = "anthropic", "auth-2"
 	h.mustUsage(second)
@@ -110,17 +110,17 @@ func buildOverviewDataset(t *testing.T, h *harness) (k1, k2 Key) {
 
 	// r3: a proven rejection that never executed.
 	h.clock.set(testEpoch.Add(2 * time.Hour))
-	r3 := h.mustReserve(ReserveInput{ID: "r3", TraceID: "t3", KeyID: k1.ID, RequestedModel: "m1", InputEstimate: 1})
+	r3 := h.mustAdmit(AdmitInput{ID: "r3", TraceID: "t3", KeyID: k1.ID, RequestedModel: "m1"})
 	h.mustComplete(Completion{ID: r3.ID, TraceID: r3.TraceID, Outcome: OutcomeRejected, StatusCode: 403})
 
 	// r4: a completed lifecycle without trustworthy usage stays pending.
 	h.clock.set(testEpoch.Add(3 * time.Hour))
-	r4 := h.mustReserve(ReserveInput{ID: "r4", TraceID: "t4", KeyID: k1.ID, RequestedModel: "m1", InputEstimate: 1})
+	r4 := h.mustAdmit(AdmitInput{ID: "r4", TraceID: "t4", KeyID: k1.ID, RequestedModel: "m1"})
 	h.mustComplete(Completion{ID: r4.ID, TraceID: r4.TraceID, Outcome: OutcomeSucceeded})
 
 	// r5: an administrator charges a request whose usage never arrived.
 	h.clock.set(testEpoch.Add(4 * time.Hour))
-	r5 := h.mustReserve(ReserveInput{ID: "r5", TraceID: "t5", KeyID: k1.ID, RequestedModel: "m1", InputEstimate: 1})
+	r5 := h.mustAdmit(AdmitInput{ID: "r5", TraceID: "t5", KeyID: k1.ID, RequestedModel: "m1"})
 	h.mustComplete(Completion{ID: r5.ID, TraceID: r5.TraceID, Outcome: OutcomeFailed, StatusCode: 502})
 	if err := h.store.Resolve(h.ctx(), r5.ID, Resolution{Action: ActionCharge, AmountMicroUSD: 777, Reason: "provider billed out of band"}); err != nil {
 		t.Fatalf("resolve charge: %v", err)
@@ -254,8 +254,7 @@ func TestAnalyticsFilterParity(t *testing.T) {
 		{"by pending", Filter{Result: statePending}, 1, "m1"},
 		{"by failed", Filter{Result: OutcomeFailed}, 2, "m1"},
 		{"by rejected", Filter{Result: OutcomeRejected}, 1, "m1"},
-		{"by search", Filter{Search: "beta"}, 1, "m2"},
-	}
+		{"by search", Filter{Search: "beta"}, 1, "m2"}}
 	for _, tc := range cases {
 		tc.filter.From, tc.filter.To = from, to
 		overview, err := h.store.Analytics(h.ctx(), tc.filter)
@@ -287,7 +286,7 @@ func TestAnalyticsExecutionlessModelKeepsNullRatios(t *testing.T) {
 	h := newHarness(t)
 	h.mustPrice("m1", Rates{Input: million})
 	key, _ := h.mustKey(KeySpec{Enabled: true})
-	h.mustReserve(ReserveInput{ID: "r1", TraceID: "t1", KeyID: key.ID, RequestedModel: "m1"})
+	h.mustAdmit(AdmitInput{ID: "r1", TraceID: "t1", KeyID: key.ID, RequestedModel: "m1"})
 	from, to := testEpoch.AddDate(0, 0, -1), testEpoch.AddDate(0, 0, 1)
 
 	overview, err := h.store.Analytics(h.ctx(), Filter{From: from, To: to})
@@ -317,7 +316,7 @@ func TestAnalyticsLatencySamplesAndOutputTokens(t *testing.T) {
 	h := newHarness(t)
 	h.mustPrice("m1", Rates{Input: million, Output: million})
 	key, _ := h.mustKey(KeySpec{Enabled: true})
-	req := h.mustReserve(ReserveInput{ID: "r1", TraceID: "t1", KeyID: key.ID, RequestedModel: "m1"})
+	req := h.mustAdmit(AdmitInput{ID: "r1", TraceID: "t1", KeyID: key.ID, RequestedModel: "m1"})
 	// Three executions: one measured, two unmeasured. The mean must be the
 	// single measurement, not a diluted 3000/3.
 	measured := usageFor("u1", req, "m1", tokens(1, 0, 0, 4, 6))
@@ -372,7 +371,7 @@ func TestAnalyticsRandomizedInvariants(t *testing.T) {
 		key := keys[rng.Intn(len(keys))]
 		at := testEpoch.Add(time.Duration(rng.Intn(72)) * time.Hour)
 		h.clock.set(at)
-		req := h.mustReserve(ReserveInput{ID: id, TraceID: "t-" + id, KeyID: key.ID, RequestedModel: model, InputEstimate: 1, At: at})
+		req := h.mustAdmit(AdmitInput{ID: id, TraceID: "t-" + id, KeyID: key.ID, RequestedModel: model, At: at})
 		for j := 0; j < rng.Intn(3); j++ {
 			alias := model
 			if rng.Intn(3) == 0 {
@@ -454,7 +453,7 @@ func TestAnalyticsOverflowFailsNotCorrupts(t *testing.T) {
 	h := newHarness(t)
 	h.mustPrice("m1", Rates{Input: million})
 	key, _ := h.mustKey(KeySpec{Enabled: true})
-	req := h.mustReserve(ReserveInput{ID: "ovf", TraceID: "t-ovf", KeyID: key.ID, RequestedModel: "m1"})
+	req := h.mustAdmit(AdmitInput{ID: "ovf", TraceID: "t-ovf", KeyID: key.ID, RequestedModel: "m1"})
 
 	// Insert executions whose per-row counters fit int64 but whose sum does
 	// not, bypassing the validating writer to model a legacy row set.
@@ -483,7 +482,7 @@ func TestAnalyticsJSONShape(t *testing.T) {
 	h := newHarness(t)
 	h.mustPrice("m1", Rates{Input: million})
 	key, _ := h.mustKey(KeySpec{Enabled: true})
-	req := h.mustReserve(ReserveInput{ID: "r1", TraceID: "t1", KeyID: key.ID, RequestedModel: "m1"})
+	req := h.mustAdmit(AdmitInput{ID: "r1", TraceID: "t1", KeyID: key.ID, RequestedModel: "m1"})
 	h.mustUsage(usageFor("u1", req, "m1", tokens(3, 0, 0, 4, 1)))
 	h.mustComplete(Completion{ID: req.ID, TraceID: req.TraceID, Outcome: OutcomeSucceeded})
 

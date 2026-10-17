@@ -17,7 +17,7 @@ func TestFinancialManagementAuditIsTransactional(t *testing.T) {
 	if err := h.store.PutPricingRule(ctx, rule); err != nil {
 		t.Fatal(err)
 	}
-	req := h.mustReserve(ReserveInput{ID: "pending", TraceID: "trace", KeyID: key.ID, RequestedModel: "m", InputEstimate: 5})
+	req := h.mustAdmit(AdmitInput{ID: "pending", TraceID: "trace", KeyID: key.ID, RequestedModel: "m"})
 	h.mustComplete(Completion{ID: req.ID, Outcome: OutcomeSucceeded})
 	for _, action := range []string{ActionPriceUpdate, ActionRuleUpdate, ActionRuleDelete, ActionResolve} {
 		t.Run(action, func(t *testing.T) {
@@ -55,7 +55,7 @@ func TestFinancialManagementAuditIsTransactional(t *testing.T) {
 			if err != nil || len(rules) != 1 || rules[0].Price.Rates.Input != 2_000_000 {
 				t.Fatalf("failed audit changed rule: %+v %v", rules, err)
 			}
-			if got := h.key(key.ID); got.SpentMicroUSD != 0 || got.HeldMicroUSD != 10 {
+			if got := h.key(key.ID); got.SpentMicroUSD != 0 || got.QuotaUsedMicroUSD != 0 {
 				t.Fatalf("failed audit changed ledger: %+v", got)
 			}
 			if h.request(req.ID).State != statePending || h.report(key.ID).Summary.AdjustmentMicroUSD != 0 {
@@ -85,7 +85,7 @@ func TestModelEfficiencyPairsOutputWithMeasuredLatency(t *testing.T) {
 	h := newHarness(t)
 	key, _ := h.mustKey(KeySpec{Enabled: true})
 	h.mustPrice("m", Rates{Output: 1_000_000})
-	req := h.mustReserve(ReserveInput{ID: "r", TraceID: "t", KeyID: key.ID, RequestedModel: "m"})
+	req := h.mustAdmit(AdmitInput{ID: "r", TraceID: "t", KeyID: key.ID, RequestedModel: "m"})
 	measured := usageFor("measured", req, "alias", tokens(0, 0, 0, 20, 0))
 	measured.LatencyMS, measured.TTFTMS = 1000, 12
 	h.mustUsage(measured)
@@ -111,7 +111,7 @@ func TestCleanupPrunesPeriodResetBaselinesNotLifetime(t *testing.T) {
 	h := newHarness(t)
 	key, _ := h.mustKey(KeySpec{Enabled: true})
 	h.mustPrice("m", Rates{Input: 1_000_000})
-	req := h.mustReserve(ReserveInput{ID: "r", TraceID: "t", KeyID: key.ID, RequestedModel: "m"})
+	req := h.mustAdmit(AdmitInput{ID: "r", TraceID: "t", KeyID: key.ID, RequestedModel: "m"})
 	h.mustUsage(usageFor("u", req, "m", tokens(10, 0, 0, 0, 0)))
 	h.mustComplete(Completion{ID: req.ID, Outcome: OutcomeSucceeded})
 	_, err := h.store.ResetSpend(h.ctx(), ResetSpec{KeyID: key.ID, Total: true, Daily: true, Weekly: true, Monthly: true, Reason: "new allocation"})

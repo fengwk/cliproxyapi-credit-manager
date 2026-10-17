@@ -21,10 +21,9 @@ var (
 )
 
 type Options struct {
-	DataDir            string
-	RetentionMonths    int
-	MaxPendingRequests int
-	Now                func() time.Time
+	DataDir         string
+	RetentionMonths int
+	Now             func() time.Time
 }
 
 type KeySpec struct {
@@ -61,7 +60,6 @@ type Key struct {
 	// SpentMicroUSD is the raw, durable lifetime charge. It is never reduced by
 	// a quota reset so existing consumers keep observing the true ledger total.
 	SpentMicroUSD int64 `json:"spent_micro_usd"`
-	HeldMicroUSD  int64 `json:"held_micro_usd"`
 	// QuotaUsedMicroUSD is the effective lifetime usage: it subtracts the
 	// operator reset baseline from SpentMicroUSD and is what quota admission
 	// enforces. The per period fields are the same view for day/week/month.
@@ -125,13 +123,15 @@ type Tokens struct {
 	Total      int64 `json:"total"`
 }
 
-type ReserveInput struct {
+// AdmitInput carries the facts an admission needs to authenticate the key,
+// freeze the effective price and persist the request/key/trace correlation
+// before execution starts. It carries no amount or token estimates: admission
+// only checks already-consumed effective usage.
+type AdmitInput struct {
 	ID             string
 	TraceID        string
 	KeyID          string
 	RequestedModel string
-	InputEstimate  int64
-	OutputEstimate int64
 	// ServiceTier is the pricing key read from the request body (for example
 	// "priority"). It is normalized before matching; empty means no service
 	// tier and selects context tiers only.
@@ -173,15 +173,14 @@ type Usage struct {
 }
 
 type Request struct {
-	ID           string     `json:"id"`
-	TraceID      string     `json:"trace_id"`
-	KeyID        string     `json:"key_id"`
-	Model        string     `json:"model"`
-	Outcome      string     `json:"outcome"`
-	State        string     `json:"state"`
-	StartedAt    time.Time  `json:"started_at"`
-	CompletedAt  *time.Time `json:"completed_at,omitempty"`
-	HeldMicroUSD int64      `json:"held_micro_usd"`
+	ID          string     `json:"id"`
+	TraceID     string     `json:"trace_id"`
+	KeyID       string     `json:"key_id"`
+	Model       string     `json:"model"`
+	Outcome     string     `json:"outcome"`
+	State       string     `json:"state"`
+	StartedAt   time.Time  `json:"started_at"`
+	CompletedAt *time.Time `json:"completed_at,omitempty"`
 	// AdjustmentMicroUSD totals manual Resolve charges booked against this
 	// request. It is reported next to the execution cost, never inside it, so
 	// manual ledger entries are neither hidden nor double counted.
@@ -276,7 +275,7 @@ type Backend interface {
 	KeyByPrincipal(context.Context, string) (Key, error)
 	ListPrices(context.Context) ([]Price, error)
 	PutPrice(context.Context, Price) error
-	Reserve(context.Context, ReserveInput) (Request, error)
+	Admit(context.Context, AdmitInput) (Request, error)
 	RecordUsage(context.Context, Usage) error
 	Complete(context.Context, Completion) error
 	Resolve(context.Context, string, Resolution) error

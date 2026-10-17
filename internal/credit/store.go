@@ -17,9 +17,9 @@ import (
 // Lifecycle vocabulary stored in the database. It is part of the internal
 // contract shared with the plugin adapter, not with the database file.
 const (
-	stateActive  = "active"  // execution in flight, holds money and a concurrency slot
+	stateActive  = "active"  // execution in flight, occupies a concurrency slot
 	statePending = "pending" // execution finished/restarted but accounting is unresolved
-	stateSettled = "settled" // closed: hold released, known costs charged
+	stateSettled = "settled" // closed: known costs charged, no obligation left
 
 	OutcomeSucceeded = "succeeded"
 	OutcomeFailed    = "failed"
@@ -47,10 +47,6 @@ const (
 	resolvedAuto = "auto"
 )
 
-// ErrPending reports that a key has too many unresolved requests to admit more.
-// It is additive to the shared error set in types.go.
-var ErrPending = errors.New("too many unresolved requests")
-
 // ErrLocked reports that another process already owns the data directory.
 var ErrLocked = errors.New("data directory is locked")
 
@@ -60,12 +56,15 @@ const (
 	pepperFileName         = "pepper"
 	lockFileName           = "lock"
 	defaultRetentionMonths = 3
-	defaultMaxPending      = 16
 	pepperLen              = 32
 	microPerUnit           = 1_000_000 // rates are microUSD per million tokens
 	cleanupBatch           = 512
 	vacuumPages            = 4096
 	maxPageSize            = 500
+	// schemaVersion is the current on-disk schema marker. Version 2 removed the
+	// estimated admission columns (estimates and money holds); a store carrying
+	// it has no hold/estimate state left.
+	schemaVersion = 2
 )
 
 const schemaDDL = `
@@ -89,8 +88,7 @@ CREATE TABLE IF NOT EXISTS keys (
   allowed_models TEXT NOT NULL DEFAULT '[]',
   expires_at INTEGER,
   created_at INTEGER NOT NULL,
-  spent_micro_usd INTEGER NOT NULL DEFAULT 0,
-  held_micro_usd INTEGER NOT NULL DEFAULT 0
+  spent_micro_usd INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS model_token_limits (
   key_id TEXT NOT NULL,
@@ -120,17 +118,14 @@ CREATE TABLE IF NOT EXISTS requests (
   status_code INTEGER NOT NULL DEFAULT 0,
   started_at INTEGER NOT NULL,
   completed_at INTEGER,
-  held_micro_usd INTEGER NOT NULL,
   price_input INTEGER NOT NULL,
   price_output INTEGER NOT NULL,
   price_reasoning INTEGER,
   price_cache_read INTEGER NOT NULL,
   price_cache_write INTEGER NOT NULL,
   price_version INTEGER NOT NULL,
-  token_estimate INTEGER NOT NULL DEFAULT 0,
   charge_micro_usd INTEGER NOT NULL DEFAULT 0,
-  resolved TEXT NOT NULL DEFAULT '',
-  initial_hold_micro_usd INTEGER NOT NULL DEFAULT 0
+  resolved TEXT NOT NULL DEFAULT ''
 );
 CREATE UNIQUE INDEX IF NOT EXISTS requests_trace ON requests(trace_id);
 CREATE INDEX IF NOT EXISTS requests_key_state ON requests(key_id, state);
@@ -213,7 +208,6 @@ type Store struct {
 	pepper          []byte
 	now             func() time.Time
 	retentionMonths int
-	maxPending      int
 }
 
 var _ Backend = (*Store)(nil)
@@ -296,16 +290,12 @@ func Open(opts Options) (*Store, error) {
 		pepper:          pepper,
 		now:             opts.Now,
 		retentionMonths: opts.RetentionMonths,
-		maxPending:      opts.MaxPendingRequests,
 	}
 	if s.now == nil {
 		s.now = time.Now
 	}
 	if s.retentionMonths <= 0 {
 		s.retentionMonths = defaultRetentionMonths
-	}
-	if s.maxPending <= 0 {
-		s.maxPending = defaultMaxPending
 	}
 	ctx := context.Background()
 	fail := func(err error) (*Store, error) {
@@ -413,15 +403,23 @@ func (s *Store) migrate(ctx context.Context) error {
 		if err := migratePricingFeatures(ctx, tx); err != nil {
 			return err
 		}
+		if err := migratePostpaidSchema(ctx, tx); err != nil {
+			return err
+		}
+		// The marker is stamped last so an interrupted migration never claims a
+		// schema the store does not actually carry. It is upserted because a
+		// legacy store already carries version 1.
 		_, err := tx.ExecContext(ctx,
-			`INSERT INTO meta(k, v) VALUES('schema_version', ?) ON CONFLICT(k) DO NOTHING`,
-			fmt.Sprint(1))
+			`INSERT INTO meta(k, v) VALUES('schema_version', ?)
+			 ON CONFLICT(k) DO UPDATE SET v = excluded.v`,
+			fmt.Sprint(schemaVersion))
 		return err
 	})
 }
 
 // recoverExecutions converts executions interrupted by a restart into pending
-// requests: concurrency is released, holds are preserved.
+// requests so their accounting stays visible. Concurrency is released; no money
+// is moved because admission never held any.
 func (s *Store) recoverExecutions(ctx context.Context) error {
 	return s.inTx(ctx, func(tx *sql.Tx) error {
 		_, err := tx.ExecContext(ctx,

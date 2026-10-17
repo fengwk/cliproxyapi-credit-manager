@@ -16,13 +16,13 @@ func TestLookupRequestReturnsOwnRequest(t *testing.T) {
 	other, _ := h.mustKey(KeySpec{Enabled: true})
 	ctx := h.ctx()
 
-	measured := h.mustReserve(ReserveInput{ID: "req-own", TraceID: "trace-own", KeyID: key.ID,
-		RequestedModel: "m1", InputEstimate: 100})
+	measured := h.mustAdmit(AdmitInput{ID: "req-own", TraceID: "trace-own", KeyID: key.ID,
+		RequestedModel: "m1"})
 	h.mustUsage(usageFor("exec-own", measured, "m1", tokens(100, 0, 0, 0, 0)))
 	h.mustComplete(Completion{ID: measured.ID, TraceID: measured.TraceID, Outcome: OutcomeSucceeded})
 
-	manual := h.mustReserve(ReserveInput{ID: "req-manual", TraceID: "trace-manual", KeyID: key.ID,
-		RequestedModel: "m1", InputEstimate: 500})
+	manual := h.mustAdmit(AdmitInput{ID: "req-manual", TraceID: "trace-manual", KeyID: key.ID,
+		RequestedModel: "m1"})
 	h.mustComplete(Completion{ID: manual.ID, TraceID: manual.TraceID, Outcome: OutcomeFailed, StatusCode: 502})
 	if err := h.store.Resolve(ctx, manual.ID, Resolution{Action: ActionCharge,
 		AmountMicroUSD: 777, Reason: "provider billed out of band"}); err != nil {
@@ -59,8 +59,7 @@ func TestLookupRequestReturnsOwnRequest(t *testing.T) {
 		request string
 	}{
 		{"foreign-key", other.ID, measured.ID},
-		{"unknown-request", key.ID, "req-missing"},
-	} {
+		{"unknown-request", key.ID, "req-missing"}} {
 		t.Run(tc.name, func(t *testing.T) {
 			if _, err := h.store.LookupRequest(ctx, tc.keyID, tc.request); !errors.Is(err, ErrNotFound) {
 				t.Fatalf("lookup err = %v, want ErrNotFound", err)

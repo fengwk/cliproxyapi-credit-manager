@@ -33,7 +33,7 @@ func TestPricingRuleScanKeepsCanonicalModel(t *testing.T) {
 // the request, which is what the operator sees as the price that will be used.
 func (h *harness) reserveRate(id, trace, model, keyID string) int64 {
 	h.t.Helper()
-	return h.mustReserve(ReserveInput{ID: id, TraceID: trace, KeyID: keyID, RequestedModel: model}).Price.Rates.Input
+	return h.mustAdmit(AdmitInput{ID: id, TraceID: trace, KeyID: keyID, RequestedModel: model}).Price.Rates.Input
 }
 
 // TestPricingRuleSelectionOrder pins the documented deterministic order: the
@@ -86,7 +86,7 @@ func TestPricingRuleExactPriceBeatsSamePriorityPattern(t *testing.T) {
 func TestPricingRuleDisabledWinningRuleDenies(t *testing.T) {
 	h, key := billingHarness(t)
 	h.mustRule(PricingRule{ID: "off", MatchKind: MatchGlob, Pattern: "m*", Priority: 10, Enabled: false})
-	_, err := h.store.Reserve(h.ctx(), ReserveInput{ID: "r1", TraceID: "t1", KeyID: key.ID, RequestedModel: "m1"})
+	_, err := h.store.Admit(h.ctx(), AdmitInput{ID: "r1", TraceID: "t1", KeyID: key.ID, RequestedModel: "m1"})
 	if !errors.Is(err, ErrUnpriced) {
 		t.Fatalf("disabled winning rule err = %v, want ErrUnpriced", err)
 	}
@@ -135,8 +135,7 @@ func TestPricingRuleValidation(t *testing.T) {
 			for i := range r.Tiers {
 				r.Tiers[i] = PriceTier{Kind: priceTierContext, Threshold: int64(i + 1)}
 			}
-		}},
-	}
+		}}}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			rule := valid
@@ -196,13 +195,9 @@ func TestPricingRuleSnapshotSurvivesEditAndDelete(t *testing.T) {
 	h, key := billingHarness(t)
 	h.mustRule(PricingRule{ID: "rule", MatchKind: MatchGlob, Pattern: "m*", Priority: 5, Enabled: true,
 		Price: Price{Rates: Rates{Input: million, Output: 2 * million}}})
-	req := h.mustReserve(ReserveInput{ID: "r1", TraceID: "t1", KeyID: key.ID, RequestedModel: "m1",
-		InputEstimate: 10, OutputEstimate: 10})
+	req := h.mustAdmit(AdmitInput{ID: "r1", TraceID: "t1", KeyID: key.ID, RequestedModel: "m1"})
 	if req.Price.Rates.Input != million || req.Price.Rates.Output != 2*million {
 		t.Fatalf("reserved price = %+v", req.Price.Rates)
-	}
-	if req.HeldMicroUSD != 30 {
-		t.Fatalf("hold = %d, want 30", req.HeldMicroUSD)
 	}
 	// Edit the rule to a wildly different price and add a matcher, then delete it.
 	h.mustRule(PricingRule{ID: "rule", MatchKind: MatchGlob, Pattern: "m*", Priority: 5, Enabled: true,
@@ -214,8 +209,8 @@ func TestPricingRuleSnapshotSurvivesEditAndDelete(t *testing.T) {
 	h.mustUsage(usageFor("u1", req, "m1", tokens(10, 0, 0, 5, 0)))
 	h.mustComplete(Completion{ID: req.ID, TraceID: req.TraceID, Outcome: OutcomeSucceeded})
 	key = h.key(key.ID)
-	if key.SpentMicroUSD != 20 || key.HeldMicroUSD != 0 {
-		t.Fatalf("spent=%d held=%d, want the frozen 20 charge", key.SpentMicroUSD, key.HeldMicroUSD)
+	if key.SpentMicroUSD != 20 {
+		t.Fatalf("spent=%d, want the frozen 20 charge", key.SpentMicroUSD)
 	}
 	// A new request now falls back to the exact price book.
 	if got := h.reserveRate("r2", "t2", "m1", key.ID); got != million {
@@ -230,8 +225,7 @@ func TestPricePreviewSelectsTiersAndResolves(t *testing.T) {
 		Price: Price{Rates: Rates{Input: million, Output: 2 * million}},
 		Tiers: []PriceTier{
 			{Kind: priceTierContext, Threshold: 100, Label: "100K", Rates: Rates{Input: 5 * million}},
-			{Kind: priceTierService, Service: "priority", Rates: Rates{Input: 9 * million}},
-		}})
+			{Kind: priceTierService, Service: "priority", Rates: Rates{Input: 9 * million}}}})
 	ctx := h.ctx()
 	got, err := h.store.PreviewPrice(ctx, "m1", "", 150)
 	if err != nil {
@@ -271,17 +265,13 @@ func TestPricePreviewSelectsTiersAndResolves(t *testing.T) {
 func TestPricingRuleFreeModelIsNotMissing(t *testing.T) {
 	h, key := billingHarness(t)
 	h.mustRule(PricingRule{ID: "free", MatchKind: MatchExact, Pattern: "free-model", Priority: 5, Enabled: true})
-	req := h.mustReserve(ReserveInput{ID: "r1", TraceID: "t1", KeyID: key.ID, RequestedModel: "free-model",
-		InputEstimate: 100, OutputEstimate: 100})
-	if req.HeldMicroUSD != 0 {
-		t.Fatalf("free model hold = %d, want 0", req.HeldMicroUSD)
-	}
+	req := h.mustAdmit(AdmitInput{ID: "r1", TraceID: "t1", KeyID: key.ID, RequestedModel: "free-model"})
 	h.mustUsage(usageFor("u1", req, "free-model", tokens(10, 0, 0, 5, 0)))
 	h.mustComplete(Completion{ID: req.ID, TraceID: req.TraceID, Outcome: OutcomeSucceeded})
-	if key = h.key(key.ID); key.SpentMicroUSD != 0 || key.HeldMicroUSD != 0 {
-		t.Fatalf("free model spent=%d held=%d, want 0/0", key.SpentMicroUSD, key.HeldMicroUSD)
+	if key = h.key(key.ID); key.SpentMicroUSD != 0 {
+		t.Fatalf("free model spent=%d, want 0", key.SpentMicroUSD)
 	}
-	if _, err := h.store.Reserve(h.ctx(), ReserveInput{ID: "r2", TraceID: "t2", KeyID: key.ID,
+	if _, err := h.store.Admit(h.ctx(), AdmitInput{ID: "r2", TraceID: "t2", KeyID: key.ID,
 		RequestedModel: "no-such-model"}); !errors.Is(err, ErrUnpriced) {
 		t.Fatalf("missing price err = %v, want ErrUnpriced", err)
 	}

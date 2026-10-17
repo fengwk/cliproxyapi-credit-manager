@@ -314,7 +314,7 @@ func (s *Store) RecordUsage(ctx context.Context, usage Usage) error {
 			return fmt.Errorf("insert usage: %w", err)
 		}
 		if reliable {
-			// Consumed tokens count against admission budgets immediately.
+			// Consumed tokens count against the quota counters immediately.
 			if err := addTokens(ctx, tx, req.keyID, req.model, req.startedAt, tokens.Total); err != nil {
 				return err
 			}
@@ -377,7 +377,7 @@ func (u *usageRow) materialEqual(in Usage) bool {
 }
 
 // Complete records a terminal lifecycle event. Concurrency is released once and
-// the monetary hold is closed only for trustworthy accounting.
+// the request is closed only for trustworthy accounting.
 func (s *Store) Complete(ctx context.Context, c Completion) error {
 	if strings.TrimSpace(c.ID) == "" {
 		return fmt.Errorf("%w: completion id is required", ErrInvalid)
@@ -422,7 +422,7 @@ func (s *Store) Complete(ctx context.Context, c Completion) error {
 			}
 			// An administrator closed this request before its completion
 			// arrived. Record that outcome metadata once, without reopening the
-			// request or touching the released hold.
+			// request.
 			if _, err := tx.ExecContext(ctx, `UPDATE requests SET outcome = ?, status_code = ?,
 				completed_at = ? WHERE id = ?`,
 				c.Outcome, c.StatusCode, unixNano(at), req.id); err != nil {

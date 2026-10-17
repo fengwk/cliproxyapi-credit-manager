@@ -9,23 +9,22 @@ import (
 	"time"
 )
 
-// Reserve admits one execution. It is idempotent by lifecycle ID and persists
-// the trace/key binding before any execution starts.
-func (s *Store) Reserve(ctx context.Context, in ReserveInput) (Request, error) {
+// Admit admits one execution. It is idempotent by lifecycle ID and persists the
+// trace/key binding and frozen price snapshot before any execution starts.
+//
+// Admission is a post-usage gate: it only checks key permissions, the
+// requested-model price and the effective usage already consumed. It never
+// estimates what the request will cost, so a positive remaining quota admits a
+// very large declared output limit or input payload, and concurrent in-flight
+// requests may legitimately exceed a quota.
+func (s *Store) Admit(ctx context.Context, in AdmitInput) (Request, error) {
 	if strings.TrimSpace(in.ID) == "" || strings.TrimSpace(in.TraceID) == "" ||
 		strings.TrimSpace(in.KeyID) == "" || strings.TrimSpace(in.RequestedModel) == "" {
 		return Request{}, fmt.Errorf("%w: id, trace id, key id and requested model are required", ErrInvalid)
 	}
-	if in.InputEstimate < 0 || in.OutputEstimate < 0 {
-		return Request{}, fmt.Errorf("%w: token estimates must not be negative", ErrInvalid)
-	}
-	estimate, err := checkedAdd(in.InputEstimate, in.OutputEstimate)
-	if err != nil {
-		return Request{}, err
-	}
 	at := s.resolveAt(in.At)
 	var out Request
-	err = s.inTx(ctx, func(tx *sql.Tx) error {
+	err := s.inTx(ctx, func(tx *sql.Tx) error {
 		existing, err := loadRequestByID(ctx, tx, in.ID)
 		switch {
 		case err == nil:
@@ -76,20 +75,13 @@ func (s *Store) Reserve(ctx context.Context, in ReserveInput) (Request, error) {
 				return err
 			}
 		}
-		hold, err := holdFor(price, tiers, in, images, estimate)
-		if err != nil {
-			return err
-		}
-		if err := s.checkMoneyLimits(ctx, tx, key, at, hold); err != nil {
+		if err := s.checkMoneyLimits(ctx, tx, key, at); err != nil {
 			return err
 		}
 		if err := s.checkConcurrency(ctx, tx, key); err != nil {
 			return err
 		}
-		if err := s.checkBacklog(ctx, tx, key); err != nil {
-			return err
-		}
-		if err := s.checkTokenLimits(ctx, tx, key, in.RequestedModel, estimate, at); err != nil {
+		if err := s.checkTokenLimits(ctx, tx, key, in.RequestedModel, at); err != nil {
 			return err
 		}
 		snapshot, err := encodePriceSnapshot(priceSnapshot{
@@ -104,30 +96,23 @@ func (s *Store) Reserve(ctx context.Context, in ReserveInput) (Request, error) {
 		}
 		if _, err := tx.ExecContext(ctx, `INSERT INTO requests
 			(id, trace_id, key_id, model, state, outcome, status_code, started_at, completed_at,
-			 held_micro_usd, price_input, price_output, price_reasoning, price_cache_read,
-			 price_cache_write, price_version, token_estimate, charge_micro_usd, resolved,
-			 initial_hold_micro_usd, price_snapshot)
-			VALUES(?,?,?,?,?,'',0,?,NULL,?,?,?,?,?,?,?,?,0,'',?,?)`,
-			in.ID, in.TraceID, in.KeyID, in.RequestedModel, stateActive, unixNano(at), hold,
+			 price_input, price_output, price_reasoning, price_cache_read,
+			 price_cache_write, price_version, charge_micro_usd, resolved, price_snapshot)
+			VALUES(?,?,?,?,?,'',0,?,NULL,?,?,?,?,?,?,0,'',?)`,
+			in.ID, in.TraceID, in.KeyID, in.RequestedModel, stateActive, unixNano(at),
 			price.Rates.Input, price.Rates.Output, price.Rates.Reasoning, price.Rates.CacheRead,
-			price.Rates.CacheWrite, price.Version, estimate, hold, snapshot); err != nil {
+			price.Rates.CacheWrite, price.Version, snapshot); err != nil {
 			return fmt.Errorf("insert request: %w", err)
 		}
-		if hold != 0 {
-			if err := bumpKeyColumn(ctx, tx, key.id, "held_micro_usd", hold); err != nil {
-				return fmt.Errorf("update key hold: %w", err)
-			}
-		}
 		out = Request{
-			ID:           in.ID,
-			TraceID:      in.TraceID,
-			KeyID:        in.KeyID,
-			Model:        in.RequestedModel,
-			State:        stateActive,
-			StartedAt:    at,
-			HeldMicroUSD: hold,
-			Price:        price,
-			Executions:   []Usage{},
+			ID:         in.ID,
+			TraceID:    in.TraceID,
+			KeyID:      in.KeyID,
+			Model:      in.RequestedModel,
+			State:      stateActive,
+			StartedAt:  at,
+			Price:      price,
+			Executions: []Usage{},
 		}
 		return nil
 	})
@@ -137,25 +122,13 @@ func (s *Store) Reserve(ctx context.Context, in ReserveInput) (Request, error) {
 	return out, nil
 }
 
-// holdFor prices the pre-authorization hold of one admission. images is the
-// already-resolved image count of a per-image request.
+// checkMoneyLimits enforces the soft monetary admission limits of a key.
 //
-// A per-image price holds the frozen requested image count. A token price holds
-// the canonical bucket estimates and applies only matching service tiers: the
-// admission estimate is far too coarse to select a context tier, so context
-// tiers are applied at settlement from actual usage instead.
-func holdFor(price Price, tiers []PriceTier, in ReserveInput, images, estimate int64) (int64, error) {
-	if price.IsPerImage() {
-		return perImageCost(price, images)
-	}
-	return tokenCost(price, tiers, Tokens{
-		Input:  in.InputEstimate,
-		Output: in.OutputEstimate,
-		Total:  estimate,
-	}, in.ServiceTier, false)
-}
-
-func (s *Store) checkMoneyLimits(ctx context.Context, tx *sql.Tx, key *keyRow, at time.Time, hold int64) error {
+// Every configured limit > 0 rejects the next request once the actual effective
+// usage has reached it. Effective usage is the durable counter minus the
+// operator reset baseline; no in-flight prediction is added. A key with a
+// positive remaining quota therefore always admits, however large the payload.
+func (s *Store) checkMoneyLimits(ctx context.Context, tx *sql.Tx, key *keyRow, at time.Time) error {
 	// A soft deleted key must never admit new work. This is the single
 	// admission gate for deleted keys: money limits are always evaluated, even
 	// when no monetary limit is configured, before any execution is admitted.
@@ -163,22 +136,11 @@ func (s *Store) checkMoneyLimits(ctx context.Context, tx *sql.Tx, key *keyRow, a
 		return ErrUnauthorized
 	}
 	if quota := key.spec.QuotaMicroUSD; quota > 0 {
-		// Effective usage is the durable lifetime spend minus the operator
-		// reset baseline. A reset therefore clears quota headroom without ever
-		// erasing the true ledger total.
 		effective, err := effectiveMoney(ctx, tx, key.id, windowTotal, periodOf(windowTotal, at), key.spent)
 		if err != nil {
 			return err
 		}
-		committed, err := checkedAdd(effective, key.held)
-		if err != nil {
-			return err
-		}
-		total, err := checkedAdd(committed, hold)
-		if err != nil {
-			return err
-		}
-		if total > quota {
+		if effective >= quota {
 			return fmt.Errorf("%w: lifetime monetary limit reached", ErrQuota)
 		}
 	}
@@ -198,27 +160,11 @@ func (s *Store) checkMoneyLimits(ctx context.Context, tx *sql.Tx, key *keyRow, a
 		if err != nil {
 			return err
 		}
-		spent, err := effectiveMoney(ctx, tx, key.id, l.win, periodOf(l.win, at), raw)
+		effective, err := effectiveMoney(ctx, tx, key.id, l.win, periodOf(l.win, at), raw)
 		if err != nil {
 			return err
 		}
-		// Unresolved requests admitted in this same period still hold budget
-		// that has not been charged yet; without them two concurrent requests
-		// could each pass the check and jointly exceed the limit. A reset never
-		// touches these holds, so late or unknown obligations keep counting.
-		held, err := periodHold(ctx, tx, key.id, l.win, at)
-		if err != nil {
-			return err
-		}
-		total, err := checkedAdd(spent, held)
-		if err != nil {
-			return err
-		}
-		total, err = checkedAdd(total, hold)
-		if err != nil {
-			return err
-		}
-		if total > l.limit {
+		if effective >= l.limit {
 			return fmt.Errorf("%w: %s monetary limit reached", ErrQuota, l.win)
 		}
 	}
@@ -240,24 +186,9 @@ func (s *Store) checkConcurrency(ctx context.Context, tx *sql.Tx, key *keyRow) e
 	return nil
 }
 
-// checkBacklog bounds unresolved requests per key (active + pending), which is
-// what must be reconciled before more work is admitted.
-func (s *Store) checkBacklog(ctx context.Context, tx *sql.Tx, key *keyRow) error {
-	unresolved, err := counterValue(ctx, tx,
-		`SELECT COUNT(*) FROM requests WHERE key_id = ? AND state IN (?,?)`,
-		key.id, stateActive, statePending)
-	if err != nil {
-		return err
-	}
-	if unresolved >= int64(s.maxPending) {
-		return fmt.Errorf("%w: %d unresolved requests for key", ErrPending, unresolved)
-	}
-	return nil
-}
-
-// checkTokenLimits enforces durable model token budgets using consumed tokens
-// plus the admission estimates of unresolved requests.
-func (s *Store) checkTokenLimits(ctx context.Context, tx *sql.Tx, key *keyRow, model string, estimate int64, at time.Time) error {
+// checkTokenLimits enforces the soft model token admission limits of a key
+// against already-consumed effective tokens only.
+func (s *Store) checkTokenLimits(ctx context.Context, tx *sql.Tx, key *keyRow, model string, at time.Time) error {
 	var limit *ModelTokenLimit
 	for i := range key.spec.ModelTokenLimits {
 		if key.spec.ModelTokenLimits[i].Model == model {
@@ -281,32 +212,17 @@ func (s *Store) checkTokenLimits(ctx context.Context, tx *sql.Tx, key *keyRow, m
 		if w.limit <= 0 {
 			continue
 		}
-		// Estimates are period scoped: an unresolved request only occupies the
-		// period it was admitted in, so stale work cannot starve the next one.
-		reserved, err := reservedTokens(ctx, tx, key.id, model, w.win, at)
-		if err != nil {
-			return err
-		}
-		admit, err := checkedAdd(reserved, estimate)
-		if err != nil {
-			return err
-		}
 		used, err := tokenCounter(ctx, tx, key.id, model, w.win, periodOf(w.win, at))
 		if err != nil {
 			return err
 		}
 		// Effective token usage subtracts the operator reset baseline for this
-		// window/period. Reserved estimates of unresolved requests are never
-		// baselined, so a reset cannot forgive an unknown obligation.
+		// window/period, so a reset restores headroom without erasing history.
 		effective, err := effectiveToken(ctx, tx, key.id, model, w.win, periodOf(w.win, at), used)
 		if err != nil {
 			return err
 		}
-		total, err := checkedAdd(effective, admit)
-		if err != nil {
-			return err
-		}
-		if total > w.limit {
+		if effective >= w.limit {
 			return fmt.Errorf("%w: %s token limit reached for model %s", ErrQuota, w.win, model)
 		}
 	}

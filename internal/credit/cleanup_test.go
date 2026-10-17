@@ -17,8 +17,7 @@ func TestRetentionCutoffClampsMonthEnd(t *testing.T) {
 		{time.Date(2026, 5, 31, 10, 0, 0, 0, time.UTC), time.Date(2026, 2, 28, 10, 0, 0, 0, time.UTC)},
 		{time.Date(2024, 5, 31, 10, 0, 0, 0, time.UTC), time.Date(2024, 2, 29, 10, 0, 0, 0, time.UTC)},
 		{time.Date(2026, 3, 31, 0, 0, 0, 0, time.UTC), time.Date(2025, 12, 31, 0, 0, 0, 0, time.UTC)},
-		{time.Date(2026, 1, 15, 8, 30, 0, 0, time.UTC), time.Date(2025, 10, 15, 8, 30, 0, 0, time.UTC)},
-	}
+		{time.Date(2026, 1, 15, 8, 30, 0, 0, time.UTC), time.Date(2025, 10, 15, 8, 30, 0, 0, time.UTC)}}
 	for _, tc := range cases {
 		if got := addMonthsClamped(tc.now, -3); !got.Equal(tc.want) {
 			t.Fatalf("cutoff for %s = %s, want %s", tc.now, got, tc.want)
@@ -34,20 +33,17 @@ func TestCleanupPurgesOnlyClosedHistory(t *testing.T) {
 
 	// One old settled request that must be purged.
 	h.clock.set(january)
-	old := h.mustReserve(ReserveInput{ID: "old", TraceID: "t-old", KeyID: key.ID, RequestedModel: "m1",
-		InputEstimate: 100, OutputEstimate: 100})
+	old := h.mustAdmit(AdmitInput{ID: "old", TraceID: "t-old", KeyID: key.ID, RequestedModel: "m1"})
 	h.mustUsage(usageFor("u-old", old, "m1", tokens(100, 0, 0, 100, 0)))
 	h.mustComplete(Completion{ID: old.ID, TraceID: old.TraceID, Outcome: OutcomeSucceeded})
 
 	// One old request that is still unresolved: never purged.
-	unresolved := h.mustReserve(ReserveInput{ID: "stuck", TraceID: "t-stuck", KeyID: key.ID, RequestedModel: "m1",
-		InputEstimate: 10, OutputEstimate: 0})
+	unresolved := h.mustAdmit(AdmitInput{ID: "stuck", TraceID: "t-stuck", KeyID: key.ID, RequestedModel: "m1"})
 	h.mustComplete(Completion{ID: unresolved.ID, TraceID: unresolved.TraceID, Outcome: OutcomeSucceeded})
 
 	// One recent settled request that stays inside retention.
 	h.clock.set(testEpoch)
-	recent := h.mustReserve(ReserveInput{ID: "recent", TraceID: "t-recent", KeyID: key.ID, RequestedModel: "m1",
-		InputEstimate: 10, OutputEstimate: 0})
+	recent := h.mustAdmit(AdmitInput{ID: "recent", TraceID: "t-recent", KeyID: key.ID, RequestedModel: "m1"})
 	h.mustUsage(usageFor("u-recent", recent, "m1", tokens(10, 0, 0, 0, 0)))
 	h.mustComplete(Completion{ID: recent.ID, TraceID: recent.TraceID, Outcome: OutcomeSucceeded})
 
@@ -100,8 +96,8 @@ func TestCleanupPurgesOnlyClosedHistory(t *testing.T) {
 	if _, err := h.store.UpdateKey(h.ctx(), key.ID, spec); err != nil {
 		t.Fatalf("update key: %v", err)
 	}
-	if _, err := h.store.Reserve(h.ctx(), ReserveInput{ID: "after-purge", TraceID: "t-after",
-		KeyID: key.ID, RequestedModel: "m1", InputEstimate: 100}); !errors.Is(err, ErrQuota) {
+	if _, err := h.store.Admit(h.ctx(), AdmitInput{ID: "after-purge", TraceID: "t-after",
+		KeyID: key.ID, RequestedModel: "m1"}); !errors.Is(err, ErrQuota) {
 		t.Fatalf("reserve after purge err = %v, want ErrQuota", err)
 	}
 	// The unresolved request can still be resolved by an administrator.
@@ -119,8 +115,7 @@ func TestCleanupReclaimsDatabaseAndWAL(t *testing.T) {
 	pad := strings.Repeat("p", 400)
 	for i := 0; i < 800; i++ {
 		id := "bulk-" + itoa(i)
-		req := h.mustReserve(ReserveInput{ID: id, TraceID: "t-" + id, KeyID: key.ID, RequestedModel: "m1",
-			InputEstimate: 1})
+		req := h.mustAdmit(AdmitInput{ID: id, TraceID: "t-" + id, KeyID: key.ID, RequestedModel: "m1"})
 		u := usageFor("u-"+id, req, "m1", tokens(1, 0, 0, 0, 0))
 		u.Executor = pad
 		u.ResponseModel = pad
@@ -238,15 +233,15 @@ func TestCleanupPrunesAgedPeriodsButKeepsTotals(t *testing.T) {
 
 	// A closed January request that books January periods and 100 tokens.
 	h.clock.set(january)
-	closed := h.mustReserve(ReserveInput{ID: "closed", TraceID: "t-closed", KeyID: key.ID,
-		RequestedModel: "m1", InputEstimate: 100})
+	closed := h.mustAdmit(AdmitInput{ID: "closed", TraceID: "t-closed", KeyID: key.ID,
+		RequestedModel: "m1"})
 	h.mustUsage(usageFor("u-closed", closed, "m1", tokens(100, 0, 0, 0, 0)))
 	h.mustComplete(Completion{ID: closed.ID, TraceID: closed.TraceID, Outcome: OutcomeSucceeded})
 
 	// An unresolved February request keeps its own periods alive.
 	h.clock.set(february)
-	stuck := h.mustReserve(ReserveInput{ID: "stuck", TraceID: "t-stuck", KeyID: key.ID,
-		RequestedModel: "m1", InputEstimate: 100})
+	stuck := h.mustAdmit(AdmitInput{ID: "stuck", TraceID: "t-stuck", KeyID: key.ID,
+		RequestedModel: "m1"})
 	h.mustUsage(usageFor("u-stuck", stuck, "m1", tokens(100, 0, 0, 0, 0)))
 	unknown := usageFor("u-stuck-unknown", stuck, "m1", Tokens{})
 	unknown.Quality = QualityUnknown
@@ -321,8 +316,7 @@ func TestCleanupWithoutRunKeepsPeriodHistory(t *testing.T) {
 	key, _ := h.mustKey(KeySpec{Enabled: true})
 	january := time.Date(2026, 1, 10, 9, 0, 0, 0, time.UTC)
 	h.clock.set(january)
-	req := h.mustReserve(ReserveInput{ID: "old", TraceID: "t-old", KeyID: key.ID, RequestedModel: "m1",
-		InputEstimate: 100})
+	req := h.mustAdmit(AdmitInput{ID: "old", TraceID: "t-old", KeyID: key.ID, RequestedModel: "m1"})
 	h.mustUsage(usageFor("u-old", req, "m1", tokens(100, 0, 0, 0, 0)))
 	h.mustComplete(Completion{ID: req.ID, TraceID: req.TraceID, Outcome: OutcomeSucceeded})
 	h.clock.set(testEpoch)
@@ -351,8 +345,8 @@ func TestCleanupSurfacesBusyCheckpoint(t *testing.T) {
 	// History is needed so the WAL actually holds pages to fold back.
 	for i := 0; i < 5; i++ {
 		id := "r" + itoa(i)
-		req := h.mustReserve(ReserveInput{ID: id, TraceID: "t-" + id, KeyID: key.ID,
-			RequestedModel: "m1", InputEstimate: 1})
+		req := h.mustAdmit(AdmitInput{ID: id, TraceID: "t-" + id, KeyID: key.ID,
+			RequestedModel: "m1"})
 		h.mustUsage(usageFor("u-"+id, req, "m1", tokens(1, 0, 0, 0, 0)))
 		h.mustComplete(Completion{ID: req.ID, TraceID: req.TraceID, Outcome: OutcomeSucceeded})
 	}
@@ -397,26 +391,9 @@ func TestCleanupSurfacesBusyCheckpoint(t *testing.T) {
 	}
 }
 
-// assertHoldAligned checks the ledger invariant that survived this bug: the key
-// hold always equals the holds of the requests that are still open.
-func assertHoldAligned(t *testing.T, h *harness, keyID string) {
-	t.Helper()
-	held := h.key(keyID).HeldMicroUSD
-	sum, err := counterValue(context.Background(), h.store.db,
-		`SELECT COALESCE(SUM(held_micro_usd),0) FROM requests WHERE key_id = ? AND state IN (?,?)`,
-		keyID, stateActive, statePending)
-	if err != nil {
-		t.Fatalf("sum unresolved holds: %v", err)
-	}
-	if held != sum {
-		t.Fatalf("key hold %d does not match unresolved requests %d", held, sum)
-	}
-}
-
 // TestCleanupKeepsRequestReopenedByLateExecution reproduces the removal race:
-// candidates are collected, a late execution reopens a request and restores its
-// hold, and the delete path must then leave that request, its history and the
-// hold alone.
+// candidates are collected, a late execution reopens a request, and the delete
+// path must then leave that request and its history alone.
 func TestCleanupKeepsRequestReopenedByLateExecution(t *testing.T) {
 	h := newHarness(t)
 	h.mustPrice("m1", Rates{Input: million})
@@ -425,14 +402,13 @@ func TestCleanupKeepsRequestReopenedByLateExecution(t *testing.T) {
 	old := testEpoch.AddDate(0, -4, 0)
 
 	// A settled request the retention window has already passed.
-	req := h.mustReserve(ReserveInput{ID: "old", TraceID: "t-old", KeyID: key.ID,
-		RequestedModel: "m1", InputEstimate: 5, At: old})
+	req := h.mustAdmit(AdmitInput{ID: "old", TraceID: "t-old", KeyID: key.ID,
+		RequestedModel: "m1", At: old})
 	first := usageFor("u-old", req, "m1", tokens(5, 0, 0, 0, 0))
 	first.At = old
 	h.mustUsage(first)
 	h.mustComplete(Completion{ID: req.ID, TraceID: req.TraceID, Outcome: OutcomeSucceeded, At: old})
 	spent := h.key(key.ID).SpentMicroUSD
-	assertHoldAligned(t, h, key.ID)
 
 	cutoff := h.store.retentionFrom(h.clock.now())
 	stale, err := expiredRequestIDs(ctx, h.store.db, cutoff)
@@ -447,10 +423,9 @@ func TestCleanupKeepsRequestReopenedByLateExecution(t *testing.T) {
 	late := usageFor("u-late", req, "m1", Tokens{})
 	late.Quality = QualityUnknown
 	h.mustUsage(late)
-	if got := h.request(req.ID); got.State != statePending || got.HeldMicroUSD != 5 {
-		t.Fatalf("reopened request = %+v, want pending with the hold restored", got)
+	if got := h.request(req.ID); got.State != statePending {
+		t.Fatalf("reopened request = %+v, want pending", got)
 	}
-	assertHoldAligned(t, h, key.ID)
 
 	// Deleting the stale list must not touch the reopened request.
 	var deleted int64
@@ -466,14 +441,13 @@ func TestCleanupKeepsRequestReopenedByLateExecution(t *testing.T) {
 	}
 	kept := func(stage string) {
 		t.Helper()
-		if got := h.request(req.ID); got.State != statePending || got.HeldMicroUSD != 5 {
+		if got := h.request(req.ID); got.State != statePending {
 			t.Fatalf("%s: request = %+v, want the pending accounting kept", stage, got)
 		}
 		n, err := counterValue(ctx, h.store.db, `SELECT COUNT(*) FROM usages WHERE request_id = ?`, req.ID)
 		if err != nil || n != 2 {
 			t.Fatalf("%s: usages = %d (%v), want both retained", stage, n, err)
 		}
-		assertHoldAligned(t, h, key.ID)
 	}
 	kept("after the stale delete")
 
@@ -487,8 +461,7 @@ func TestCleanupKeepsRequestReopenedByLateExecution(t *testing.T) {
 	}
 	kept("after cleanup")
 
-	// Once an administrator closes it the history is collectable, and the key
-	// hold still agrees with the requests that remain.
+	// Once an administrator closes it the history is collectable.
 	if err := h.store.Resolve(ctx, req.ID, Resolution{Action: ActionRelease, Reason: "operator"}); err != nil {
 		t.Fatalf("resolve: %v", err)
 	}
@@ -505,8 +478,7 @@ func TestCleanupKeepsRequestReopenedByLateExecution(t *testing.T) {
 	if n, err := counterValue(ctx, h.store.db, `SELECT COUNT(*) FROM usages WHERE request_id = ?`, req.ID); err != nil || n != 0 {
 		t.Fatalf("executions survived cleanup: %d (%v)", n, err)
 	}
-	assertHoldAligned(t, h, key.ID)
-	if k := h.key(key.ID); k.HeldMicroUSD != 0 || k.SpentMicroUSD != spent {
-		t.Fatalf("ledger after cleanup = %+v, want held 0 and spent %d", k, spent)
+	if k := h.key(key.ID); k.SpentMicroUSD != spent {
+		t.Fatalf("ledger after cleanup = %+v, want spent %d", k, spent)
 	}
 }

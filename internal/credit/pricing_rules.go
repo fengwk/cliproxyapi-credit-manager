@@ -275,7 +275,7 @@ func candidateLess(a, b pricingCandidate) bool {
 	return a.id < b.id
 }
 
-// resolvePricing picks the price and tiers frozen into one reservation. It
+// resolvePricing picks the price and tiers frozen into one request admission. It
 // never returns a fabricated zero price: an absent price book entry with no
 // matching rule is ErrUnpriced, and a disabled winning rule denies the model.
 func resolvePricing(ctx context.Context, q querier, model string) (Price, []PriceTier, string, error) {
@@ -367,7 +367,7 @@ func (s *Store) PreviewPrice(ctx context.Context, model, serviceTier string, inp
 		return match, nil
 	}
 	tokens := Tokens{Input: inputTokens, Total: inputTokens}
-	if match.Rates, err = effectiveRates(price.Rates, tiers, tokens, serviceTier, true); err != nil {
+	if match.Rates, err = effectiveRates(price.Rates, tiers, tokens, serviceTier); err != nil {
 		return PriceMatch{}, err
 	}
 	if match.CostMicroUSD, err = ratesCost(match.Rates, tokens); err != nil {
