@@ -390,17 +390,28 @@ html[data-palette="dark"] .btn-danger {
 
 .input-pair {
   display: flex;
-  gap: 6px;
+  gap: 8px;
   min-width: 0;
 }
 
-.input-pair > input {
+.money-unit-group {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
   flex: 1 1 0;
   min-width: 0;
 }
 
-.input-pair > input.money-micro {
-  flex: 1.2 1 0;
+.money-unit-tag {
+  font-size: 11px;
+  font-weight: 600;
+  font-family: var(--mono);
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.money-unit-group input {
+  min-width: 0;
 }
 
 input, select, textarea {
@@ -427,8 +438,37 @@ input:focus, select:focus, textarea:focus, .btn:focus-visible, .tab:focus-visibl
   outline: none;
 }
 
+input[aria-invalid="true"], select[aria-invalid="true"], textarea[aria-invalid="true"] {
+  border-color: var(--danger);
+}
+
 input[type="checkbox"] {
-  width: auto;
+  width: 16px;
+  height: 16px;
+  min-width: 16px;
+  min-height: 16px;
+  padding: 0;
+  margin: 0;
+  flex: none;
+  align-self: flex-start;
+  accent-color: var(--accent);
+  cursor: pointer;
+  box-sizing: border-box;
+}
+
+.field > label.checkbox-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  color: var(--text);
+  cursor: pointer;
+  user-select: none;
+  min-height: 36px;
+}
+
+.checkbox-label input[type="checkbox"] {
+  align-self: center;
 }
 
 textarea {
@@ -741,6 +781,27 @@ table.data {
   width: 100%;
   border-collapse: collapse;
   font-size: 13px;
+}
+
+table.data.keys-table {
+  min-width: 1180px;
+}
+
+.key-fingerprint, .key-principal {
+  font-family: var(--mono);
+  white-space: nowrap;
+}
+
+.keys-table td:last-child {
+  min-width: 220px;
+}
+
+.keys-table td:first-child {
+  min-width: 130px;
+}
+
+.keys-table td:nth-child(3) {
+  min-width: 105px;
 }
 
 table.data th, table.data td {

@@ -1708,8 +1708,9 @@
 
   function moneyPairInput(options) {
     var opts = options || {};
-    var microInput = el('input', { type: 'text', inputmode: 'numeric', class: 'money-micro', value: opts.micro === undefined ? '0' : String(opts.micro), placeholder: '整数微美元' });
-    var usdInput = el('input', { type: 'text', inputmode: 'decimal', class: 'money-usd', placeholder: '美元（可留空）' });
+    var fieldLabel = opts.label || '金额';
+    var microInput = el('input', { type: 'text', inputmode: 'numeric', class: 'money-micro', value: opts.micro === undefined ? '0' : String(opts.micro), placeholder: '整数微美元', 'aria-label': fieldLabel + '（微美元 µUSD）' });
+    var usdInput = el('input', { type: 'text', inputmode: 'decimal', class: 'money-usd', placeholder: '美元（可留空）', 'aria-label': fieldLabel + '（美元 USD）' });
     var hint = el('div', { class: 'metric-sub', text: '' });
 
     var syncFromMicro = function () {
@@ -1753,8 +1754,15 @@
     }
 
     var row = el('div', { class: 'field' }, [
-      el('label', { text: opts.label || '金额' }),
-      el('div', { class: 'input-pair' }, [microInput, usdInput]),
+      el('label', { text: fieldLabel }),
+      el('div', { class: 'input-pair' }, [
+        el('label', { class: 'money-unit-group' }, [
+          el('span', { class: 'money-unit-tag', text: 'µUSD' }), microInput,
+        ]),
+        el('label', { class: 'money-unit-group' }, [
+          el('span', { class: 'money-unit-tag', text: 'USD' }), usdInput,
+        ]),
+      ]),
       hint,
     ]);
     return { node: row, microInput: microInput, usdInput: usdInput, hint: hint };
@@ -3564,8 +3572,8 @@
           el('div', { text: callerName }),
         ]),
         el('td', {}, statusBadges),
-        el('td', {}, [el('div', { class: 'mono-break', text: key.fingerprint || '—' })]),
-        el('td', {}, [el('div', { class: 'mono-break', text: key.principal || '—' })]),
+        el('td', {}, [el('div', { class: 'key-fingerprint', text: key.fingerprint || '—' })]),
+        el('td', {}, [el('div', { class: 'key-principal', text: key.principal || '—' })]),
         el('td', { class: 'num' }, [
           el('div', { text: formatMicroUSD(effectiveSpent) }),
           el('div', { class: 'pill-note', text: '累积 ' + formatMicroUSD(key.spent_micro_usd) }),
@@ -3658,7 +3666,7 @@
       el('th', { text: '允许模型 / token 限额' }),
       el('th', { text: '操作' }),
     ]);
-    replace(container, [tableScroll(el('table', { class: 'data' }, [el('thead', {}, [head]), el('tbody', {}, rows)]))]);
+    replace(container, [tableScroll(el('table', { class: 'data keys-table' }, [el('thead', {}, [head]), el('tbody', {}, rows)]))]);
   }
 
   function openKeyEditor(existing) {
@@ -3668,7 +3676,7 @@
     var labelInput = el('input', { type: 'text', id: 'key-label', value: spec.label || '' });
     var enabledInput = el('input', { type: 'checkbox', id: 'key-enabled' });
     enabledInput.checked = creating ? true : spec.enabled === true;
-    var quotaField = moneyPairInput({ label: '总额度（微美元）', micro: intString(spec.quota_micro_usd || 0) });
+    var quotaField = moneyPairInput({ label: '总额度', micro: intString(spec.quota_micro_usd || 0) });
     var dailyField = moneyPairInput({ label: '每日额度', micro: intString(spec.daily_micro_usd || 0) });
     var weeklyField = moneyPairInput({ label: '每周额度', micro: intString(spec.weekly_micro_usd || 0) });
     var monthlyField = moneyPairInput({ label: '每月额度', micro: intString(spec.monthly_micro_usd || 0) });
@@ -3699,6 +3707,10 @@
       wide: true,
       body: [
         errorNode,
+        creating ? el('p', {
+          class: 'hint hint-warn',
+          text: '创建 Key 不会自动定价；允许全部模型不等于免费。调用前请在「价格规则」为客户端请求的模型 ID 配置价格，并用「价格预览」确认匹配。',
+        }) : null,
         creating
           ? el('p', {
               class: 'note',
@@ -3711,8 +3723,11 @@
         el('div', { class: 'form-grid' }, [
           el('div', { class: 'field' }, [el('label', { for: 'key-label', text: '标签' }), labelInput]),
           el('div', { class: 'field' }, [
-            el('label', { for: 'key-enabled', text: '启用（新建默认启用）' }),
-            enabledInput,
+            el('label', { text: '状态' }),
+            el('label', { for: 'key-enabled', class: 'checkbox-label' }, [
+              enabledInput,
+              document.createTextNode('启用（新建默认启用）'),
+            ]),
           ]),
           el('div', { class: 'field' }, [
             el('label', { for: 'key-concurrent', text: '最大并发（0 表示不限）' }),
@@ -4230,11 +4245,11 @@
 
     var form = el('form', { class: 'form-grid' }, [
       el('div', { class: 'field' }, [
-        el('label', { for: 'caller-id', text: '调用方唯一 ID（创建后不可更改）' }),
+        el('label', { for: 'caller-id', text: '调用方唯一 ID（必填，创建后不可更改）' }),
         idInput,
       ]),
       el('div', { class: 'field' }, [
-        el('label', { for: 'caller-name', text: '显示名称 / 团队部门' }),
+        el('label', { for: 'caller-name', text: '显示名称 / 团队部门（必填）' }),
         nameInput,
       ]),
       el('div', { class: 'field' }, [
@@ -4250,11 +4265,22 @@
       type: 'button',
       text: isEdit ? '保存修改' : '创建调用方',
       onclick: function () {
+        if (saveBtn.disabled) return;
         var id = idInput.value.trim();
         var displayName = nameInput.value.trim();
         var enabled = enabledInput.checked;
+        idInput.removeAttribute('aria-invalid');
+        nameInput.removeAttribute('aria-invalid');
         if (!id) {
+          idInput.setAttribute('aria-invalid', 'true');
           dialog.setError('调用方 ID 不能为空');
+          idInput.focus();
+          return;
+        }
+        if (!displayName) {
+          nameInput.setAttribute('aria-invalid', 'true');
+          dialog.setError('显示名称不能为空，请填写调用方名称或团队部门');
+          nameInput.focus();
           return;
         }
         saveBtn.disabled = true;

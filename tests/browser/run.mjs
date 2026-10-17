@@ -609,7 +609,9 @@ async function main() {
     await cdp.click('#tab-keys');
     await cdp.waitFor("document.querySelectorAll('#keys-list tbody tr').length === 2", 10000, 'Key 列表');
     const keysText = await cdp.text('#keys-list');
-    check('Key 列表展示标签/指纹/额度/并发', keysText.includes('生产主力') && keysText.includes('fp-abcd1234') && keysText.includes('并发'));
+    check('Key 列表展示标签/指纹/额度/并发', keysText.includes('生产主力') && keysText.includes('1daf934d4c6a6818') && keysText.includes('并发'));
+    check('Key 列表指纹单行不换行', await cdp.evaluate("(() => { const el = document.querySelector('#keys-list .key-fingerprint'); return !!el && window.getComputedStyle(el).whiteSpace === 'nowrap'; })()"));
+    check('Key 列表页面含缺价上手提示', (await cdp.text('#panel-keys')).includes('创建 Key 不会自动定价') && (await cdp.text('#panel-keys')).includes('允许全部模型不等于免费'));
     check('禁用状态与不限额度如实显示', keysText.includes('已禁用') && keysText.includes('总额度不限'));
     check(
       'Key 列表在可见 DOM 中不含持有金额',
@@ -623,10 +625,25 @@ async function main() {
     );
     check('允许模型与 token 限额可见', keysText.includes('opencode-go/glm-5') && keysText.includes('模型 token 限额'));
 
+    await cdp.clickText('#keys-list tbody tr:nth-child(2) button', '编辑');
+    await cdp.waitFor("document.querySelector('.modal #key-enabled')", 10000, '停用 Key 编辑');
+    check('编辑停用 Key 不会默认重新启用', await cdp.evaluate("document.querySelector('#key-enabled').checked === false"));
+    await cdp.clickText('.modal button', '取消');
+
     await cdp.clickText('#panel-keys button', '新建 Key');
     await cdp.waitFor("document.querySelector('.modal #key-label')", 10000, '新建弹窗');
     check('新建默认启用', await cdp.evaluate("document.querySelector('.modal #key-enabled').checked === true"));
+    const boxRect = await cdp.evaluate("(() => { const el = document.querySelector('.modal #key-enabled'); const r = el.getBoundingClientRect(); return { width: r.width, height: r.height }; })()");
+    check('新建 Key 复选框未被通栏拉伸且尺寸合理', boxRect.width >= 14 && boxRect.width <= 24 && boxRect.height >= 14 && boxRect.height <= 24, JSON.stringify(boxRect));
+    const modalText = await cdp.text('.modal');
+    check('新建 Key 弹窗包含缺价上手提示', modalText.includes('创建 Key 不会自动定价') && modalText.includes('允许全部模型不等于免费'));
+    const unitTags = await cdp.evaluate("[...document.querySelectorAll('.modal .money-unit-tag')].map((el) => el.textContent.trim())");
+    check('金额输入包含常显单位 µUSD 与 USD', unitTags.includes('µUSD') && unitTags.includes('USD'));
     await cdp.setValue('.modal #key-label', '新Key');
+    await cdp.setModalMoney('总额度', 'micro', '9007199254740993');
+    check('超大整数微美元无损换算为美元', (await cdp.modalMoney('总额度', 'usd')) === '9007199254.740993', await cdp.modalMoney('总额度', 'usd'));
+    await cdp.setModalMoney('总额度', 'usd', '9007199254.740993');
+    check('超大整数美元无损反向换算为微美元', (await cdp.modalMoney('总额度', 'micro')) === '9007199254740993');
     await cdp.setModalMoney('总额度', 'micro', '1234567');
     check('微美元输入自动换算美元', (await cdp.modalMoney('总额度', 'usd')) === '1.234567', await cdp.modalMoney('总额度', 'usd'));
     await cdp.setModalMoney('总额度', 'usd', '2.5');
@@ -647,6 +664,7 @@ async function main() {
 
     await cdp.clickText('#keys-list tbody tr:first-child button', '编辑');
     await cdp.waitFor("document.querySelector('.modal #key-label')", 10000, '编辑弹窗');
+    check('编辑启用 Key 保留勾选状态', await cdp.evaluate("document.querySelector('#key-enabled').checked === true"));
     check('编辑预填允许模型', (await cdp.evaluate("document.querySelector('.modal #key-allowed').value")).includes('gpt-5'));
     check('编辑预填 token 限额 JSON', (await cdp.evaluate("document.querySelector('.modal #key-limits').value")).includes('gpt-5'));
     await cdp.setValue('.modal #key-label', '生产主力-改');
@@ -990,6 +1008,44 @@ async function main() {
     await cdp.waitFor("document.querySelectorAll('#callers-list tbody tr').length > 0", 10000, '调用方列表');
     const callersText = await cdp.text('#callers-list');
     check('调用方列表包含显示名称', callersText.includes('研发一部') || callersText.includes('caller-'));
+
+    // 测试调用方空名称校验与创建流程
+    const callersPostCount = async () => (await hitsOf('/api/callers')).filter((h) => h.startsWith('POST ')).length;
+    const postsBefore = await callersPostCount();
+    await cdp.click('#callers-create');
+    await cdp.waitFor("document.querySelector('.modal #caller-id')", 10000, '新建调用方弹窗');
+    await cdp.setValue('.modal #caller-id', 'test-team');
+    // 只填 ID，未填显示名称时点击提交
+    await cdp.click('.modal .btn-primary');
+    await sleep(200);
+    const postsAfterEmpty = await callersPostCount();
+    check('调用方显示名称为空时拦截且不发送网络请求', postsAfterEmpty === postsBefore, 'posts: ' + postsAfterEmpty);
+    const callerError = await cdp.text('.modal .inline-error');
+    check('调用方显示名称为空时显示中文错误提示', callerError.includes('显示名称不能为空') || callerError.includes('必填'));
+    check('调用方空名称输入框标记为 aria-invalid', await cdp.evaluate("document.querySelector('.modal #caller-name').getAttribute('aria-invalid') === 'true'"));
+
+    // 补齐显示名称后正常提交
+    await cdp.setValue('.modal #caller-name', '核心算法组');
+    await cdp.click('.modal .btn-primary');
+    await cdp.waitFor("!document.querySelector('.modal #caller-id')", 10000, '新建调用方弹窗关闭');
+    await cdp.waitFor("document.querySelector('#callers-list').innerText.includes('核心算法组')", 10000, '调用方列表中出现新项目');
+    check('调用方补齐名称后创建成功且在列表中展示', (await cdp.text('#callers-list')).includes('核心算法组'));
+    check('有效调用方创建仅提交一次且保留启用状态', (await callersPostCount()) === postsBefore + 1 && JSON.parse((await debug('callers:create')).body).enabled === true);
+    const createdCallerRow = await cdp.evaluate("[...document.querySelectorAll('#callers-list tbody tr')].findIndex(row => row.textContent.includes('test-team'))");
+    await cdp.clickText('#callers-list tbody tr:nth-child(' + (createdCallerRow + 1) + ') button', '编辑');
+    await cdp.waitFor("document.querySelector('.modal #caller-name')", 10000, '编辑调用方');
+    check('调用方编辑保留 ID 与启用状态', await cdp.evaluate("document.querySelector('#caller-id').disabled && document.querySelector('#caller-id').value === 'test-team' && document.querySelector('#caller-enabled').checked"));
+    const callerPutsBefore = (await hitsOf('/api/callers')).filter(h => h.startsWith('PUT ')).length;
+    await cdp.setValue('.modal #caller-name', '   ');
+    await cdp.click('.modal .btn-primary');
+    check('编辑调用方的空白名称也不提交', (await hitsOf('/api/callers')).filter(h => h.startsWith('PUT ')).length === callerPutsBefore);
+    await cdp.setValue('.modal #caller-name', '核心算法组-更新');
+    await cdp.evaluate("document.querySelector('#caller-enabled').checked = false");
+    await cdp.click('.modal .btn-primary');
+    await cdp.waitFor("!document.querySelector('.modal #caller-id')", 10000, '编辑调用方关闭');
+    await cdp.waitFor("document.querySelector('#callers-list').innerText.includes('核心算法组-更新')", 10000, '更新调用方列表');
+    const callerUpdate = JSON.parse((await debug('callers:update')).body);
+    check('有效调用方编辑保存名称及停用状态', callerUpdate.display_name === '核心算法组-更新' && callerUpdate.enabled === false);
 
     /* --- 7d. 审计日志 --- */
     await cdp.click('#tab-audit');
@@ -1616,6 +1672,48 @@ async function main() {
       await cdp.clickText('.modal .subtab', '请求头');
       check('请求头视图包含复制请求头按钮', (await cdp.evaluate("!!document.querySelector('.modal .btn-row button')")) === true);
       await cdp.clickText('.modal button', '关闭');
+    });
+
+    // Pin actual form geometry, not only the presence of CSS declarations.
+    await step('Key 表单与表格在桌面和移动端的真实布局', async () => {
+      await cdp.click('#tab-keys');
+      await cdp.waitFor("document.querySelector('#keys-list .keys-table')", 10000, 'Key 表格');
+      for (const width of [1280, 390]) {
+        await cdp.send('Emulation.setDeviceMetricsOverride', { width, height: 900, deviceScaleFactor: 1, mobile: width === 390 });
+        for (const theme of ['white', 'dark']) {
+          await cdp.evaluate(`localStorage.setItem('cli-proxy-theme', '${theme}'); window.dispatchEvent(new StorageEvent('storage', { key: 'cli-proxy-theme' })); window.scrollTo(0, 0);`);
+          const tableGeometry = await cdp.evaluate(`(() => {
+            const fp = document.querySelector('.key-fingerprint');
+            const principal = document.querySelector('.key-principal');
+            const scroll = document.querySelector('#keys-list .table-scroll');
+            return { nowrap: getComputedStyle(fp).whiteSpace === 'nowrap' && getComputedStyle(principal).whiteSpace === 'nowrap',
+              fingerprint: fp.textContent, principal: principal.textContent,
+              pageFits: document.documentElement.scrollWidth <= innerWidth + 1,
+              boundedScroll: scroll.clientWidth <= innerWidth && getComputedStyle(scroll).overflowX === 'auto' };
+          })()`);
+          check('Key 表格完整标识与内部横滚 ' + width + '/' + theme,
+            tableGeometry.nowrap && tableGeometry.fingerprint === '1daf934d4c6a6818' &&
+            tableGeometry.principal === 'cmk:11111111-1111-1111-1111-111111111111' &&
+            tableGeometry.pageFits && tableGeometry.boundedScroll, JSON.stringify(tableGeometry));
+          await cdp.screenshot('keys-' + width + '-' + theme + '.png');
+          await cdp.click('#keys-create');
+          await cdp.waitFor("document.querySelector('.modal #key-enabled')", 10000, 'Key 表单');
+          const formGeometry = await cdp.evaluate(`(() => {
+            const box = document.querySelector('#key-enabled'), r = box.getBoundingClientRect();
+            const modal = document.querySelector('.modal');
+            return { checked: box.checked, width: r.width, height: r.height,
+              units: document.querySelectorAll('.modal .money-unit-tag').length,
+              labels: [...document.querySelectorAll('.modal .money-micro,.modal .money-usd')].every(n => n.getAttribute('aria-label')),
+              fits: modal.scrollWidth <= modal.clientWidth + 1 };
+          })()`);
+          check('Key 表单勾选、单位与布局 ' + width + '/' + theme,
+            formGeometry.checked && formGeometry.width === 16 && formGeometry.height === 16 &&
+            formGeometry.units === 8 && formGeometry.labels && formGeometry.fits, JSON.stringify(formGeometry));
+          await cdp.screenshot('key-form-' + width + '-' + theme + '.png');
+          await cdp.clickText('.modal button', '关闭');
+        }
+      }
+      await cdp.send('Emulation.clearDeviceMetricsOverride');
     });
 
     /* --- 18. 主题同步与多端截图 --- */
