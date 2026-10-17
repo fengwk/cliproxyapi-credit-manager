@@ -636,7 +636,7 @@ test('效率榜不将未知用量当作免费，按客户端请求数计算平�
     { model: 'unknown', requests: 1, executions: 1, complete_executions: 0, pending: 0, cost_micro_usd: 0, tokens: { total: 100 } },
     { model: 'free', requests: 1, executions: 1, complete_executions: 1, pending: 0, cost_micro_usd: 0, tokens: { total: 100 } },
     { model: 'retried', requests: 2, executions: 4, complete_executions: 4, pending: 0, cost_micro_usd: '9007199254740993', tokens: { total: 100 },
-      latency_ms: 1000, latency_samples: 1, output_tokens: '9007199254740993' },
+      latency_ms: 0, latency_samples: 0, output_tokens: '9007199254740993', measured_output_tokens: 0 },
   ];
   const ranked = CMCharts.computeModelRankings(models, 'value');
   assert.equal(ranked[0].model, 'free');
@@ -646,6 +646,14 @@ test('效率榜不将未知用量当作免费，按客户端请求数计算平�
   assert.equal(unit.rational.den, 2n);
   assert.equal(unit.rational.num, 9007199254740993n);
   assert.equal(unit.display, '4503599627.370497 USD / 请求');
-  // Legacy total output without a paired measurement is not a throughput sample.
+  // 无配对延迟时不计算吞吐量，即使其它执行确实有输出。
   assert.equal(CMCharts.computeModelRankings(models, 'tps').find(m => m.model === 'retried').display, '—');
+});
+
+test('实测零输出仍是有效 TPS 样本，不从全部输出补值', () => {
+  const models = [{ model: 'zero-measured', tokens: { total: 100 }, output_tokens: 100,
+    measured_output_tokens: 0, latency_ms: 1000, latency_samples: 1 }];
+  const item = CMCharts.computeModelRankings(models, 'tps')[0];
+  assert.equal(item.display, '0 tokens/s (累计吞吐)');
+  assert.equal(item.rational.num, 0n);
 });

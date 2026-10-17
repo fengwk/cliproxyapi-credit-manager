@@ -438,7 +438,6 @@
       to: localDatetimeValue(current),
       key: '',
       model: '',
-      source: '',
       bucket: 'day',
     };
   }
@@ -492,7 +491,6 @@
     push('to', toISOFromLocal(toVal));
     push('key_id', input.key);
     push('model', input.model);
-    push('source', input.source);
     push('bucket', USAGE_BUCKETS.indexOf(input.bucket) >= 0 ? input.bucket : 'day');
     return pairs
       .map(function (pair) {
@@ -1341,8 +1339,10 @@
     isBigIntegerLiteral: isBigIntegerLiteral,
     rewriteNumbers: rewriteNumbers,
     buildUsageQuery: buildUsageQuery,
+    buildOverviewQuery: buildOverviewQuery,
     usageFiltersFromForm: usageFiltersFromForm,
     defaultUsageFilters: defaultUsageFilters,
+    defaultOverviewFilters: defaultOverviewFilters,
     quickRangeFilters: quickRangeFilters,
     normalizePage: normalizePage,
     normalizePageSize: normalizePageSize,
@@ -2190,7 +2190,6 @@
     set('overview-to', f.to || '');
     set('overview-key', f.key || '');
     set('overview-model', f.model || '');
-    set('overview-source', f.source || '');
     set('overview-bucket', f.bucket || 'day');
 
     var fromWrap = $('overview-from-wrap');
@@ -2208,7 +2207,6 @@
       to: $('overview-to') ? $('overview-to').value : '',
       key: $('overview-key') ? $('overview-key').value : '',
       model: $('overview-model') ? $('overview-model').value : '',
-      source: $('overview-source') ? $('overview-source').value : '',
       bucket: $('overview-bucket') ? $('overview-bucket').value : 'day',
     };
   }
@@ -2364,8 +2362,8 @@
       ]),
       el('div', { class: 'card stat-card metric-card' }, [
         el('div', { class: 'stat-label metric-label', text: '总消耗 Token' }),
-        el('div', { class: 'stat-value mono', text: formatTokens(summary.tokens && summary.tokens.total !== undefined ? summary.tokens.total : summary.tokens, state.tokenUnit) }),
-        el('div', { class: 'stat-sub muted', text: '输入 ' + formatTokens(summary.tokens && summary.tokens.input !== undefined ? summary.tokens.input : 0, state.tokenUnit) + ' · 输出 ' + formatTokens(summary.tokens && summary.tokens.output !== undefined ? summary.tokens.output : 0, state.tokenUnit) }),
+        el('div', { class: 'stat-value mono', text: formatTokens(summary.tokens ? summary.tokens.total : 0, state.tokenUnit) }),
+        el('div', { class: 'stat-sub muted', text: '输入 ' + formatTokens(summary.tokens ? summary.tokens.input : 0, state.tokenUnit) + ' · 输出 ' + formatTokens(summary.tokens ? summary.tokens.output : 0, state.tokenUnit) }),
       ]),
       el('div', { class: 'card stat-card metric-card' }, [
         el('div', { class: 'stat-label metric-label', text: '总费用支出（总成本）' }),
@@ -2429,7 +2427,7 @@
 
     if (metric === 'tokens') {
       centerTitle = '总 Token';
-      var sumTokens = summary && summary.tokens && summary.tokens.total !== undefined ? summary.tokens.total : (summary && summary.tokens ? summary.tokens : 0);
+      var sumTokens = summary && summary.tokens ? summary.tokens.total : 0;
       centerTotal = formatTokens(sumTokens, state.tokenUnit);
     } else if (metric === 'cost') {
       centerTitle = '总费用';
@@ -2443,7 +2441,7 @@
         val = Number(intString(m.requests || 0));
         disp = formatInt(m.requests || 0) + ' 次';
       } else if (metric === 'tokens') {
-        var tVal = m.tokens && m.tokens.total !== undefined ? m.tokens.total : m.tokens;
+        var tVal = m.tokens ? m.tokens.total : 0;
         val = Number(intString(tVal || 0));
         disp = formatTokens(tVal || 0, state.tokenUnit);
       } else if (metric === 'cost') {
@@ -2521,7 +2519,7 @@
           score: null,
           display: '—',
           requestsText: intString(m.requests || 0),
-          tokensText: intString(m.tokens && m.tokens.total !== undefined ? m.tokens.total : m.tokens || 0),
+          tokensText: intString(m.tokens ? m.tokens.total : 0),
           costMicroText: intString(m.cost_micro_usd || 0),
         };
       });
@@ -3478,7 +3476,7 @@
   function quotaProgress(key) {
     var spec = key.spec || {};
     var limit = intString(spec.quota_micro_usd);
-    var spent = intString(key.quota_used_micro_usd !== undefined ? key.quota_used_micro_usd : key.spent_micro_usd);
+    var spent = intString(key.quota_used_micro_usd || 0);
     if (limit === '0') return el('span', { class: 'pill-note', text: '总额度不限' });
     var percent = ratioPercent(spent, limit);
     return el('div', {}, [
@@ -3555,7 +3553,7 @@
         }
       }
 
-      var effectiveSpent = key.quota_used_micro_usd !== undefined ? key.quota_used_micro_usd : key.spent_micro_usd;
+      var effectiveSpent = key.quota_used_micro_usd || 0;
 
       return el('tr', { class: 'row-main' + (isDeleted ? ' is-deleted' : '') }, [
         el('td', {}, [
@@ -3969,14 +3967,7 @@
         ]);
       },
       function (err) {
-        if (err && (err.status === 409 || (err.message && err.message.indexOf('legacy') >= 0))) {
-          dialog.setBody([
-            el('p', { class: 'hint hint-warn', text: '该密钥为历史旧版创建的 Key，未在安全密封区加密存储，无法直接恢复明文。' }),
-            el('p', { class: 'note', text: '若需要获取可用明文，请使用“轮换密钥”功能重新生成具备安全加密保护的新密钥。' }),
-          ]);
-        } else {
-          dialog.setError('读取密钥失败：' + describeError(err));
-        }
+        dialog.setError('读取密钥失败：' + describeError(err));
         dialog.setFooter([
           el('button', { class: 'btn btn-ghost', type: 'button', text: '关闭', onclick: dialog.close }),
         ]);

@@ -232,7 +232,7 @@ async function main() {
   fs.mkdirSync(profileRoot, { recursive: true });
   const profileDir = fs.mkdtempSync(path.join(profileRoot, 'run-'));
   const origin = `http://127.0.0.1:${mock.port}`;
-  const shellUrl = `${origin}/v0/resource/plugins/credit-manager/index.html`;
+  const shellUrl = `${origin}/v0/resource/plugins/cliproxyapi-credit-manager/index.html`;
 
   const chrome = await launchChrome(profileDir);
   const cdp = await connect(chrome.wsUrl);
@@ -302,6 +302,7 @@ async function main() {
     check('概览卡片包含总请求数与总成本', overviewSummary.includes('总请求数') && overviewSummary.includes('总成本'));
     check('概览模型占比卡片存在', await cdp.evaluate("!!document.querySelector('#overview-model-share')"));
     check('概览模型效率排行卡片存在', await cdp.evaluate("!!document.querySelector('#overview-model-rank')"));
+    check('概览不显示后端未支持的来源筛选', await cdp.evaluate("document.querySelector('#overview-source') === null"));
     check('概览 Token 趋势使用真实嵌套桶而非空折线', await cdp.evaluate(
       "echarts.getInstanceByDom(document.getElementById('overview-token-chart')).getOption().series.some(s => s.data.some(v => Number(v) > 0))"
     ));
@@ -694,6 +695,14 @@ async function main() {
     check('查看明文弹窗正确展示解密密钥', (await cdp.evaluate("document.querySelector('.modal input.mono').value")).includes('sk-revealed'));
     check('查看明文弹窗提示一次性显示', (await cdp.text('.modal')).includes('一次性显示'));
     await cdp.clickText('.modal button', '已复制并关闭');
+
+    // 密文损坏是当前存储错误，不能误导成历史键或展示虚构明文。
+    await cdp.clickText('#keys-list tbody tr:nth-child(2) button', '查看密钥');
+    await cdp.waitFor("document.querySelector('.modal .inline-error')?.textContent.includes('读取密钥失败')", 10000, '密钥检索错误');
+    const revealError = await cdp.text('.modal');
+    check('密钥检索失败明确显示错误而不冒充历史键', revealError.includes('stored key material failed verification') && !revealError.includes('历史旧版') && !revealError.includes('未在安全密封区'));
+    check('密钥检索失败不展示明文', await cdp.evaluate("document.querySelector('.modal input.mono') === null"));
+    await cdp.clickText('.modal button', '关闭');
 
     /* --- 7. 价格 --- */
     await cdp.click('#tab-prices');

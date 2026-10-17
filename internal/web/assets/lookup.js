@@ -654,7 +654,7 @@
   function renderQuotas(key) {
     var quotas = el('quotas');
     clear(quotas);
-    var effectiveSpent = key.quota_used_micro_usd !== undefined ? key.quota_used_micro_usd : key.spent_micro_usd;
+    var effectiveSpent = key.quota_used_micro_usd;
     quotas.appendChild(card('已用额度', formatMoney(effectiveSpent, state.currency, state.rate)));
     quotas.appendChild(card('总额度', key.quota_micro_usd ? formatMoney(key.quota_micro_usd, state.currency, state.rate) : '不限'));
     quotas.appendChild(card('日额度', key.daily_micro_usd ? formatMoney(key.daily_micro_usd, state.currency, state.rate) : '不限'));
@@ -795,7 +795,7 @@
           return {
             model: m.model || 'unknown',
             requestsText: intText(m.requests || 0),
-            tokensText: intText(m.tokens && m.tokens.total !== undefined ? m.tokens.total : m.tokens || 0),
+            tokensText: intText(m.tokens ? m.tokens.total : 0),
             costMicroText: intText(m.cost_micro_usd || 0),
             display: '—',
           };
@@ -830,9 +830,9 @@
         metaEl.appendChild(tokSpan);
 
         var orig = (models || []).find(function (item) { return item.model === m.model; }) || {};
-        var measuredOut = intText(orig.measured_output_tokens !== undefined ? orig.measured_output_tokens : (orig.output_tokens || 0));
+        var measuredOut = intText(orig.measured_output_tokens || 0);
         var latMs = BigInt(intText(orig.latency_ms || 0));
-        if (latMs > 0n && orig.measured_output_tokens !== undefined) {
+        if (latMs > 0n) {
           var tpsVal = charts().formatDecimalRatio(BigInt(measuredOut) * 1000n, latMs, 1);
           var tpsSpan = document.createElement('span');
           tpsSpan.textContent = tpsVal + ' tokens/s (累计吞吐)';
