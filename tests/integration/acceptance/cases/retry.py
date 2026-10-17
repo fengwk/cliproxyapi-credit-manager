@@ -10,7 +10,7 @@ accounting as zero, and nothing is held or estimated while it is unresolved.
 
 from __future__ import annotations
 
-from ..report import check, check_eq, check_no_holds
+from ..report import check, check_eq, check_no_holds, check_no_ledger_fields
 
 CASES = []
 
@@ -20,12 +20,6 @@ def case(name, expects):
         CASES.append({"name": name, "expects": expects, "fn": fn})
         return fn
     return wrap
-
-
-def _spent(ctx, key_id):
-    items = ctx.manager.keys().json()["items"]
-    row = next((k for k in items if k["id"] == key_id), None)
-    return row["spent_micro_usd"] if row else None
 
 
 def _key(ctx, key_id):
@@ -80,10 +74,13 @@ def failover(ctx):
     check_eq(request["outcome"], "succeeded", "request outcome is succeeded")
     check_eq(request["state"], "pending", "unknown attempt keeps the request pending")
     check_no_holds(request, "pending request with an unknown attempt")
-    check_eq(_spent(ctx, item["id"]), 14, "key billed once (14), not twice")
+    summary = ctx.wait_report(item["id"])["summary"]
+    check_eq(summary["cost_micro_usd"], 14, "only the successful attempt is priced, not twice")
+    check_eq(summary["complete_executions"], 1, "one complete usage drives the cost")
     check_no_holds(_key(ctx, item["id"]), "key row")
+    check_no_ledger_fields(_key(ctx, item["id"]), "key row")
     return {"upstream_calls": len(calls), "credentials": sorted(credentials),
-            "client_requests": report["total"], "key_spent": _spent(ctx, item["id"]),
+            "client_requests": report["total"], "summary": summary,
             "request_state": request["state"],
             "attempts": [{"failed": ex["failed"], "quality": ex["quality"], "cost": ex.get("cost_micro_usd"),
                           "status": ex.get("status_code")} for ex in executions]}
@@ -100,13 +97,15 @@ def all_failures(ctx):
     response = ctx.client.chat(key, "synthetic-chat", timeout=40)
     check(response.status >= 400, f"client sees an upstream error, got {response.status}")
     check(ctx.mock.count("/chat/completions") >= 1, "at least one upstream attempt reached the mock")
-    check_eq(_spent(ctx, item["id"]), 0, "no free billing when the request never succeeded")
+    summary = ctx.usage_rows(key_id=item["id"], page_size=50)["summary"]
+    check_eq(summary["cost_micro_usd"], 0, "no cost exists when the request never succeeded")
     request = ctx.find_request(key_id=item["id"])
     if request is not None:
         check(request["state"] != "settled" or request["outcome"] != "succeeded",
-              "a fully failed request must not settle as a billed success")
+              "a fully failed request must not settle as a priced success")
         check(not any(ex.get("cost_micro_usd") for ex in request["executions"]),
               "no execution may carry a cost for a fully failed request")
         check_no_holds(request, "fully failed request")
+        check_no_ledger_fields(request, "fully failed request")
     return {"status": response.status, "upstream_calls": ctx.mock.count("/chat/completions"),
-            "key_spent": _spent(ctx, item["id"])}
+            "summary": summary}

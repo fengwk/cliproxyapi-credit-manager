@@ -17,10 +17,8 @@ def case(name, expects):
     return wrap
 
 
-def _spent(ctx, key_id):
-    items = ctx.manager.keys().json()["items"]
-    row = next((k for k in items if k["id"] == key_id), None)
-    return row["spent_micro_usd"] if row else None
+def _cost(ctx, key_id):
+    return ctx.usage_rows(key_id=key_id, page_size=100)["summary"]["cost_micro_usd"]
 
 
 def _body(model="synthetic-chat"):
@@ -61,9 +59,10 @@ def candidate_locations(ctx):
     for location, status in results.items():
         check_eq(status, 200, f"candidate location {location}")
     check_eq(ctx.mock.count("/chat/completions"), 5, "each accepted candidate reached upstream once")
-    # All five bill the same key: 5 * 14.
-    check(ctx.wait_until(lambda: _spent(ctx, item["id"]) == 70), f"key spent after 5 calls: {_spent(ctx, item['id'])}")
-    return {"locations": results, "key_spent": _spent(ctx, item["id"])}
+    # All five derive the same key's cost: 5 * 14.
+    report = ctx.wait_report(item["id"], settled=5)
+    check_eq(report["summary"]["cost_micro_usd"], 70, "five calls derive 70 microUSD")
+    return {"locations": results, "cost": report["summary"]["cost_micro_usd"]}
 
 
 @case("auth.invalid_and_absent_denied", "invalid or absent credentials are denied with no upstream call")
@@ -77,7 +76,7 @@ def invalid_absent(ctx):
     goog_invalid = ctx.client.post("/v1/chat/completions", _body(), {"x-goog-api-key": "synthetic-invalid"})
     _expect_denied(ctx, goog_invalid.status, "invalid google key denied")
     check_eq(ctx.mock.count("/chat/completions"), 0, "denied requests must not reach upstream")
-    check_eq(_spent(ctx, item["id"]), 0, "no billing on denied requests")
+    check_eq(_cost(ctx, item["id"]), 0, "no cost on denied requests")
     return {"invalid": invalid.status, "absent": absent.status, "goog_invalid": goog_invalid.status}
 
 
@@ -91,8 +90,9 @@ def invalid_bearer_valid_google(ctx):
     )
     check_eq(response.status, 200, "valid google key accepted despite invalid bearer")
     check_eq(ctx.mock.count("/chat/completions"), 1, "one upstream call")
-    check(ctx.wait_until(lambda: _spent(ctx, item["id"]) == 14), "billed to the valid google key")
-    return {"status": response.status, "key_spent": _spent(ctx, item["id"])}
+    check_eq(ctx.wait_report(item["id"], settled=1)["summary"]["cost_micro_usd"], 14,
+             "priced to the valid google key")
+    return {"status": response.status, "cost": _cost(ctx, item["id"])}
 
 
 @case("auth.conflicting_first_wins", "two valid keys in one request bill only the first in native candidate order")
@@ -106,17 +106,19 @@ def conflicting_first_wins(ctx):
         {"Authorization": f"Bearer {key_a}", "x-goog-api-key": key_b},
     )
     check_eq(response.status, 200, "request accepted")
-    check(ctx.wait_until(lambda: _spent(ctx, item_a["id"]) == 14), "first candidate (bearer) billed")
-    check_eq(_spent(ctx, item_b["id"]), 0, "second candidate must not be billed")
+    check_eq(ctx.wait_report(item_a["id"], settled=1)["summary"]["cost_micro_usd"], 14,
+             "first candidate (bearer) derives the cost")
+    check_eq(_cost(ctx, item_b["id"]), 0, "second candidate must not be charged")
     # Reverse the order: the google key is still candidate 2, so bearer B wins.
     response = ctx.client.post(
         "/v1/chat/completions", _body(),
         {"Authorization": f"Bearer {key_b}", "x-goog-api-key": key_a},
     )
     check_eq(response.status, 200, "reversed request accepted")
-    check(ctx.wait_until(lambda: _spent(ctx, item_b["id"]) == 14), "reversed bearer billed")
-    check_eq(_spent(ctx, item_a["id"]), 14, "a must remain at its single charge")
-    return {"a_spent": _spent(ctx, item_a["id"]), "b_spent": _spent(ctx, item_b["id"])}
+    check_eq(ctx.wait_report(item_b["id"], settled=1)["summary"]["cost_micro_usd"], 14,
+             "reversed bearer derives the cost")
+    check_eq(_cost(ctx, item_a["id"]), 14, "a must remain at its single derived charge")
+    return {"a_cost": _cost(ctx, item_a["id"]), "b_cost": _cost(ctx, item_b["id"])}
 
 
 @case("auth.original_cpa_key_rejected", "the original CPA access.api-keys client key is rejected while the plugin is exclusive")
@@ -136,7 +138,8 @@ def custom_prefix(ctx):
     check_eq(key, "custom-prefix-material-0001", "one-time plaintext echoes the custom material")
     response = ctx.client.post("/v1/chat/completions", _body(), {"Authorization": f"Bearer {key}"})
     check_eq(response.status, 200, "custom-prefix key accepted")
-    check(ctx.wait_until(lambda: _spent(ctx, item["id"]) == 14), "custom key billed")
+    check_eq(ctx.wait_report(item["id"], settled=1)["summary"]["cost_micro_usd"], 14,
+             "custom key derives its cost")
     return {"status": response.status, "key_prefix": key[:12]}
 
 
@@ -152,8 +155,8 @@ def plugin_absent_denies(ctx):
     for location, status in loaded.items():
         check_eq(status, 200, f"with the plugin loaded, {location} accepts a plugin key")
     check_eq(ctx.mock.count("/chat/completions"), 5, "each accepted location reached upstream once")
-    check(ctx.wait_until(lambda: _spent(ctx, item["id"]) == 70),
-          f"the plugin key was billed while loaded: {_spent(ctx, item['id'])}")
+    check_eq(ctx.wait_report(item["id"], settled=5)["summary"]["cost_micro_usd"], 70,
+             "the plugin key derives cost while loaded")
 
     # 2. Rebuild the same deployment with the plugin disabled (plugins.enabled
     #    false, library not loaded) while the original CPA access.api-keys guard

@@ -44,8 +44,10 @@ def _seed(ctx, label):
     ctx.set_price("synthetic-chat")
     response = ctx.client.chat(key, "synthetic-chat")
     check_eq(response.status, 200, f"{label}: priced request accepted through the proxy")
-    request = ctx.wait_until(lambda: ctx.find_request(key_id=item["id"]))
-    check(request is not None, f"{label}: request recorded for its own key")
+    report = ctx.wait_report(item["id"], settled=1)
+    request = next((row for row in report["items"] if row["state"] == "settled"), None)
+    check(request is not None, f"{label}: request settled for its own key")
+    check_eq(report["summary"]["cost_micro_usd"], 14, f"{label}: the seeded request derives its cost")
     return item, key, request
 
 
@@ -73,7 +75,11 @@ def customer_bearer_required(ctx):
     check_eq(response.status, 200, "lookup/data accepts the customer's own key")
     payload = response.json()
     check_eq(payload["key"]["id"], item["id"], "lookup/data reports the authenticated key only")
-    check_eq(payload["key"]["quota_micro_usd"], BIG, "64-bit quota survives JSON without precision loss")
+    check_eq(payload["key"]["quota_micro_usd"], BIG,
+             "the display budget survives JSON without precision loss")
+    for retired in ("spent_micro_usd", "quota_used_micro_usd", "daily_used_micro_usd",
+                    "weekly_used_micro_usd", "monthly_used_micro_usd"):
+        check(retired not in payload["key"], f"lookup key must not expose the retired {retired}")
     for forbidden in ("principal", "scope", "fingerprint", "hmac", "material"):
         check(forbidden not in response.text, f"lookup/data must not expose {forbidden}")
 
@@ -121,6 +127,8 @@ def scope_is_own_key_only(ctx):
         key=alpha_key,
     ).json()
     check_eq(narrowed["items"], [], "searching the other key's label returns nothing for this key")
+    check_eq(own["summary"]["cost_micro_usd"], 14, "the customer summary derives only its own cost")
+    check_eq(own["summary"]["unpriced_executions"], 0, "the customer summary has no unpriced execution")
 
     # The sanitized request shape drops upstream credential placement and raw payloads.
     text = _get(ctx, path, key=alpha_key).text
@@ -178,6 +186,9 @@ def trend_uses_calendar_months(ctx):
               f"month bucket point is the UTC first of the month: {point['time']}")
     check_eq(sum(point["requests"] for point in trend), payload["summary"]["requests"],
              "monthly trend reconciles with the summary")
+    check_eq(sum(point["cost_micro_usd"] for point in trend), payload["summary"]["cost_micro_usd"],
+             "monthly trend cost reconciles with the summary")
+    check_eq(payload["summary"]["cost_micro_usd"], 14, "the customer sees the derived cost")
 
     daily = _get(ctx, f"{path}?bucket=day&{window}&page_size=50", key=key).json()
     check(all(point["time"].endswith("T00:00:00Z") for point in daily["trend"]),

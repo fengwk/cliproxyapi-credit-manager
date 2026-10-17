@@ -2,13 +2,13 @@
 
 Every mutating management operation is written to a single ordered, paged audit
 trail and the disclosure is transactional. This case exercises the key, rule and
-resolution operations the aligned surface introduced and asserts they are
-recorded with their identifiers, newest first, and never with a plaintext key.
+token-reset operations the aligned surface exposes and asserts they are recorded
+with their identifiers, newest first, and never with a plaintext key. Manual
+money resolution no longer exists, so no resolve action is expected.
 """
 
 from __future__ import annotations
 
-from ..mock import Script
 from ..report import check, check_eq
 
 CASES = []
@@ -22,11 +22,11 @@ def case(name, expects):
 
 
 EXPECTED_ACTIONS = {"create", "update", "rotate", "reveal", "delete", "reset",
-                    "caller_create", "price_update", "rule_update", "rule_delete", "resolve"}
+                    "caller_create", "price_update", "rule_update", "rule_delete"}
 
 
-@case("audit.records_key_rule_and_resolve_operations",
-      "key, pricing-rule and resolve operations are all audited, newest first, without any plaintext key")
+@case("audit.records_key_rule_and_token_reset_operations",
+      "key, pricing-rule and token-reset operations are all audited, newest first, without any plaintext key")
 def audit_trail(ctx):
     caller = ctx.manager.create_caller({"id": "caller-audit", "display_name": "Audit Team", "enabled": True})
     check_eq(caller.status, 201, f"caller create {caller.text[:120]}")
@@ -52,17 +52,9 @@ def audit_trail(ctx):
     check_eq(ctx.manager.put_pricing_rule(rule).status, 200, "rule upsert audited")
     check_eq(ctx.manager.delete_pricing_rule("audit-rule").status, 200, "rule delete audited")
 
-    # A resolution is audited with the request id and the chosen action.
-    item, key = ctx.new_key(label="audit-resolve")
-    check_eq(ctx.client.chat(key, "synthetic-chat").status, 200, "priced request accepted")
-    ctx.mock.default_script = Script(omit_usage=True)
-    check_eq(ctx.client.chat(key, "synthetic-chat").status, 200, "pending request accepted")
-    ctx.mock.default_script = Script()
-    pending = ctx.wait_until(lambda: ctx.find_request(key_id=item["id"]), timeout=15)
-    check(pending is not None and pending["state"] != "settled", "pending request available for resolution")
-    check_eq(ctx.manager.resolve(pending["id"], "release", reason="audited resolution").status, 200, "resolve audited")
-
-    check_eq(ctx.manager.reset_spend({"id": key_id, "total": True, "reason": "audited reset"}).status, 200, "reset audited")
+    # A token reset is audited with its scope and names the token baseline.
+    check_eq(ctx.manager.reset_tokens({"id": key_id, "total": True, "reason": "audited reset"}).status, 200,
+             "token reset audited")
     check_eq(ctx.manager.delete_key(key_id, "audited delete").status, 200, "delete audited")
 
     page = ctx.manager.audit(limit=500)
@@ -72,6 +64,7 @@ def audit_trail(ctx):
     actions = {entry["action"] for entry in body["items"]}
     missing = EXPECTED_ACTIONS - actions
     check(missing == set(), f"audit is missing operations: {sorted(missing)} (saw {sorted(actions)})")
+    check("resolve" not in actions, "no manual resolution action exists")
 
     by_action = {}
     for entry in body["items"]:
@@ -79,15 +72,15 @@ def audit_trail(ctx):
     for entry in by_action["create"]:
         check(entry["key_id"], "every create audit carries its key id")
         check(entry["detail"].startswith("fingerprint="), f"create detail: {entry['detail']!r}")
-    check(any(entry["key_id"] == key_id for entry in by_action["create"]), "the audited key create carries its key id")
+    check(any(entry["key_id"] == key_id for entry in by_action["create"]),
+          "the audited key create carries its key id")
     reveal_entry = by_action["reveal"][0]
     check_eq(reveal_entry["key_id"], key_id, "reveal audit carries its key id")
     for entry in by_action["rule_update"] + by_action["rule_delete"]:
         check_eq(entry["detail"], "rule_id=audit-rule", f"rule audit detail {entry['detail']!r}")
-    resolve_entry = by_action["resolve"][0]
-    check("action=release" in resolve_entry["detail"], f"resolve audit detail {resolve_entry['detail']!r}")
+    reset_detail = by_action["reset"][0]["detail"]
+    check("tokens" in reset_detail, f"reset audit detail names the token baseline: {reset_detail!r}")
     check_eq(by_action["delete"][0]["reason"], "audited delete", "delete audit carries its reason")
-    check("total" in by_action["reset"][0]["detail"], f"reset audit detail {by_action['reset'][0]['detail']!r}")
 
     seqs = [entry["seq"] for entry in body["items"]]
     check(seqs == sorted(seqs, reverse=True), "audit is ordered newest first")

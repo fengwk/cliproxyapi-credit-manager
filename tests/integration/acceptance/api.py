@@ -109,12 +109,8 @@ class Manager:
     def capture(self, request_id):
         return self.call("GET", "/api/capture", query={"id": request_id})
 
-    def resolve(self, request_id, action, amount_micro_usd=0, reason="synthetic"):
-        return self.call(
-            "POST",
-            "/api/resolve",
-            {"id": request_id, "action": action, "amount_micro_usd": amount_micro_usd, "reason": reason},
-        )
+    def reset_tokens(self, spec):
+        return self.call("POST", "/api/reset-tokens", spec)
 
     # Extended management surface (aligned features) ------------------------
     def callers(self):
@@ -156,8 +152,9 @@ class Manager:
     def delete_key(self, key_id, reason):
         return self.call("POST", "/api/delete-key", {"id": key_id, "reason": reason})
 
-    def reset_spend(self, spec):
-        return self.call("POST", "/api/reset-spend", spec)
+    def retired_route(self, suffix, spec):
+        """Probe a route the new contract no longer registers (expected 404)."""
+        return self.call("POST", suffix, spec)
 
 
 class Client:
