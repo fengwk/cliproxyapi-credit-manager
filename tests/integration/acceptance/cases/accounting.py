@@ -6,8 +6,6 @@ upstream reported and never carries an estimate or a hold.
 
 from __future__ import annotations
 
-import json
-
 from ..report import check, check_eq, check_no_holds
 
 CASES = []
@@ -120,8 +118,10 @@ def unpriced_denied(ctx):
     denied = ctx.client.chat(key_a, "synthetic-unpriced")
     check_eq(denied.status, 403, "unpriced model denied")
     denied_body = denied.json()
-    check("not available" in json.dumps(denied_body) or "not permitted" in json.dumps(denied_body),
-          f"denial body: {denied_body}")
+    check_eq(denied_body["error"]["message"],
+             "model pricing is not configured or is disabled; contact the administrator",
+             "pricing rejection explains the required configuration")
+    check_eq(denied_body["error"]["type"], "permission_error", "pricing rejection type")
     check_eq(ctx.mock.count("/chat/completions"), 0, "denied request must not reach upstream")
     # The same key still works on a priced model.
     check_eq(ctx.client.chat(key_a, "synthetic-chat").status, 200, "key A still usable after denial")
@@ -131,6 +131,47 @@ def unpriced_denied(ctx):
     check(ctx.wait_until(lambda: _find_key(ctx.manager, item_a["id"])["spent_micro_usd"] == 14), "key A settled")
     check(ctx.wait_until(lambda: _find_key(ctx.manager, item_b["id"])["spent_micro_usd"] == 14), "key B settled")
     return {"denied_status": denied.status, "upstream_calls": ctx.mock.count("/chat/completions")}
+
+
+@case("billing.fresh_key_requires_requested_alias_price",
+      "a fresh key alone does not price models; only an explicit price for the requested alias restores billing")
+def fresh_key_requires_requested_alias_price(ctx):
+    # Model existence and key permission are separate from financial pricing.
+    check_eq(ctx.manager.prices().json()["items"], [], "fresh price book")
+    check_eq(ctx.manager.pricing_rules().json()["items"], [], "fresh rule book")
+    item, key = ctx.new_key(label="fresh-onboarding")
+    for phase in ("empty price book", "only upstream model priced"):
+        if phase == "only upstream model priced":
+            ctx.set_price("synthetic-upstream-name")
+        denied = ctx.client.chat(key, "synthetic-alias")
+        check_eq(denied.status, 403, phase)
+        check_eq(denied.json()["error"]["message"],
+                 "model pricing is not configured or is disabled; contact the administrator",
+                 "actionable missing-price message")
+        # Reproduce the production /v1/responses rejection without contacting
+        # any real model or requiring the upstream mock to implement Responses.
+        responses_denied = ctx.client.post(
+            "/v1/responses", {"model": "synthetic-alias", "input": "synthetic"},
+            headers={"Authorization": "Bearer " + key})
+        check_eq(responses_denied.status, 403, "Responses missing-price rejection")
+        check_eq(responses_denied.json()["error"]["message"],
+                 "model pricing is not configured or is disabled; contact the administrator",
+                 "Responses reports pricing rather than upstream availability")
+        check_eq(ctx.mock.count("/chat/completions"), 0, "unpriced request never executes")
+        check_eq(ctx.usage_rows(key_id=item["id"])["summary"]["requests"], 0,
+                 "rejected request creates no accounting")
+    ctx.set_price("synthetic-alias")
+    check_eq(ctx.manager.price_preview(model="synthetic-alias").status, 200,
+             "administrator verifies the requested alias price")
+    check_eq(ctx.client.chat(key, "synthetic-alias").status, 200,
+             "the same key works once its requested model is priced")
+    request = _settled(ctx, item["id"])
+    check(request is not None, "newly priced request settles")
+    check_eq(request["model"], "synthetic-alias", "frozen requested model")
+    check_eq(request["executions"][0]["cost_micro_usd"], 14, "full actual cost")
+    check_eq(_find_key(ctx.manager, item["id"])["spent_micro_usd"], 14, "exact key ledger")
+    check_eq(ctx.mock.count("/chat/completions"), 1, "only the priced request executes")
+    return {"requested_model": request["model"], "cost_micro_usd": 14}
 
 
 @case("billing.upstream_label_never_exempts",

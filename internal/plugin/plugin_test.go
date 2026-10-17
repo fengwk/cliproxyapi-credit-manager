@@ -1340,6 +1340,70 @@ func TestUnpricedModelRejectedThenPricedSucceeds(t *testing.T) {
 	}
 }
 
+// Pricing failures must explain the operator action, never masquerade as an
+// upstream availability failure or fall through to a lower-priority price.
+func TestPricingRejectionExplainsMissingOrDisabledPrice(t *testing.T) {
+	for _, disabledRule := range []bool{false, true} {
+		name := "missing"
+		if disabledRule {
+			name = "disabled winning rule"
+		}
+		t.Run(name, func(t *testing.T) {
+			h := newHarness(t)
+			ctx := context.Background()
+			model := "unpriced-model"
+			rule := credit.PricingRule{
+				ID: "disabled", MatchKind: credit.MatchExact, Pattern: testModel, Priority: 5,
+				Price: credit.Price{Rates: credit.Rates{Input: 1_000_000}},
+			}
+			if disabledRule {
+				model = testModel // A lower-priority exact base price already exists.
+				if err := h.store().(pricingStore).PutPricingRule(ctx, rule); err != nil {
+					t.Fatal(err)
+				}
+			}
+			probe := h.request("denied", "trace-denied")
+			probe.Model, probe.RequestedModel = model, model
+			resp := h.intercept(probe)
+			var body struct {
+				Error struct {
+					Message string `json:"message"`
+					Type    string `json:"type"`
+				} `json:"error"`
+			}
+			if err := json.Unmarshal(resp.ResponseBody, &body); err != nil {
+				t.Fatal(err)
+			}
+			if !resp.Terminate || resp.StatusCode != http.StatusForbidden ||
+				body.Error.Type != "permission_error" ||
+				body.Error.Message != "model pricing is not configured or is disabled; contact the administrator" {
+				t.Fatalf("unclear pricing rejection: status=%d body=%s", resp.StatusCode, resp.ResponseBody)
+			}
+			report, err := h.store().Report(ctx, credit.Filter{})
+			if err != nil || report.Summary.Requests != 0 {
+				t.Fatalf("pricing denial created accounting: %+v, %v", report.Summary, err)
+			}
+			if disabledRule {
+				rule.Enabled = true
+				if err := h.store().(pricingStore).PutPricingRule(ctx, rule); err != nil {
+					t.Fatal(err)
+				}
+			} else if err := h.store().PutPrice(ctx, credit.Price{
+				Model: model, Rates: credit.Rates{Input: 1_000_000},
+			}); err != nil {
+				t.Fatal(err)
+			}
+			probe.RequestID, probe.TraceID = "priced", "trace-priced"
+			if resp := h.intercept(probe); resp.Terminate {
+				t.Fatalf("configured price did not restore admission: %+v", resp)
+			}
+			if h.m.LastError() != "" {
+				t.Fatalf("business rejection degraded health: %s", h.m.LastError())
+			}
+		})
+	}
+}
+
 // TestReconfigureDrainsAdmissionBeforeLivenessCheck pins the interleaving that a
 // naive check order would get wrong: an admission that is still inside Admit
 // when the reconfigure starts must be drained and then observed by the

@@ -351,7 +351,7 @@ func admitMessage(err error) string {
 	case errors.Is(err, credit.ErrUnauthorized), errors.Is(err, credit.ErrDenied):
 		return "request is not permitted"
 	case errors.Is(err, credit.ErrUnpriced):
-		return "model is not available"
+		return "model pricing is not configured or is disabled; contact the administrator"
 	case errors.Is(err, credit.ErrConflict):
 		return "conflicting request"
 	default:
